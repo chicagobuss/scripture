@@ -1,0 +1,21 @@
+[package]
+name = "scriptured"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Lab-grade Scripture daemon transport adapters"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+scripture = { path = "../scripture" }
+scripture-service = { path = "../scripture-service" }
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[dev-dependencies]
+holylog.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

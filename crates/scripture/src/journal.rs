@@ -147,7 +147,7 @@ pub struct TrimGap {
 }
 
 /// One pull-reader outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ReadEvent {
     /// Next ordered record.
     Record(JournalRecord),

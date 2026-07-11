@@ -36,6 +36,13 @@ maximum batches/second <= 1 / durable_append_round_trip_seconds
 K-window pipelining is not used by v0 and must not be included in throughput
 or cost projections until the async writer driver exists.
 
+The lab service actor preserves this depth-one behavior: each accepted
+submission currently becomes one durable batch. Its bounded in-memory queue is
+backpressure, not durable staging, and queued/failed submissions must be
+counted separately from acknowledged batches. A future batching driver may
+merge submissions behind the same acknowledgement boundary; no text or HTTP
+transport should assume the present one-line/one-batch implementation.
+
 The final seal check is a metadata read. With a durable LogDrive-backed seal,
 add one seal GET per batch append that reaches its acknowledgement check.
 Failed/abandoned writes may incur work without producing acknowledged records
@@ -69,6 +76,11 @@ idle-subscriber request cost = P × provider_GET_price
 After sealing, the canonical check additionally performs `weakTail(K)`, whose
 replica listing/point-repair work is backend- and history-dependent and must be
 recorded by adapter metrics.
+
+A future service tail cache can replace `P` per-session polls with one poll per
+journal cadence plus local wakeups after a service-owned append. This is an
+economic objective, not a present implementation claim: the current raw-lines
+adapter only writes and performs no tail caching.
 
 ## Trim and retained storage
 
