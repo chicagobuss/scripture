@@ -15,35 +15,34 @@ addressed.
 - The batching boundary holds: payloads are opaque `Bytes` end to end, no size
   ceiling interfered, and the kernel imposed no record/flush concepts on the
   envelope or codec.
-- `QuorumMetrics` gave per-run logical cost numbers with zero effort: the
-  spike's 3 appends / 5 batch reads / 1 trim / 1 seal produced 6 replica
-  writes, 10 replica reads, 2 tail queries, 606 bytes up, 1010 bytes down.
-  This is the raw material obligation 9's cost model needs.
+- `QuorumMetrics` gave per-run figures with zero effort: the spike's
+  3 appends / 5 batch reads / 1 trim / 1 seal produced 6 replica writes,
+  10 replica reads, 2 tail queries, 606 bytes up, 1010 bytes down.
+  **Label these precisely: they are deterministic in-memory QuorumLogDrive
+  data-plane operation counters, not end-to-end object-store cost data.**
+  The run used `InMemorySeal` and `InMemoryTrimPoint`, so the durable seal
+  GET that every canonical `check_tail` (and acknowledged append) performs is
+  absent, and no idle polling loop was modeled. The first provider-realistic
+  cost experiment needs durable metadata objects, a defined polling cadence,
+  and metadata plus data-plane operations in one ledger (obligations 3 and 9).
 
 ## Gaps
 
-1. **No exported deterministic in-memory LogDrive.** Every consumer (and every
-   holylog integration test) rebuilds the same ~50-line wrapper around
-   `ReferenceLogDrive`. Already on holylog's Milestone 1 "next" list as
-   reusable test infrastructure; the spike confirms it should be a public,
-   documented kernel offering (a `holylog::memory` module or feature), ideally
-   with the fault-injection hooks the scripted test drive already has.
-   → holylog.
+1. **No exported deterministic in-memory LogDrive.** ~~Every consumer rebuilds
+   the same wrapper around `ReferenceLogDrive`.~~ **Addressed** at holylog
+   `a6b4660`: `holylog::memory::InMemoryLogDrive` is public; the spike now
+   uses it. Fault-injection hooks remain test infrastructure per the roadmap.
 
-2. **AtomicLog assembly is verbose and K appears twice.** Wiring
-   drive + sequencer + seal + trim + K (with K repeated into the sequencer) is
-   five lines of `Arc::new` per log. The construction-time K-coherence check
-   catches mistakes, but a small builder (or a config struct that constructs
-   the in-memory components by default) would make the common case harder to
-   get wrong. Matters more once Scripture multiplexes many logs. → holylog,
-   minor.
+2. **AtomicLog assembly is verbose and K appears twice.** **Addressed** at
+   holylog `a6b4660`: `AtomicLog::builder(drive, k)` supplies coherent
+   in-memory defaults (the default sequencer is constructed from the builder's
+   K); explicit sequencers still fail construction on mismatch.
 
-3. **Construction error types don't compose.** `QuorumLogDrive::new` returns
-   `QuorumError`, which has no path into `AtomicLogError`; the spike had to
-   wrap it as `DriveError::backend` manually. Runtime composition is clean
-   (the quorum *is* a `LogDrive`); only constructor errors clash. A
-   `From<QuorumError> for DriveError` (or a shared construction error) would
-   remove the wart. → holylog, minor.
+3. **Construction error types don't compose.** **Resolved by policy** per
+   review: `QuorumError` is a construction/configuration error and must not be
+   flattened into runtime `DriveError`. The consumer keeps a typed setup error
+   (see the spike's `SetupError`); the builder removes most of the wiring that
+   made this annoying.
 
 4. **Every tail poll costs a sequencer call plus a seal read.** `check_tail`
    is the only way to learn about new entries, so a polling consumer pays that
