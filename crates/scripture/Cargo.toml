@@ -7,10 +7,22 @@ description = "A correctness-first durable journal system over holylog"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+r2-smoke = [
+    "dep:holylog-object-store",
+    "dep:object_store",
+    "dep:tokio",
+    "object_store/aws",
+]
+
 [dependencies]
 bytes.workspace = true
 holylog.workspace = true
+holylog-object-store = { workspace = true, optional = true, features = ["s3"] }
+object_store = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 futures.workspace = true

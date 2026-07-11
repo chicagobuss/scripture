@@ -6,8 +6,11 @@ resolver = "3"
 bytes = "1.12"
 futures = "0.3"
 holylog = { path = "../holylog" }
+holylog-object-store = { path = "../holylog/crates/holylog-object-store" }
+object_store = { version = "0.14", default-features = false }
 proptest = "1.9"
 thiserror = "2.0"
+tokio = { version = "1.47", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

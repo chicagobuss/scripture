@@ -51,6 +51,16 @@ cargo fmt --all -- --check
 cargo run -p protoscripture
 ```
 
+The ignored R2 smoke test writes a unique temporary prefix, exercises durable
+data/seal/trim objects through the Holylog adapter, and deletes the prefix on a
+successful run. It requires `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, and
+`R2_SECRET_ACCESS_KEY` (`R2_REGION` defaults to `auto`):
+
+```sh
+cargo test -p scripture --features r2-smoke --test r2 \
+  scripture_v0_runs_against_r2 --locked -- --ignored --exact
+```
+
 ## License
 
 MIT
