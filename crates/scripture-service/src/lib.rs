@@ -128,7 +128,9 @@ impl JournalActor {
                     terminal = Some(error.clone());
                     let _ = submission.acknowledgement.send(Err(error));
                 }
-                Err(WriteError::Log(_)) | Err(WriteError::Codec(CodecError::OffsetOverflow)) => {
+                Err(WriteError::Log(_))
+                | Err(WriteError::Poisoned)
+                | Err(WriteError::Codec(CodecError::OffsetOverflow)) => {
                     terminal = Some(ServiceError::Unavailable);
                     let _ = submission
                         .acknowledgement

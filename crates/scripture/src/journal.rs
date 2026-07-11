@@ -37,6 +37,10 @@ pub enum WriteError {
         expected: JournalId,
         actual: JournalId,
     },
+    /// A previous append was cancelled or failed after its durable write may
+    /// have landed; cached offsets are unreliable. Rebuild via `recover`.
+    #[error("writer poisoned by a cancelled or failed append; recover a new writer")]
+    Poisoned,
 }
 
 /// Single in-process v0 writer. This type is deliberately not `Clone` and is
@@ -45,6 +49,7 @@ pub struct JournalWriter {
     journal_id: JournalId,
     log: AtomicLog,
     next_offset: RecordOffset,
+    poisoned: bool,
 }
 
 impl JournalWriter {
@@ -56,6 +61,7 @@ impl JournalWriter {
             journal_id,
             log,
             next_offset,
+            poisoned: false,
         }
     }
 
@@ -92,7 +98,24 @@ impl JournalWriter {
     }
 
     /// Canonically encodes and durably appends one non-empty batch.
+    ///
+    /// # Safety and Cancellation
+    ///
+    /// This method is cancellation-unsafe by design. Once an append reaches its
+    /// kernel await boundary, the writer's in-memory offset state is unreliable
+    /// if that future does not complete successfully (e.g. cancelled by a timeout
+    /// or aborted by caller).
+    ///
+    /// If an append is cancelled or fails, the writer is permanently poisoned and
+    /// will refuse further appends. A fresh writer may be built using `recover`
+    /// only when that helper's same-live-log preconditions hold. In particular,
+    /// a dropped append may leave this AtomicLog intentionally wedged, which
+    /// `recover` cannot repair. `JournalActor` is the sanctioned surface for
+    /// concurrent or cancellable callers.
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<AppendAck, WriteError> {
+        if self.poisoned {
+            return Err(WriteError::Poisoned);
+        }
         if records.is_empty() {
             return Err(WriteError::EmptyBatch);
         }
@@ -102,9 +125,14 @@ impl JournalWriter {
             .checked_add(records.len())
             .ok_or(CodecError::OffsetOverflow)?;
         let bytes = encode_batch(self.journal_id, self.next_offset, &records)?;
-        let slot = self.log.append(bytes).await?.get();
+
+        self.poisoned = true;
+        let slot = self.log.append(bytes).await?;
+        self.poisoned = false;
+
+        let slot_val = slot.get();
         let ack = AppendAck {
-            slot,
+            slot: slot_val,
             first_offset: self.next_offset,
             next_offset,
             record_count,
