@@ -9,12 +9,12 @@ publish = false
 
 [dependencies]
 bytes.workspace = true
+holylog.workspace = true
 scripture = { path = "../scripture" }
 scripture-service = { path = "../scripture-service" }
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 
 [dev-dependencies]
-holylog.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

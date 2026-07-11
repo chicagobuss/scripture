@@ -54,6 +54,15 @@ durable line. It is a loopback-tested protocol harness, not a production
 daemon, schema registry, or HTTP API. In particular a connection that closes
 before its `OK` has an unknown durable outcome and must retry at-least-once.
 
+For a local protocol demonstration, the `scriptured` executable listens on
+`0.0.0.0:9000` by default (or `--bind HOST:PORT`). It intentionally uses an
+in-memory Holylog, so data survives only while the process is running:
+
+```sh
+cargo run -p scriptured -- --bind 127.0.0.1:9000
+printf 'first\nsecond\n' | nc 127.0.0.1 9000
+```
+
 ## Development
 
 Pinned to the same Rust toolchain as holylog, which is consumed as a path
