@@ -47,6 +47,21 @@ The writer allocates one dense record range per batch and advances durable
 state only after `AtomicLog::append` succeeds. A failed or sealed append does
 not produce successful record acknowledgements.
 
+### Cancellation Safety
+
+The `JournalWriter::append_batch` method is cancellation-unsafe by design. Once
+an append reaches its kernel await boundary, dropping or cancelling the future
+leaves the cached in-memory offsets unreliable, as the write may still land durably.
+To preserve correctness, any cancelled or failed append permanently poisons the
+`JournalWriter` instance, causing all subsequent appends to return a
+`WriteError::Poisoned` error. A fresh writer may be constructed through
+`recover` only under its existing same-live-log preconditions. In particular,
+a dropped append can leave the AtomicLog intentionally wedged by an abandoned
+slot, and `recover` cannot repair that generation. For concurrent or
+cancellable caller environments, `JournalActor` serves as the sanctioned, safe
+abstraction since it runs the writer task outside of the cancellable transport
+request future.
+
 ## Kafka-mappability
 
 Durable ordered acknowledgement is at least as strong as the intended future

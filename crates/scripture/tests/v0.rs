@@ -334,3 +334,91 @@ proptest! {
         })?;
     }
 }
+
+struct GatedDrive {
+    inner: InMemoryLogDrive,
+    gate: std::sync::Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+impl LogDrive for GatedDrive {
+    fn write(
+        &self,
+        address: holylog::logdrive::Address,
+        value: bytes::Bytes,
+    ) -> holylog::drive::DriveFuture<'_, ()> {
+        let mut guard = self.gate.lock().expect("lock gate");
+        let rx = guard.take();
+        Box::pin(async move {
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            self.inner.write(address, value).await
+        })
+    }
+
+    fn read(
+        &self,
+        address: holylog::logdrive::Address,
+    ) -> holylog::drive::DriveFuture<'_, Option<bytes::Bytes>> {
+        self.inner.read(address)
+    }
+
+    fn weak_tail(
+        &self,
+        k: u64,
+    ) -> holylog::drive::DriveFuture<'_, holylog::logdrive::TailDescription> {
+        self.inner.weak_tail(k)
+    }
+}
+
+#[test]
+fn writer_poison_guard_cancellation_and_error() {
+    block_on(async {
+        use futures::Future;
+
+        // 1. Test GatedDrive cancellation poisoning
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let drive = Arc::new(GatedDrive {
+            inner: InMemoryLogDrive::new(),
+            gate: std::sync::Mutex::new(Some(rx)),
+        }) as Arc<dyn LogDrive>;
+        let log = AtomicLog::builder(drive, 4).build().expect("build log");
+        let mut writer = JournalWriter::new(journal_id(), log.clone(), RecordOffset::new(0));
+
+        // Start append_batch and poll once (or let it wait)
+        let mut append_fut = Box::pin(writer.append_batch(vec![record(0)]));
+
+        // Use a simple poll to verify it gets pending
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(append_fut.as_mut().poll(&mut cx).is_pending());
+
+        // Drop the append future (CANCELLATION!)
+        drop(append_fut);
+
+        // Try a second append, must return Poisoned
+        let second_append = writer.append_batch(vec![record(1)]).await;
+        assert!(matches!(second_append, Err(WriteError::Poisoned)));
+
+        // Unblock the gated write so later things aren't blocked, though the slot is abandoned (wedged)
+        let _ = tx.send(());
+
+        // 2. Test Error-poisoning (append to a sealed log)
+        let sealed_log = self::log();
+        let mut sealed_writer =
+            JournalWriter::new(journal_id(), sealed_log.clone(), RecordOffset::new(0));
+        sealed_log.seal().await.expect("seal");
+
+        let first_err = sealed_writer.append_batch(vec![record(0)]).await;
+        assert!(matches!(first_err, Err(WriteError::Log(_))));
+
+        let second_err = sealed_writer.append_batch(vec![record(1)]).await;
+        assert!(matches!(second_err, Err(WriteError::Poisoned)));
+
+        // 3. Assert the cure: recover after sealed-append poisoning yields correct next_offset (with durable zombie)
+        let recovered = JournalWriter::recover(journal_id(), sealed_log.clone())
+            .await
+            .expect("recover");
+        assert_eq!(recovered.next_offset(), RecordOffset::new(1));
+    });
+}
