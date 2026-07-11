@@ -49,6 +49,13 @@ pub enum CodecError {
     /// A bool was not encoded canonically.
     #[error("boolean attribute has invalid value {value}")]
     InvalidBool { value: u8 },
+    /// A fixed-width attribute used the wrong encoded length.
+    #[error("attribute type {tag} has length {actual}, expected {expected}")]
+    InvalidAttributeLength {
+        tag: u8,
+        expected: usize,
+        actual: usize,
+    },
     /// Attribute keys were duplicated or not in canonical ascending order.
     #[error("attribute keys are not unique and canonically ordered")]
     NonCanonicalAttributes,
@@ -289,14 +296,28 @@ pub fn decode_batch(bytes: &Bytes) -> Result<Batch, CodecError> {
                         .map_err(|_| CodecError::InvalidUtf8)?
                         .to_owned(),
                 ),
-                I64_TAG => AttributeValue::I64(i64::from_be_bytes(
-                    value_bytes.try_into().map_err(|_| CodecError::Truncated)?,
-                )),
+                I64_TAG => {
+                    let value: [u8; 8] =
+                        value_bytes
+                            .try_into()
+                            .map_err(|_| CodecError::InvalidAttributeLength {
+                                tag: I64_TAG,
+                                expected: 8,
+                                actual: value_bytes.len(),
+                            })?;
+                    AttributeValue::I64(i64::from_be_bytes(value))
+                }
                 BOOL_TAG => match value_bytes {
                     [0] => AttributeValue::Bool(false),
                     [1] => AttributeValue::Bool(true),
                     [value] => return Err(CodecError::InvalidBool { value: *value }),
-                    _ => return Err(CodecError::Truncated),
+                    _ => {
+                        return Err(CodecError::InvalidAttributeLength {
+                            tag: BOOL_TAG,
+                            expected: 1,
+                            actual: value_bytes.len(),
+                        });
+                    }
                 },
                 tag => return Err(CodecError::UnsupportedAttributeType { tag }),
             };

@@ -31,6 +31,12 @@ pub enum WriteError {
     /// Holylog rejected or failed the append.
     #[error(transparent)]
     Log(#[from] AtomicLogError),
+    /// Last durable batch belongs to another journal.
+    #[error("last durable batch belongs to journal {actual}, expected {expected}")]
+    JournalMismatch {
+        expected: JournalId,
+        actual: JournalId,
+    },
 }
 
 /// Single in-process v0 writer. This type is deliberately not `Clone` and is
@@ -59,6 +65,32 @@ impl JournalWriter {
         self.next_offset
     }
 
+    /// Recovers the next offset from the last durable batch.
+    ///
+    /// This helper is valid only with the same live AtomicLog, no concurrent
+    /// writer, and no trimmed final slot. It is not crash recovery or writer
+    /// fencing; those require VirtualLog. Durable zombie batches are included.
+    pub async fn recover(journal_id: JournalId, log: AtomicLog) -> Result<Self, WriteError> {
+        let tail = log.check_tail().await?.tail;
+        let next_offset = if tail == 0 {
+            RecordOffset::new(0)
+        } else {
+            let LogEntry { payload, .. } = log.read_next(tail - 1, tail).await?;
+            let batch = decode_batch(&payload)?;
+            if batch.journal_id != journal_id {
+                return Err(WriteError::JournalMismatch {
+                    expected: journal_id,
+                    actual: batch.journal_id,
+                });
+            }
+            batch
+                .base_offset
+                .checked_add(batch.records.len())
+                .ok_or(CodecError::OffsetOverflow)?
+        };
+        Ok(Self::new(journal_id, log, next_offset))
+    }
+
     /// Canonically encodes and durably appends one non-empty batch.
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<AppendAck, WriteError> {
         if records.is_empty() {
@@ -80,8 +112,24 @@ impl JournalWriter {
         self.next_offset = next_offset;
         Ok(ack)
     }
+}
 
-    /// Manually advances the logical trim point by Holylog slots.
+/// Single manual retention authority, deliberately separate from writing.
+pub struct RetentionAuthority {
+    log: AtomicLog,
+}
+
+impl RetentionAuthority {
+    /// Creates the sole manual retention authority for one v0 journal.
+    #[must_use]
+    pub fn new(log: AtomicLog) -> Self {
+        Self { log }
+    }
+
+    /// Logically trims every Holylog slot below `slot`.
+    ///
+    /// v0 intentionally speaks physical slots here. Mapping record offsets or
+    /// time policies to slots is deferred to the retention-policy decision.
     pub async fn trim_to_slot(&self, slot: u64) -> Result<u64, WriteError> {
         Ok(self.log.prefix_trim(slot).await?)
     }
@@ -221,12 +269,9 @@ impl JournalReader {
 
     async fn load_batch(&mut self) -> Result<Option<ReadEvent>, ReadError> {
         if self.slot >= self.checked_tail {
-            self.refresh_tail().await?;
-            if self.slot >= self.checked_tail {
-                return Ok(Some(ReadEvent::CaughtUp {
-                    next_offset: self.next_offset,
-                }));
-            }
+            return Ok(Some(ReadEvent::CaughtUp {
+                next_offset: self.next_offset,
+            }));
         }
         match self.log.read_next(self.slot, self.checked_tail).await {
             Ok(LogEntry { payload, .. }) => {
@@ -281,7 +326,12 @@ impl JournalReader {
         }
     }
 
-    /// Pulls one record, explicit gap, or caught-up marker.
+    /// Pulls one record, explicit gap, or caught-up marker below the last
+    /// explicitly refreshed tail.
+    ///
+    /// This method never polls storage for a newer tail. Call `refresh_tail`
+    /// at the desired cadence; with durable seal storage each refresh incurs
+    /// the tail-poll costs documented in `docs/cost-model.md`.
     pub async fn read_next(&mut self) -> Result<ReadEvent, ReadError> {
         loop {
             if self.cached.is_none()

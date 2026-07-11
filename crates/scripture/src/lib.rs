@@ -13,8 +13,8 @@ pub mod model;
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
 pub use clock::{BatchAccumulator, BatchPolicy, Clock, ManualClock, PushResult, SystemClock};
 pub use journal::{
-    AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError, TrimGap,
-    WriteError,
+    AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError,
+    RetentionAuthority, TrimGap, WriteError,
 };
 pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,

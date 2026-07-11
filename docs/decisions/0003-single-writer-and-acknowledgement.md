@@ -23,10 +23,23 @@ are never reported durable. Batching is bounded by record count, encoded bytes,
 and monotonic elapsed age. Scripture owns its small injectable timer
 abstraction; it does not wait for Holylog's unrelated hedging timer.
 
+The first v0 writer is deliberately sequential: `append_batch(&mut self)`
+awaits one Holylog append before accepting the next. It does not yet pipeline
+up to K or expose per-record acknowledgement futures. Per-journal throughput is
+therefore capped at one batch per durable-append round trip. Pipelining needs a
+separate async-driver decision and must not be assumed by v0 cost estimates.
+
 Kernel conflicts are diagnostic only. Identical bytes at the same slot can be
 accepted idempotently and collapse two logical writes, so conflict detection
 must never be described as fencing. Production fencing is gated on VirtualLog
 and a conditional-register decision.
+
+A sealed append may return an error after its bytes became durable (Holylog's
+documented zombie-append behavior). The writer does not advance its in-memory
+offset on that error, but fenced recovery must count the durable zombie range
+as allocated. Consequently, errored records may appear in the log and a retry
+in a successor generation may occupy different offsets, producing
+at-least-once duplicates across generation replacement.
 
 ## Correctness
 

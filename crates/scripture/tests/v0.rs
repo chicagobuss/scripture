@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use scripture::{
     AttributeValue, BatchAccumulator, BatchPolicy, Checkpoint, JournalId, JournalReader,
     JournalWriter, ManualClock, PushResult, ReadError, ReadEvent, ReaderCheckpointError, Record,
-    RecordOffset, ResumeHint, WriteError,
+    RecordOffset, ResumeHint, RetentionAuthority, WriteError,
 };
 
 fn journal_id() -> JournalId {
@@ -53,6 +53,13 @@ fn writer_reader_checkpoint_and_trim_gap_form_one_ordered_history() {
         assert_eq!(writer.next_offset(), RecordOffset::new(5));
 
         let mut reader = JournalReader::from_start(journal_id(), log.clone());
+        assert_eq!(
+            reader.read_next().await.expect("no implicit poll"),
+            ReadEvent::CaughtUp {
+                next_offset: RecordOffset::new(0)
+            }
+        );
+        reader.refresh_tail().await.expect("explicit tail poll");
         let ReadEvent::Record(zero) = reader.read_next().await.expect("record zero") else {
             panic!("expected record");
         };
@@ -63,6 +70,7 @@ fn writer_reader_checkpoint_and_trim_gap_form_one_ordered_history() {
 
         let mut resumed = JournalReader::from_checkpoint(journal_id(), log.clone(), checkpoint)
             .expect("resume checkpoint");
+        resumed.refresh_tail().await.expect("resume tail poll");
         let ReadEvent::Record(one) = resumed.read_next().await.expect("record one") else {
             panic!("expected record");
         };
@@ -72,8 +80,12 @@ fn writer_reader_checkpoint_and_trim_gap_form_one_ordered_history() {
         };
         assert_eq!(two.offset, RecordOffset::new(2));
 
-        writer.trim_to_slot(1).await.expect("logical trim");
+        RetentionAuthority::new(log.clone())
+            .trim_to_slot(1)
+            .await
+            .expect("logical trim");
         let mut lagging = JournalReader::from_start(journal_id(), log);
+        lagging.refresh_tail().await.expect("lagging tail poll");
         let ReadEvent::Gap(gap) = lagging.read_next().await.expect("trim gap") else {
             panic!("expected explicit gap");
         };
@@ -104,6 +116,33 @@ fn writer_does_not_advance_offsets_for_empty_overflowing_or_sealed_batches() {
             Err(WriteError::Log(_))
         ));
         assert_eq!(writer.next_offset(), RecordOffset::new(9));
+
+        let recovered = JournalWriter::recover(journal_id(), atomic_log.clone())
+            .await
+            .expect("durable zombie determines recovery offset");
+        assert_eq!(recovered.next_offset(), RecordOffset::new(10));
+        let mut zombie_reader = JournalReader::from_checkpoint(
+            journal_id(),
+            atomic_log,
+            Checkpoint {
+                journal_id: journal_id(),
+                next_offset: RecordOffset::new(9),
+                resume_hint: Some(ResumeHint::new(0, 0)),
+            },
+        )
+        .expect("zombie reader");
+        zombie_reader
+            .refresh_tail()
+            .await
+            .expect("sealed tail poll");
+        let ReadEvent::Record(zombie) = zombie_reader
+            .read_next()
+            .await
+            .expect("durable zombie is readable")
+        else {
+            panic!("expected durable zombie record");
+        };
+        assert_eq!(zombie.offset, RecordOffset::new(9));
 
         let fresh = log();
         let mut overflow = JournalWriter::new(journal_id(), fresh, RecordOffset::new(u64::MAX));
@@ -159,6 +198,7 @@ fn reader_rejects_wrong_journal_discontinuity_and_invalid_resume_hint() {
             .await
             .expect("write other journal");
         let mut wrong_reader = JournalReader::from_start(journal_id(), wrong_log);
+        wrong_reader.refresh_tail().await.expect("wrong tail poll");
         assert!(matches!(
             wrong_reader.read_next().await,
             Err(ReadError::JournalMismatch { .. })
@@ -174,6 +214,10 @@ fn reader_rejects_wrong_journal_discontinuity_and_invalid_resume_hint() {
         .await
         .expect("write discontinuous batch");
         let mut discontinuous = JournalReader::from_start(journal_id(), discontinuous_log);
+        discontinuous
+            .refresh_tail()
+            .await
+            .expect("discontinuous tail poll");
         assert!(matches!(
             discontinuous.read_next().await,
             Err(ReadError::OffsetDiscontinuity {
@@ -194,6 +238,7 @@ fn reader_rejects_wrong_journal_discontinuity_and_invalid_resume_hint() {
         };
         let mut hinted = JournalReader::from_checkpoint(journal_id(), hinted_log, checkpoint)
             .expect("construct reader before durable hint validation");
+        hinted.refresh_tail().await.expect("hinted tail poll");
         assert!(matches!(
             hinted.read_next().await,
             Err(ReadError::InvalidResumeHint {
@@ -269,6 +314,7 @@ proptest! {
             prop_assert_eq!(writer.next_offset(), RecordOffset::new(expected_count));
 
             let mut reader = JournalReader::from_start(journal_id(), log);
+            reader.refresh_tail().await.expect("generated tail poll");
             for expected in 0..expected_count {
                 let event = reader.read_next().await.expect("read generated record");
                 let ReadEvent::Record(record) = event else {

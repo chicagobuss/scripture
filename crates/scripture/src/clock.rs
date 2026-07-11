@@ -114,6 +114,7 @@ pub struct BatchAccumulator<C> {
     policy: BatchPolicy,
     clock: C,
     records: Vec<Record>,
+    encoded_length: usize,
     started_at: Option<Duration>,
 }
 
@@ -125,6 +126,7 @@ impl<C: Clock> BatchAccumulator<C> {
             policy,
             clock,
             records: Vec::new(),
+            encoded_length: encoded_batch_len(&[]).expect("empty batch length is representable"),
             started_at: None,
         }
     }
@@ -132,7 +134,8 @@ impl<C: Clock> BatchAccumulator<C> {
     /// Attempts to stage one record under the count and exact encoded-byte
     /// bounds. A single oversized record is accepted into an empty batch.
     pub fn push(&mut self, record: Record) -> Result<PushResult, CodecError> {
-        let candidate_length = encoded_batch_len(&self.records)?
+        let candidate_length = self
+            .encoded_length
             .checked_add(8)
             .and_then(|length| length.checked_add(encoded_record_len(&record).ok()?))
             .ok_or(CodecError::Oversized)?;
@@ -145,9 +148,10 @@ impl<C: Clock> BatchAccumulator<C> {
             self.started_at = Some(self.clock.now());
         }
         self.records.push(record);
+        self.encoded_length = candidate_length;
         Ok(PushResult::Accepted {
             should_flush: self.records.len() >= self.policy.max_records
-                || encoded_batch_len(&self.records)? >= self.policy.max_bytes,
+                || self.encoded_length >= self.policy.max_bytes,
         })
     }
 
@@ -173,6 +177,7 @@ impl<C: Clock> BatchAccumulator<C> {
     /// Drains the pending records for durable append.
     pub fn take(&mut self) -> Vec<Record> {
         self.started_at = None;
+        self.encoded_length = encoded_batch_len(&[]).expect("empty batch length is representable");
         std::mem::take(&mut self.records)
     }
 }

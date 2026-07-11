@@ -12,8 +12,10 @@ v0 needs the smallest honest read path over Loglet `check_tail` and
 
 ## Decision
 
-`JournalReader` is client-direct and pull-based. The caller controls tail-poll
-cadence. The reader fetches whole batches, validates journal identity and dense
+`JournalReader` is client-direct and pull-based. Tail refresh is an explicit
+`refresh_tail` operation, so the caller controls and can observe poll cadence.
+`read_next` never polls implicitly; it returns `CaughtUp` at the last checked
+tail. The reader fetches whole batches, validates journal identity and dense
 offset continuity, and yields records in order. There is no agent,
 notification channel, filtering, or consumer group in v0.
 
