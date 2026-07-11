@@ -20,8 +20,15 @@ record section, footer index, footer length, and footer magic.
 Attributes are canonically ordered by key. Initially supported scalar values
 are UTF-8 string, signed 64-bit integer, and boolean. The wire encoding uses a
 type tag and length-delimited value so later scalar types need not change the
-outer framing. Duplicate attribute keys, malformed values, non-canonical
+outer framing. Adding a type still gates older readers: unknown tags are
+strictly rejected so a future filter cannot silently miss an attribute it
+cannot interpret. Framing extensibility is not a compatibility promise.
+Duplicate attribute keys, malformed values, non-canonical
 ordering, trailing bytes, and unknown major versions are rejected.
+
+The minor version is reserved for a future negotiated-capability scheme. v0
+strictly rejects newer minor versions, so today a minor bump gates old readers
+just like a major bump. No compatibility distinction is claimed yet.
 
 The footer records each record's byte offset. In v0 this accelerates in-memory
 decoding only. Holylog's `LogDrive::read` returns a whole value, so Scripture

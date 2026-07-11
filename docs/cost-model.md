@@ -27,6 +27,15 @@ PUTs per record       = Qw / R
 uploaded bytes/record = Qw × B / R
 ```
 
+The current writer is sequential and permits only one outstanding batch, so:
+
+```text
+maximum batches/second <= 1 / durable_append_round_trip_seconds
+```
+
+K-window pipelining is not used by v0 and must not be included in throughput
+or cost projections until the async writer driver exists.
+
 The final seal check is a metadata read. With a durable LogDrive-backed seal,
 add one seal GET per batch append that reaches its acknowledgement check.
 Failed/abandoned writes may incur work without producing acknowledged records

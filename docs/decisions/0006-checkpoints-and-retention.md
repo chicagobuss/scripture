@@ -18,7 +18,15 @@ storage and the point at which application processing advances it belong to
 the consumer. At-least-once is the only claimed delivery guarantee.
 
 Retention is a manual trim operation under one retention authority per
-journal. There is no automatic policy or physical reclamation in Scripture v0.
+journal, represented independently from the writer. The v0 primitive speaks
+Holylog slots; an offset/time retention policy must later define and cost its
+offset-to-slot mapping. There is no automatic policy or physical reclamation
+in Scripture v0.
+
+Durable-but-unacknowledged zombie batches are visible to recovery and readers.
+They consume offsets even though their original producer observed an error;
+application retry may therefore create a duplicate at a later offset. This is
+within the v0 at-least-once claim and must be preserved by VirtualLog recovery.
 
 ## Correctness
 
