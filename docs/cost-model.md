@@ -100,3 +100,10 @@ Protoscripture's sample numbers are deterministic in-memory
 metadata, provider request pricing, latency, and an idle polling cadence. A
 provider-realistic experiment must put all of those operations in the same
 ledger before quoting dollars.
+
+## Physical Reclamation
+
+In the cost analysis of log pruning and retention, several constraints must be observed:
+- **Entries ≠ Slots:** Because of Scripture batching, the number of records (entries) $R$ does not equal the physical slots. Batching divides the S3/R2 request counts by $R$, making batching policy the first-class economic defense against API costs.
+- **Durable Metadata Isolation:** Durable metadata registers (such as seal, trim, and future checkpoints) must be bound to and age out with the generations they describe, rather than accreting globally and creating unbounded scan/read overhead over time.
+- **Physical purges:** Storage reclamation cannot rely on naïve slot-by-slot `DELETE` API loops, which are economically prohibitive. Reclamation strategies must utilize delegated provider lifecycle rules applied to sealed-generation prefixes to achieve zero-request bulk purges.
