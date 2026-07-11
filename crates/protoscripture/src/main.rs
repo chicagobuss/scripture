@@ -6,14 +6,24 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::executor::block_on;
-use holylog::atomic::{
-    AtomicLog, AtomicLogError, InMemorySeal, InMemorySequencer, InMemoryTrimPoint,
-};
+use holylog::atomic::{AtomicLog, AtomicLogError};
 use holylog::drive::LogDrive;
-use holylog::quorum::QuorumLogDrive;
-use protoscripture::{InMemoryDrive, Journal, JournalError, Record};
+use holylog::memory::InMemoryLogDrive;
+use holylog::quorum::{QuorumError, QuorumLogDrive};
+use protoscripture::{Journal, JournalError, Record};
 
 const K: u64 = 4;
+
+/// Construction failures keep their categories: quorum configuration errors
+/// are not runtime drive errors.
+#[derive(Debug, thiserror::Error)]
+enum SetupError {
+    #[error(transparent)]
+    Quorum(#[from] QuorumError),
+
+    #[error(transparent)]
+    Log(#[from] AtomicLogError),
+}
 
 fn orders(region: &str, ids: &[u32]) -> Vec<Record> {
     ids.iter()
@@ -26,27 +36,16 @@ fn orders(region: &str, ids: &[u32]) -> Vec<Record> {
         .collect()
 }
 
-fn build_journal() -> Result<(Journal, Arc<QuorumLogDrive>), AtomicLogError> {
+fn build_journal() -> Result<(Journal, Arc<QuorumLogDrive>), SetupError> {
     let replicas: Vec<Arc<dyn LogDrive>> = (0..3)
-        .map(|_| Arc::new(InMemoryDrive::new()) as Arc<dyn LogDrive>)
+        .map(|_| Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>)
         .collect();
-    let quorum = Arc::new(
-        QuorumLogDrive::new(replicas, 2)
-            .map_err(|error| AtomicLogError::Drive(holylog::drive::DriveError::backend(error)))?,
-    );
-    let log = AtomicLog::new(
-        Arc::clone(&quorum) as Arc<dyn LogDrive>,
-        Arc::new(InMemorySequencer::new(K)),
-        Arc::new(InMemorySeal::new()),
-        Arc::new(InMemoryTrimPoint::new()),
-        K,
-    )?;
+    let quorum = Arc::new(QuorumLogDrive::new(replicas, 2)?);
+    let log = AtomicLog::builder(Arc::clone(&quorum) as Arc<dyn LogDrive>, K).build()?;
     Ok((Journal::new("orders", log), quorum))
 }
 
-async fn run() -> Result<(), JournalError> {
-    let (journal, quorum) = build_journal()?;
-
+async fn run(journal: &Journal, quorum: &QuorumLogDrive) -> Result<(), JournalError> {
     // Producer: three batches, mixed regions.
     let batches = [
         orders("eu", &[1, 2]),
@@ -128,7 +127,14 @@ async fn run() -> Result<(), JournalError> {
 }
 
 fn main() {
-    if let Err(error) = block_on(run()) {
+    let (journal, quorum) = match build_journal() {
+        Ok(built) => built,
+        Err(error) => {
+            eprintln!("protoscripture setup failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = block_on(run(&journal, &quorum)) {
         eprintln!("protoscripture spike failed: {error}");
         std::process::exit(1);
     }

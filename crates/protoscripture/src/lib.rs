@@ -7,66 +7,9 @@
 //! is answered by the Scripture design obligations, not by this code.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use holylog::atomic::{AtomicLog, AtomicLogError, LogEntry};
-use holylog::drive::{DriveError, DriveFuture, LogDrive};
-use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
-
-/// A deterministic in-memory primitive LogDrive for spike runs.
-///
-/// Kernel gap: holylog does not export a reusable asynchronous in-memory
-/// drive, so every consumer rebuilds this wrapper around `ReferenceLogDrive`.
-#[derive(Debug, Default)]
-pub struct InMemoryDrive {
-    model: Mutex<ReferenceLogDrive>,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("in-memory drive lock poisoned")]
-struct LockPoisoned;
-
-impl InMemoryDrive {
-    /// Creates an empty drive.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl LogDrive for InMemoryDrive {
-    fn write(&self, address: Address, value: Bytes) -> DriveFuture<'_, ()> {
-        Box::pin(async move {
-            self.model
-                .lock()
-                .map_err(|_| DriveError::backend(LockPoisoned))?
-                .write(address, value)?;
-            Ok(())
-        })
-    }
-
-    fn read(&self, address: Address) -> DriveFuture<'_, Option<Bytes>> {
-        Box::pin(async move {
-            Ok(self
-                .model
-                .lock()
-                .map_err(|_| DriveError::backend(LockPoisoned))?
-                .read(address)
-                .cloned())
-        })
-    }
-
-    fn weak_tail(&self, k: u64) -> DriveFuture<'_, TailDescription> {
-        Box::pin(async move {
-            Ok(self
-                .model
-                .lock()
-                .map_err(|_| DriveError::backend(LockPoisoned))?
-                .weak_tail(k)?)
-        })
-    }
-}
 
 /// Envelope format version written as the first byte of every batch.
 pub const BATCH_FORMAT_VERSION: u8 = 0;
