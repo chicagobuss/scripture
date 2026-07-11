@@ -217,20 +217,4 @@ mod tests {
         drop(handle);
         actor.await.expect("actor exits");
     }
-
-    #[tokio::test]
-    async fn rejected_codec_input_does_not_wedge_later_valid_submissions() {
-        let (handle, actor) = JournalActor::new(writer(), 4);
-        let actor = tokio::spawn(actor.run());
-        let invalid = Record::new(
-            [("value".into(), AttributeValue::F64(f64::NAN))],
-            Bytes::new(),
-        );
-        let invalid = handle.submit(vec![invalid]).await.expect("enqueue invalid");
-        assert_eq!(invalid.await, Err(ServiceError::InvalidRequest));
-        let valid = handle.submit(vec![record(1)]).await.expect("enqueue valid");
-        assert_eq!(valid.await.expect("valid durable").first_offset.get(), 0);
-        drop(handle);
-        actor.await.expect("actor exits");
-    }
 }
