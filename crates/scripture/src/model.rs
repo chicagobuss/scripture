@@ -55,27 +55,23 @@ impl RecordOffset {
     }
 }
 
-/// Initially supported typed attribute values.
+/// Initially supported typed attribute values for small envelope metadata.
 ///
-/// Floating-point values are finite IEEE-754 binary64 values. `NaN` and the
-/// infinities do not have a useful portable data-model meaning, so the codec
-/// rejects them rather than quietly persisting a non-canonical value.
-#[derive(Debug, Clone, PartialEq)]
+/// Application message types deliberately do not live here. Payloads remain
+/// opaque until a future immutable schema reference and parser/projection layer
+/// define how to interpret them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttributeValue {
     /// UTF-8 text.
     String(String),
     /// Signed 64-bit integer.
     I64(i64),
-    /// Finite IEEE-754 binary64 number.
-    F64(f64),
-    /// UTC Unix timestamp in microseconds.
-    TimestampMicros(i64),
     /// Boolean.
     Bool(bool),
 }
 
 /// One application record before or after durable encoding.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// Canonically key-ordered typed attributes.
     pub attributes: BTreeMap<String, AttributeValue>,
@@ -98,7 +94,7 @@ impl Record {
 }
 
 /// One decoded record with its stable journal offset.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRecord {
     /// Dense record offset.
     pub offset: RecordOffset,

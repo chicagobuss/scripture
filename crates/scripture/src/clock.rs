@@ -100,7 +100,7 @@ impl Default for BatchPolicy {
 }
 
 /// Result of trying to add a record to an accumulator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushResult {
     /// Record was staged. `should_flush` reports whether a bound is now met.
     Accepted { should_flush: bool },

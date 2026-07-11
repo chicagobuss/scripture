@@ -13,11 +13,9 @@ const MINOR_VERSION: u8 = 0;
 const STRING_TAG: u8 = 1;
 const I64_TAG: u8 = 2;
 const BOOL_TAG: u8 = 3;
-const F64_TAG: u8 = 4;
-const TIMESTAMP_MICROS_TAG: u8 = 5;
 
 /// A fully decoded durable batch.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
     /// Journal identity embedded in the batch.
     pub journal_id: JournalId,
@@ -51,12 +49,6 @@ pub enum CodecError {
     /// A bool was not encoded canonically.
     #[error("boolean attribute has invalid value {value}")]
     InvalidBool { value: u8 },
-    /// A floating-point attribute was not finite.
-    #[error("floating-point attribute must be finite")]
-    NonFiniteFloat,
-    /// A finite float used a non-canonical representation.
-    #[error("floating-point attribute is not canonically encoded")]
-    NonCanonicalFloat,
     /// A fixed-width attribute used the wrong encoded length.
     #[error("attribute type {tag} has length {actual}, expected {expected}")]
     InvalidAttributeLength {
@@ -92,15 +84,6 @@ fn put_len_bytes(buffer: &mut BytesMut, value: &[u8]) -> Result<(), CodecError> 
     Ok(())
 }
 
-fn canonical_float_bits(value: f64) -> Result<u64, CodecError> {
-    if !value.is_finite() {
-        return Err(CodecError::NonFiniteFloat);
-    }
-    // Rust (and the data model) treats both zero signs as equal. Persist one
-    // representation so canonical re-encoding also holds for zero.
-    Ok(if value == 0.0 { 0.0 } else { value }.to_bits())
-}
-
 /// Encodes a canonical self-contained batch.
 pub fn encode_batch(
     journal_id: JournalId,
@@ -131,16 +114,6 @@ pub fn encode_batch(
                 }
                 AttributeValue::I64(value) => {
                     output.put_u8(I64_TAG);
-                    output.put_u32(8);
-                    output.put_i64(*value);
-                }
-                AttributeValue::F64(value) => {
-                    output.put_u8(F64_TAG);
-                    output.put_u32(8);
-                    output.put_u64(canonical_float_bits(*value)?);
-                }
-                AttributeValue::TimestampMicros(value) => {
-                    output.put_u8(TIMESTAMP_MICROS_TAG);
                     output.put_u32(8);
                     output.put_i64(*value);
                 }
@@ -191,11 +164,6 @@ pub(crate) fn encoded_record_len(record: &Record) -> Result<usize, CodecError> {
         let value_length = match value {
             AttributeValue::String(value) => value.len(),
             AttributeValue::I64(_) => 8,
-            AttributeValue::F64(value) => {
-                let _ = canonical_float_bits(*value)?;
-                8
-            }
-            AttributeValue::TimestampMicros(_) => 8,
             AttributeValue::Bool(_) => 1,
         };
         length = length
@@ -322,64 +290,37 @@ pub fn decode_batch(bytes: &Bytes) -> Result<Batch, CodecError> {
             previous_key = Some(key.clone());
             let tag = cursor.u8()?;
             let value_bytes = cursor.len_bytes()?;
-            let value =
-                match tag {
-                    STRING_TAG => AttributeValue::String(
-                        std::str::from_utf8(value_bytes)
-                            .map_err(|_| CodecError::InvalidUtf8)?
-                            .to_owned(),
-                    ),
-                    I64_TAG => {
-                        let value: [u8; 8] = value_bytes.try_into().map_err(|_| {
-                            CodecError::InvalidAttributeLength {
+            let value = match tag {
+                STRING_TAG => AttributeValue::String(
+                    std::str::from_utf8(value_bytes)
+                        .map_err(|_| CodecError::InvalidUtf8)?
+                        .to_owned(),
+                ),
+                I64_TAG => {
+                    let value: [u8; 8] =
+                        value_bytes
+                            .try_into()
+                            .map_err(|_| CodecError::InvalidAttributeLength {
                                 tag: I64_TAG,
                                 expected: 8,
                                 actual: value_bytes.len(),
-                            }
-                        })?;
-                        AttributeValue::I64(i64::from_be_bytes(value))
+                            })?;
+                    AttributeValue::I64(i64::from_be_bytes(value))
+                }
+                BOOL_TAG => match value_bytes {
+                    [0] => AttributeValue::Bool(false),
+                    [1] => AttributeValue::Bool(true),
+                    [value] => return Err(CodecError::InvalidBool { value: *value }),
+                    _ => {
+                        return Err(CodecError::InvalidAttributeLength {
+                            tag: BOOL_TAG,
+                            expected: 1,
+                            actual: value_bytes.len(),
+                        });
                     }
-                    F64_TAG => {
-                        let value: [u8; 8] = value_bytes.try_into().map_err(|_| {
-                            CodecError::InvalidAttributeLength {
-                                tag: F64_TAG,
-                                expected: 8,
-                                actual: value_bytes.len(),
-                            }
-                        })?;
-                        let value = f64::from_bits(u64::from_be_bytes(value));
-                        let canonical_bits = canonical_float_bits(value)?;
-                        if value.to_bits() != canonical_bits {
-                            return Err(CodecError::NonCanonicalFloat);
-                        }
-                        AttributeValue::F64(value)
-                    }
-                    TIMESTAMP_MICROS_TAG => {
-                        if value_bytes.len() != 8 {
-                            return Err(CodecError::InvalidAttributeLength {
-                                tag: TIMESTAMP_MICROS_TAG,
-                                expected: 8,
-                                actual: value_bytes.len(),
-                            });
-                        }
-                        AttributeValue::TimestampMicros(i64::from_be_bytes(
-                            value_bytes.try_into().map_err(|_| CodecError::Truncated)?,
-                        ))
-                    }
-                    BOOL_TAG => match value_bytes {
-                        [0] => AttributeValue::Bool(false),
-                        [1] => AttributeValue::Bool(true),
-                        [value] => return Err(CodecError::InvalidBool { value: *value }),
-                        _ => {
-                            return Err(CodecError::InvalidAttributeLength {
-                                tag: BOOL_TAG,
-                                expected: 1,
-                                actual: value_bytes.len(),
-                            });
-                        }
-                    },
-                    tag => return Err(CodecError::UnsupportedAttributeType { tag }),
-                };
+                },
+                tag => return Err(CodecError::UnsupportedAttributeType { tag }),
+            };
             if attributes.insert(key, value).is_some() {
                 return Err(CodecError::NonCanonicalAttributes);
             }

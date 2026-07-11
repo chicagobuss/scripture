@@ -26,10 +26,10 @@ The actor has terminal failure behavior. On a kernel failure (or offset-space
 exhaustion) it returns the mapped error for that request and returns the same
 terminal error to every later queued submission. It does not leave
 acknowledgement futures pending. `AtomicLogError::Sealed` maps to `Sealed {
-slot }`; other kernel failures map to `Unavailable`. Deterministic bad input
-(such as a non-finite float) is rejected only for that request and does not
-wedge the actor. An unavailable or sealed request may still have durable zombie
-bytes, so an error is never evidence that its records are absent.
+slot }`; other kernel failures map to `Unavailable`. Deterministic envelope
+validation failures are rejected only for that request and do not wedge the
+actor. An unavailable or sealed request may still have durable zombie bytes,
+so an error is never evidence that its records are absent.
 
 `scriptured` supplies only a lab-grade raw-lines TCP adapter: one newline
 delimited byte line maps to one record and, in FIFO line order, receives
