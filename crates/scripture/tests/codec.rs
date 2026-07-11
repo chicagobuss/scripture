@@ -49,6 +49,8 @@ proptest! {
                 btree_map("[a-z]{1,8}", prop_oneof![
                     "[a-z0-9]{0,16}".prop_map(AttributeValue::String),
                     any::<i64>().prop_map(AttributeValue::I64),
+                    any::<f64>().prop_filter("finite", |value| value.is_finite()).prop_map(AttributeValue::F64),
+                    any::<i64>().prop_map(AttributeValue::TimestampMicros),
                     any::<bool>().prop_map(AttributeValue::Bool),
                 ], 0..5),
                 vec(any::<u8>(), 0..128),
@@ -83,4 +85,50 @@ proptest! {
     fn arbitrary_bytes_never_panic(bytes in vec(any::<u8>(), 0..512)) {
         let _ = decode_batch(&Bytes::from(bytes));
     }
+}
+
+#[test]
+fn rejects_non_finite_floats() {
+    let record = Record::new(
+        [("value".into(), AttributeValue::F64(f64::NAN))],
+        Bytes::new(),
+    );
+    assert_eq!(
+        encode_batch(journal_id(), RecordOffset::new(0), &[record]),
+        Err(CodecError::NonFiniteFloat)
+    );
+}
+
+#[test]
+fn float_zero_is_canonical_and_timestamp_round_trips() {
+    let negative_zero = Record::new(
+        [
+            ("value".into(), AttributeValue::F64(-0.0)),
+            (
+                "event_time".into(),
+                AttributeValue::TimestampMicros(1_725_000_000_123_456),
+            ),
+        ],
+        Bytes::new(),
+    );
+    let positive_zero = Record::new(
+        [
+            ("value".into(), AttributeValue::F64(0.0)),
+            (
+                "event_time".into(),
+                AttributeValue::TimestampMicros(1_725_000_000_123_456),
+            ),
+        ],
+        Bytes::new(),
+    );
+    let negative = encode_batch(journal_id(), RecordOffset::new(0), &[negative_zero])
+        .expect("encode negative zero");
+    let positive = encode_batch(journal_id(), RecordOffset::new(0), &[positive_zero])
+        .expect("encode positive zero");
+    assert_eq!(negative, positive);
+    let decoded = decode_batch(&negative).expect("decode");
+    assert_eq!(
+        decoded.records[0].attributes.get("event_time"),
+        Some(&AttributeValue::TimestampMicros(1_725_000_000_123_456))
+    );
 }

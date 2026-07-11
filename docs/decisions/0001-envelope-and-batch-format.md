@@ -18,9 +18,12 @@ minor format versions, `JournalId`, dense base `RecordOffset`, record count,
 record section, footer index, footer length, and footer magic.
 
 Attributes are canonically ordered by key. Initially supported scalar values
-are UTF-8 string, signed 64-bit integer, and boolean. The wire encoding uses a
-type tag and length-delimited value so later scalar types need not change the
-outer framing. Adding a type still gates older readers: unknown tags are
+are UTF-8 string, signed 64-bit integer, finite IEEE-754 binary64, UTC Unix
+microsecond timestamp, and boolean. The float and timestamp types are present
+before production bytes specifically so metrics and lakehouse projections do
+not have to smuggle numeric/event-time data through strings. `NaN` and both
+infinities are rejected. The wire encoding uses a type tag and length-delimited
+value so later scalar types need not change the outer framing. Adding a type still gates older readers: unknown tags are
 strictly rejected so a future filter cannot silently miss an attribute it
 cannot interpret. Framing extensibility is not a compatibility promise.
 Duplicate attribute keys, malformed values, non-canonical

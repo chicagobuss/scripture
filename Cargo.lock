@@ -1455,6 +1455,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "scripture-service"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "holylog",
+ "scripture",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "scriptured"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "holylog",
+ "scripture",
+ "scripture-service",
+ "tokio",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
