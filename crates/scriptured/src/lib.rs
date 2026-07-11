@@ -49,7 +49,8 @@ pub async fn serve_raw_lines_connection(
     journal: JournalHandle,
     config: RawLinesConfig,
 ) -> io::Result<()> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
     loop {
         match read_line(&mut reader, config.max_line_bytes).await {
             Ok(Some(line)) => {
@@ -187,6 +188,50 @@ mod tests {
         };
         assert_eq!(first.payload.as_ref(), b"first");
         assert_eq!(second.payload.as_ref(), b"second");
+
+        drop(handle);
+        actor.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn raw_lines_buffering_handles_split_writes() {
+        let drive = Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>;
+        let log = AtomicLog::builder(drive, 4).build().expect("build log");
+        let journal_id = JournalId::from_bytes(*b"split-writes-t!!");
+        let writer = JournalWriter::new(journal_id, log.clone(), RecordOffset::new(0));
+        let (handle, actor) = JournalActor::new(writer, 4);
+        let actor = tokio::spawn(actor.run());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_handle = handle.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_raw_lines_connection(stream, server_handle, RawLinesConfig::default())
+                .await
+                .expect("serve")
+        });
+
+        let mut client = TcpStream::connect(address).await.expect("connect");
+
+        // Write a single line split across many small writes with yields
+        for byte in b"hello split world\n" {
+            client.write_all(&[*byte]).await.expect("write byte");
+            tokio::task::yield_now().await;
+        }
+        client.shutdown().await.expect("finish input");
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read acks");
+        assert_eq!(response, b"OK 0 1\n");
+        server.await.expect("server joins");
+
+        let mut reader = JournalReader::from_start(journal_id, log);
+        reader.refresh_tail().await.expect("tail");
+        let ReadEvent::Record(first) = reader.read_next().await.expect("first record") else {
+            panic!("expected record");
+        };
+        assert_eq!(first.payload.as_ref(), b"hello split world");
 
         drop(handle);
         actor.await.expect("actor joins");
