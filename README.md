@@ -5,20 +5,39 @@ Scripture is the log-system layer being designed on top of the
 subscriptions, consumer checkpoints, queue semantics, and retention policy,
 built strictly against holylog's public API.
 
-**Status: design phase.** There is no product code here yet, and none may be
-written until the corresponding design decisions are recorded. Scripture's
-design obligations live in the project family's coordination notes; accepted
-decisions migrate into `docs/decisions/` as the code that binds them lands.
+**Status: v0 implementation phase.** The first seven decisions are accepted in
+[`docs/decisions`](docs/decisions): canonical batches and typed attributes,
+dense record offsets, one in-process durable writer, direct pull reads,
+operator-configured stable journal identity, consumer-owned checkpoints/manual
+retention, and backend-neutral cost accounting.
+
+The `scripture` crate implements that bounded surface. It deliberately makes
+no directory, cross-process writer fencing/restart, filtering, consumer-group,
+queue, or physical-reclamation claim. Those remain later decisions rather
+than implicit behavior.
 
 ## Protoscripture
 
-The only crate, `crates/protoscripture`, is a **disposable spike** that
+`crates/protoscripture` is a **disposable spike** that
 exercises the kernel from a consumer's seat: a versioned record envelope, a
 batch codec, and a `Journal` over `AtomicLog`, driven end-to-end (append,
 checked-tail reads, client-side filtering, prefix trim, seal, post-seal
 recovery reads) by `cargo run -p protoscripture`. Its purpose is to
 pressure-test the kernel surface, not to grow into the product; findings feed
 [`docs/kernel-gap-report.md`](docs/kernel-gap-report.md).
+
+## Scripture v0 crate
+
+`crates/scripture` contains the code-bound v0 contract:
+
+- canonical self-contained batches with stable `JournalId`, typed attributes,
+  dense `RecordOffset`, and a validated footer index;
+- a non-cloneable `JournalWriter` whose acknowledgements mean Holylog accepted
+  the whole batch;
+- a direct `JournalReader` with checkpoints defined as the next record to
+  consume and explicit trim-gap events; and
+- deterministic count/byte/monotonic-age batching policy without any claim
+  that buffered records are durable.
 
 ## Development
 
