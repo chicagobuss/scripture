@@ -167,17 +167,48 @@ There are three ways out, and only one is honest:
 **Decision 0009 supersedes decision 0001's `Batch` as Scripture's durable payload
 format.** A single-frame chunk is the direct successor to a batch — it carries the
 same `(journal_id, base_offset, records)` and adds cohort, generation, writer
-identity, producer ranges, and per-frame integrity. Phase 1 therefore ships
+identity, producer ranges, and per-frame integrity. Phase 1 ships
 `ChunkLogWriter` / `ChunkLogReader` over `AtomicLog` and **retires** the `Batch`
-codec, `JournalWriter`, and `JournalReader` along with the transitional
-`AttributeValue` scalars (0001's own note already marks those transitional).
+codec, `JournalWriter`, and `JournalReader`.
 
 This is a format break with no cost, and it is the last moment it will be free:
 **no production bytes exist.** Making it now is cheaper than carrying two
 envelopes for the life of the system.
 
+**Scope (amended 2026-07-12): the transitional `AttributeValue` scalars stay.**
+Replacing the envelope does not require changing the record's type policy — the
+chunk represents `string | i64 | bool` attributes exactly as the batch did. The
+opaque-core migration is a *separate* question with a separate rationale, and
+folding it into a format replacement would make two independently reviewable
+decisions into one unreviewable commit. 0001's transitional note stands; retiring
+the scalars gets its own change.
+
 The raw-lines lab listener and `scripture-service`'s `JournalActor` are rewired
 onto the chunk path in the same change. Neither has durable data.
+
+## Deployment profiles: single-node is a first-class profile
+
+Nothing in this record, or in 0010 and 0011, requires more than one node.
+
+| Profile | Owner | Fencing | What you get | What you give up |
+|---|---|---|---|---|
+| **single-node** | one process | none needed (there is no contender) | the full contract: chunks, dense offsets, `committed` acks, producer idempotence, trim, recovery from durable bytes | **high availability.** If the process is down, writes stop |
+| **fenced multi-node** | one at a time, elected | VirtualLog generation + conditional register (0011) | the above, plus failover | an attested register, and the operational footprint that comes with it |
+
+The single-node profile is not a degraded mode or a toy: it is the same code,
+the same format, and the same durability, because durability comes from the
+object store rather than from the fleet. A VirtualLog is *optional* — a
+`ChunkLogWriter` sits directly on an `AtomicLog`, and a deployment that never
+reconfigures never needs a register.
+
+What a single node loses is precisely availability: no successor can take over,
+so an outage stops writes until the process returns — and, because the process
+was the only owner, it can simply resume (its next `recover` rebuilds state from
+durable bytes). It cannot lose committed data, because committed means the object
+store has it.
+
+This is the profile Phase 1 implements. Fencing is what the *second* node costs,
+and it is charged only to deployments that want one.
 
 ## Correctness
 
