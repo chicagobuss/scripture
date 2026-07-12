@@ -1,6 +1,14 @@
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use futures::future::BoxFuture;
+use futures::task::AtomicWaker;
 
 use crate::batch::{CodecError, encoded_batch_len, encoded_record_len};
 use crate::model::Record;
@@ -18,7 +26,7 @@ impl<T: Clock + ?Sized> Clock for Arc<T> {
 }
 
 /// Production monotonic clock.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SystemClock {
     origin: Instant,
 }
@@ -30,6 +38,14 @@ impl SystemClock {
         Self {
             origin: Instant::now(),
         }
+    }
+
+    /// Paired clock and timer sharing one origin so `now` and `sleep_until`
+    /// speak the same Duration scale.
+    #[must_use]
+    pub fn pair() -> (Self, SystemTimer) {
+        let origin = Instant::now();
+        (Self { origin }, SystemTimer { origin })
     }
 }
 
@@ -74,6 +90,269 @@ impl ManualClock {
 impl Clock for ManualClock {
     fn now(&self) -> Duration {
         Duration::from_nanos(self.nanos.load(Ordering::Acquire))
+    }
+}
+
+/// A wakeable sleep until a monotonic deadline on the timer's own scale.
+///
+/// [`Clock::now`] alone cannot drive an age-bound flush deterministically: the
+/// actor's `run` future must wake when a deadline is crossed. [`ManualTimer`]
+/// shares [`ManualClock`]'s nanos; [`SystemTimer`] is for the application edge.
+pub trait Timer: Send + Sync {
+    /// Completes at or after `deadline` on this timer's monotonic scale.
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()>;
+}
+
+impl<T: Timer + ?Sized> Timer for Arc<T> {
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        T::sleep_until(self, deadline)
+    }
+}
+
+/// Wall-clock timer for the application edge. Spawns a sleeper thread so the
+/// core crate stays free of tokio. Prefer [`SystemClock::pair`] so the clock and
+/// timer share one origin.
+///
+/// Cancellation is per sleeper: dropping one sleep future must not affect any
+/// other outstanding sleep on the same timer.
+#[derive(Debug, Clone)]
+pub struct SystemTimer {
+    origin: Instant,
+}
+
+impl SystemTimer {
+    /// Starts a timer whose deadlines are measured from construction.
+    ///
+    /// Prefer [`SystemClock::pair`] when the same process also uses
+    /// [`SystemClock::now`] values as `sleep_until` deadlines.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Timer for SystemTimer {
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let origin = self.origin;
+        Box::pin(async move {
+            let elapsed = origin.elapsed();
+            if elapsed >= deadline {
+                return;
+            }
+            let remaining = deadline - elapsed;
+            let sleeper = Arc::new(Sleeper {
+                done: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            });
+            let thread_sleeper = Arc::clone(&sleeper);
+            std::thread::spawn(move || {
+                std::thread::sleep(remaining);
+                if thread_sleeper.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                thread_sleeper.done.store(true, Ordering::Release);
+                thread_sleeper.waker.wake();
+            });
+            SystemSleepUntil { sleeper }.await;
+        })
+    }
+}
+
+struct SystemSleepUntil {
+    sleeper: Arc<Sleeper>,
+}
+
+impl Future for SystemSleepUntil {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.sleeper.done.load(Ordering::Acquire)
+            || self.sleeper.cancelled.load(Ordering::Acquire)
+        {
+            return Poll::Ready(());
+        }
+        self.sleeper.waker.register(context.waker());
+        if self.sleeper.done.load(Ordering::Acquire)
+            || self.sleeper.cancelled.load(Ordering::Acquire)
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for SystemSleepUntil {
+    fn drop(&mut self) {
+        self.sleeper.cancelled.store(true, Ordering::Release);
+        self.sleeper.waker.wake();
+    }
+}
+
+struct Sleeper {
+    done: AtomicBool,
+    cancelled: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl std::fmt::Debug for Sleeper {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Sleeper")
+            .field("done", &self.done.load(Ordering::Relaxed))
+            .field("cancelled", &self.cancelled.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct ManualTimerInner {
+    clock: Arc<ManualClock>,
+    sleepers: Mutex<BTreeMap<(u64, u64), Arc<Sleeper>>>,
+    next_id: AtomicU64,
+}
+
+/// Deterministic timer for tests. [`ManualTimer::advance`] moves the shared
+/// [`ManualClock`] and wakes every sleeper whose deadline has passed.
+#[derive(Debug, Clone)]
+pub struct ManualTimer {
+    inner: Arc<ManualTimerInner>,
+}
+
+impl ManualTimer {
+    /// Pairs a new timer with an existing manual clock (same Duration scale).
+    #[must_use]
+    pub fn new(clock: Arc<ManualClock>) -> Self {
+        Self {
+            inner: Arc::new(ManualTimerInner {
+                clock,
+                sleepers: Mutex::new(BTreeMap::new()),
+                next_id: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// The shared manual clock this timer advances.
+    #[must_use]
+    pub fn clock(&self) -> &ManualClock {
+        &self.inner.clock
+    }
+
+    /// Advances time and wakes sleepers whose deadlines are now due.
+    pub fn advance(&self, duration: Duration) {
+        self.inner.clock.advance(duration);
+        self.wake_due();
+    }
+
+    /// Number of registered sleepers that have not yet completed or been
+    /// cancelled. Test hook for leak regressions.
+    #[must_use]
+    pub fn sleeper_count(&self) -> usize {
+        self.inner
+            .sleepers
+            .lock()
+            .map(|guard| guard.len())
+            .unwrap_or(0)
+    }
+
+    fn wake_due(&self) {
+        let now = u64::try_from(self.inner.clock.now().as_nanos()).unwrap_or(u64::MAX);
+        let Ok(mut sleepers) = self.inner.sleepers.lock() else {
+            return;
+        };
+        while let Some(entry) = sleepers.first_entry() {
+            if entry.key().0 > now {
+                break;
+            }
+            let sleeper = entry.remove();
+            sleeper.done.store(true, Ordering::Release);
+            sleeper.waker.wake();
+        }
+    }
+}
+
+impl Timer for ManualTimer {
+    fn sleep_until(&self, deadline: Duration) -> BoxFuture<'static, ()> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let deadline_nanos = u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
+            let now = u64::try_from(inner.clock.now().as_nanos()).unwrap_or(u64::MAX);
+            if now >= deadline_nanos {
+                return;
+            }
+            let sleeper = Arc::new(Sleeper {
+                done: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            });
+            let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+            let key = (deadline_nanos, id);
+            {
+                let Ok(mut sleepers) = inner.sleepers.lock() else {
+                    return;
+                };
+                sleepers.insert(key, Arc::clone(&sleeper));
+            }
+            // Re-check after registration so an intervening advance cannot miss us.
+            let now = u64::try_from(inner.clock.now().as_nanos()).unwrap_or(u64::MAX);
+            if now >= deadline_nanos {
+                sleeper.done.store(true, Ordering::Release);
+                if let Ok(mut sleepers) = inner.sleepers.lock() {
+                    sleepers.remove(&key);
+                }
+                return;
+            }
+            ManualSleepUntil {
+                inner,
+                key,
+                sleeper,
+            }
+            .await;
+        })
+    }
+}
+
+struct ManualSleepUntil {
+    inner: Arc<ManualTimerInner>,
+    key: (u64, u64),
+    sleeper: Arc<Sleeper>,
+}
+
+impl Future for ManualSleepUntil {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.sleeper.done.load(Ordering::Acquire)
+            || self.sleeper.cancelled.load(Ordering::Acquire)
+        {
+            return Poll::Ready(());
+        }
+        self.sleeper.waker.register(context.waker());
+        if self.sleeper.done.load(Ordering::Acquire)
+            || self.sleeper.cancelled.load(Ordering::Acquire)
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for ManualSleepUntil {
+    fn drop(&mut self) {
+        self.sleeper.cancelled.store(true, Ordering::Release);
+        if let Ok(mut sleepers) = self.inner.sleepers.lock() {
+            sleepers.remove(&self.key);
+        }
     }
 }
 

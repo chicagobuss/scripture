@@ -56,12 +56,19 @@ pub struct ChunkAppendAck {
 pub struct RecoveredChunk {
     /// The Holylog position where the chunk became visible.
     pub slot: u64,
-    /// The decoded immutable index.
+    /// The decoded immutable identity.
     pub chunk_id: ChunkId,
+    /// Content digest of the durable bytes.
+    pub digest: ChunkDigest,
     /// The start of the record span.
     pub first_offset: RecordOffset,
     /// Number of records in the span.
     pub record_count: u32,
+    /// The sole decoded frame, including its [`crate::chunk::SubmissionRef`]s.
+    ///
+    /// Callers rebuild the producer dedup window from these spans without a
+    /// second Holylog read.
+    pub frame: crate::chunk::FrameRef,
 }
 
 /// Result of rebuilding one writer from a bounded durable suffix.
@@ -253,8 +260,10 @@ impl ChunkLogWriter {
             chunks.push(RecoveredChunk {
                 slot,
                 chunk_id: index.header.chunk_id,
+                digest: ChunkDigest::of(&entry.payload),
                 first_offset: frame.base_offset,
                 record_count: frame.record_count,
+                frame: frame.clone(),
             });
         }
 

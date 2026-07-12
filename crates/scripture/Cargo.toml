@@ -33,6 +33,7 @@ gcs-smoke = [
 
 [dependencies]
 bytes.workspace = true
+futures.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
 holylog.workspace = true

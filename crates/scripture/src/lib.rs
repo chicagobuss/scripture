@@ -9,6 +9,7 @@ pub mod batch;
 pub mod chunk;
 pub mod chunklog;
 pub mod clock;
+pub mod driver;
 pub mod journal;
 pub mod model;
 pub mod trace;
@@ -22,7 +23,14 @@ pub use chunk::{
 pub use chunklog::{
     ChunkAppendAck, ChunkLogError, ChunkLogRecovery, ChunkLogWriter, RecoveredChunk, RecoveryBound,
 };
-pub use clock::{BatchAccumulator, BatchPolicy, Clock, ManualClock, PushResult, SystemClock};
+pub use clock::{
+    BatchAccumulator, BatchPolicy, Clock, ManualClock, ManualTimer, PushResult, SystemClock,
+    SystemTimer, Timer,
+};
+pub use driver::{
+    AckLevel, ChunkDriverActor, ChunkDriverHandle, ChunkPolicy, DriverError, DriverMetrics,
+    PolicyError, Receipt, ReceiptFuture, Submission,
+};
 pub use journal::{
     AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError,
     RetentionAuthority, TrimGap, WriteError,
