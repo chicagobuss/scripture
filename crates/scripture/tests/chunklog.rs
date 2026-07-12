@@ -107,6 +107,20 @@ fn real_atomic_log_append_and_bounded_recovery_preserve_offsets() {
         assert_eq!(recovery.writer.next_offset(), RecordOffset::new(5));
         assert_eq!(recovery.chunks.len(), 2);
         assert_eq!(recovery.chunks[0].chunk_id, first.chunk_id);
+        assert_eq!(recovery.chunks[0].digest, first.digest);
+        assert_eq!(recovery.chunks[0].frame.submissions.len(), 2);
+        assert_eq!(
+            recovery.chunks[0]
+                .frame
+                .offsets_for(ProducerId::from_bytes(*b"producer-id-0123"), 1, 0)
+                .expect("span"),
+            (RecordOffset::new(0), 1)
+        );
         assert_eq!(recovery.chunks[1].chunk_id, second.chunk_id);
+        assert_eq!(recovery.chunks[1].record_count, 3);
+        let reconstructed_first = recovery.chunks[1].first_offset;
+        let reconstructed_count = recovery.chunks[1].record_count;
+        assert_eq!(reconstructed_first, RecordOffset::new(2));
+        assert_eq!(reconstructed_count, 3);
     });
 }
