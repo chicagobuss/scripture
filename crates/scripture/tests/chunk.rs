@@ -6,9 +6,9 @@ use bytes::Bytes;
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
 use scripture::{
-    AttributeValue, ChunkError, ChunkHeader, ChunkId, CohortId, Frame, JournalId, ProducerId,
-    ProducerRange, Record, RecordOffset, WriterId, decode_chunk, decode_frame, decode_index,
-    encoded_chunk_len, seal_chunk,
+    AttributeValue, ChunkDigest, ChunkError, ChunkHeader, ChunkId, CohortId, Frame, JournalId,
+    ProducerId, ProducerRange, Record, RecordOffset, WriterId, decode_chunk, decode_frame,
+    decode_index, encoded_chunk_len, seal_chunk, seal_single_frame_chunk,
 };
 
 fn header() -> ChunkHeader {
@@ -194,6 +194,76 @@ fn encoded_length_is_exact_before_sealing() {
             "the predicted size must equal the sealed size, not approximate it"
         );
     }
+}
+
+/// Test 7: the co-packing gate. The Phase-1 sealing path physically cannot
+/// produce a chunk with more than one frame (decision 0009).
+///
+/// Without a range-read capability, a reader of a sparse journal inside a
+/// co-packed chunk downloads the whole chunk to reach its frame. The gate lives
+/// in code, not only in prose, so it cannot be crossed by accident.
+#[test]
+fn the_phase_one_sealing_path_forbids_co_packing() {
+    let one = seal_single_frame_chunk(header(), vec![frame(1, 0, 2)]).expect("one frame is fine");
+    assert_eq!(decode_chunk(&one.bytes).expect("decode").frames.len(), 1);
+
+    assert_eq!(
+        seal_single_frame_chunk(header(), vec![frame(1, 0, 1), frame(2, 0, 1)]),
+        Err(ChunkError::CoPackingForbidden { frames: 2 }),
+        "co-packing must be unreachable until the range-read gate opens"
+    );
+    assert_eq!(
+        seal_single_frame_chunk(header(), Vec::new()),
+        Err(ChunkError::CoPackingForbidden { frames: 0 })
+    );
+}
+
+/// The digest identifies the sealed value. Equal bytes give equal digests, which
+/// is what lets a retry be *proved* to be a retry rather than assumed to be one.
+#[test]
+fn the_digest_identifies_the_sealed_bytes() {
+    let frames = vec![frame(1, 0, 3)];
+    let sealed = seal_chunk(header(), frames.clone()).expect("seal");
+    let resealed = seal_chunk(header(), frames).expect("re-seal");
+
+    assert_eq!(sealed.digest, resealed.digest);
+    assert_eq!(sealed.digest, ChunkDigest::of(&sealed.bytes));
+
+    let different = seal_chunk(header(), vec![frame(1, 0, 4)]).expect("seal a different chunk");
+    assert_ne!(
+        sealed.digest, different.digest,
+        "different bytes must not share a digest"
+    );
+}
+
+/// The on-wire checksum is CRC-32C (Castagnoli), **not** CRC-32/IEEE.
+///
+/// This is a known-answer test against the standard "123456789" vector. It exists
+/// because the two algorithms are trivially confused — an earlier draft of this
+/// codec named the field `crc32c` while computing IEEE — and a reader that
+/// computes the wrong one rejects every valid chunk. The format's name and its
+/// algorithm must never drift apart again.
+#[test]
+fn the_wire_checksum_is_crc32c_castagnoli() {
+    const CHECK_VECTOR: &[u8] = b"123456789";
+    const CRC32C_CHECK: u32 = 0xE306_9283; // Castagnoli
+    const CRC32_IEEE_CHECK: u32 = 0xCBF4_3926; // what we must NOT be computing
+
+    assert_eq!(crc32c::crc32c(CHECK_VECTOR), CRC32C_CHECK);
+    assert_ne!(CRC32C_CHECK, CRC32_IEEE_CHECK);
+
+    // And the chunk actually uses it: recomputing a frame's CRC with Castagnoli
+    // must match what the encoder wrote into the index.
+    let sealed = seal_chunk(header(), vec![frame(1, 0, 2)]).expect("seal");
+    let index = decode_index(&sealed.bytes).expect("index");
+    let entry = &index.frames[0];
+    let start = entry.frame_offset as usize;
+    let end = start + entry.frame_len as usize;
+    assert_eq!(
+        entry.frame_crc,
+        crc32c::crc32c(&sealed.bytes[start..end]),
+        "the index CRC must be Castagnoli over exactly the frame's bytes"
+    );
 }
 
 /// The multi-frame layout works — it is the format co-packing will use once the

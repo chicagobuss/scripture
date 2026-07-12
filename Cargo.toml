@@ -13,7 +13,8 @@ futures = "0.3"
 holylog = { path = "../holylog" }
 holylog-object-store = { path = "../holylog/crates/holylog-object-store" }
 object_store = { version = "0.14", default-features = false }
-crc32fast = "1.4"
+blake3 = { version = "1.5", default-features = false, features = ["std"] }
+crc32c = "0.6"
 proptest = "1.9"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }

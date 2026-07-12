@@ -13,9 +13,9 @@ pub mod model;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
 pub use chunk::{
-    Chunk, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef, ProducerId,
-    ProducerRange, SealedChunk, WriterId, decode_chunk, decode_frame, decode_index,
-    encoded_chunk_len, seal_chunk,
+    Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,
+    ProducerId, ProducerRange, SealedChunk, WriterId, decode_chunk, decode_frame, decode_index,
+    encoded_chunk_len, seal_chunk, seal_single_frame_chunk,
 };
 pub use clock::{BatchAccumulator, BatchPolicy, Clock, ManualClock, PushResult, SystemClock};
 pub use journal::{
