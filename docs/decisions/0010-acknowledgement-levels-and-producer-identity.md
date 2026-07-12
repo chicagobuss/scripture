@@ -1,0 +1,217 @@
+# Decision: acknowledgement levels, producer identity, and retry semantics
+
+- Status: accepted (design); Phase 1 binds `committed`-only
+- Date: 2026-07-12
+- Layer: write path, consumer-visible contract
+- Obligation basis: 2, 5, 9
+- Related: 0009 (chunk), 0011 (spool epochs), holylog 0001/0005 (seal, cutover)
+
+## Context
+
+An acknowledgement is a promise about survival. The failure mode this record
+exists to prevent is a promise that is *nearly* true — a level that means
+"probably durable" and is read by an operator as "durable".
+
+## Decision
+
+### Four levels, four distinct meanings
+
+| Level | Means | Survives | May be called durable |
+|---|---|---|---|
+| `accepted` | one node has the bytes in memory | nothing | **no** |
+| `replicated` | a memory quorum on independent hosts has it | a process/host loss | **no** |
+| `journaled` | a local-disk quorum in one cell has fsynced it | a node loss within the cell | **only within the declared spool failure domain** |
+| `committed` | the containing chunk is acknowledged by Holylog's object-store write quorum | whatever the object store survives | **yes** |
+
+**No API may describe `replicated` as durable.** A memory quorum is an
+availability mechanism.
+
+A receipt reports the **achieved** level (never merely the requested one), plus
+`producer_id`, `sequence`, `generation`, `chunk_id`, and — at `committed` — the
+`journal_id`, `first_offset`, `next_offset`, and `slot`.
+
+### Deployment profiles declare which levels exist
+
+| Profile | Levels offered | Requires |
+|---|---|---|
+| **object-commit** (baseline, Phase 1) | `committed` only | nothing beyond the kernel |
+| local-spool | `journaled`, `committed` | a WAL quorum **and** the WAL handoff protocol (0011) |
+| memory-spool | `replicated`, `journaled`, `committed` | the above, plus an explicit non-durability disclosure |
+
+A profile must publish its **loss budget** (0011). A profile that offers a level
+below `committed` without a loss budget is invalid configuration and must fail to
+construct.
+
+`accepted` is an internal state. It is never a client-visible durability claim in
+any profile.
+
+**`journaled` is a lie without a handoff protocol.** If a cell is fenced while
+holding `journaled`-but-uncommitted data, that data can never reach the log
+through the sealed generation — so the promise is broken unless the WAL is
+replayed into the successor. 0011 specifies that protocol and gates the level on
+it. Until it exists, only `committed` may be offered. This is why Phase 1 is
+`committed`-only, and it is a correctness constraint, not a scoping preference.
+
+### Producer identity and idempotent retry
+
+Every submission carries `(producer_id, producer_epoch, sequence)`:
+
+- `producer_id` — stable across reconnects (16 bytes).
+- `producer_epoch` — incremented when a producer restarts and re-registers;
+  fences a zombie producer instance.
+- `sequence` — strictly increasing per `(producer_id, producer_epoch, journal)`,
+  starting at 0.
+
+The owner keeps a bounded **dedup window** per `(producer_id, journal)`: the
+highest committed sequence and a bounded map from recent sequence → assigned
+offsets.
+
+Submission handling:
+
+| Condition | Outcome |
+|---|---|
+| `sequence == last_committed + 1` | accept, allocate offsets |
+| `sequence <= last_committed`, in window | **duplicate** — return the *original* receipt (same offsets). Idempotent. |
+| `sequence <= last_committed`, outside window | `Indeterminate` — the producer must reconcile by reading the log. Honest; never guessed. |
+| `sequence > last_committed + 1` | `OutOfSequence` — a gap. Reject; the producer must resync. |
+| `producer_epoch` < the highest seen | `FencedProducer` — a zombie instance. Reject. |
+
+**The dedup window is recovered from the log, not from memory.** Each frame
+records the `(producer_id, producer_epoch, sequence)` range it contains, so a
+new owner rebuilds the window by scanning the tail of the sealed predecessor. A
+window that cannot be rebuilt (because the required chunks were trimmed) yields
+`Indeterminate` for sequences below the trim point — which is correct, not a
+degradation.
+
+This is the mechanism the fleet gate names as "Scripture producer idempotence."
+
+### What a dropped request or response means
+
+| Event | Producer sees | Truth | Resolution |
+|---|---|---|---|
+| request lost | timeout | nothing happened | retry same `(pid, epoch, seq)` → accepted normally |
+| response lost, chunk **committed** | timeout | the record is in the log | retry → dedup window returns the **original** receipt |
+| response lost, chunk **failed** | timeout | nothing is in the log | retry → accepted normally |
+| response lost, chunk **durable but uncommitted** (kernel `Sealed`; the slot is at/above a cutover boundary) | timeout | the bytes exist in the object store but are **unmapped and unreachable forever** (holylog 0005) | retry → lands in the successor generation. The stranded copy is invisible, so there is **no duplicate** |
+
+That last row is the subtle one, and it is why 0009 forbids a commit flag inside
+the chunk: the durable-but-excluded chunk *looks* committed from the object
+store's point of view and is not. Only the kernel's mapping decides, and the
+kernel already excludes it — proven by holylog's
+`post_seal_zombie_is_not_mapped_after_cutover`.
+
+The dedup window handles the steady-state duplicate; the VirtualLog cutover
+handles the crash-time one. **Both mechanisms are required** — neither covers the
+other's case.
+
+## Acknowledgement state machine
+
+States of one submission inside the owner:
+
+```text
+              submit()
+                 │
+                 ▼
+          ┌─────────────┐   reservation denied / limits exceeded
+          │  Reserved   │──────────────────────────────► Rejected(Backpressure)
+          └─────┬───────┘
+                │ bytes admitted to the open chunk
+                ▼
+          ┌─────────────┐   dedup hit (seq <= last, in window)
+          │   Buffered  │──────────────────────────────► Committed(original receipt)
+          └─────┬───────┘
+                │ chunk seals (bytes | age | records | flush)
+                ▼
+          ┌─────────────┐
+          │   Sealed    │  bytes are final and immutable; retries reuse them
+          └─────┬───────┘
+                │ Holylog append issued
+                ▼
+          ┌─────────────┐
+          │  Appending  │
+          └──┬───┬───┬──┘
+             │   │   └── kernel Sealed (fenced) ─────► Indeterminate → owner resigns (0011)
+             │   └────── kernel error/timeout ───────► Failed(retryable) ─► chunk re-appended, same bytes
+             ▼
+        append acknowledged
+             │
+             ▼
+       ┌─────────────┐
+       │  Committed  │  receipt released to every submitter in the chunk
+       └─────┬───────┘
+             │ reservation released
+             ▼
+          (steady state)
+```
+
+Invariants over this machine, and they are the properties the model in 0011 must
+check:
+
+1. **A receipt is released only from `Committed`.** No path releases a receipt
+   from `Buffered`, `Sealed`, or `Appending` in the object-commit profile.
+2. **Reserved bytes are released only after `Committed` or a terminal failure.**
+   Never on `Sealed`, or the loss budget becomes unbounded.
+3. **`Sealed` bytes never change.** A retry after a kernel error re-appends the
+   identical buffer, which the kernel sees as an idempotent write.
+4. **`Indeterminate` never becomes `Committed`.** The owner that observes a fence
+   resigns; it does not retry into a sealed generation.
+5. **Cancellation of a submitter's future does not cancel the chunk.** The bytes
+   are already collective. The submitter loses its receipt, not its record — a
+   record that reaches `Committed` is in the log regardless of who is still
+   waiting.
+
+Point 5 is deliberate and is the opposite of the kernel's `JournalWriter`, whose
+cancellation poisons the writer (scripture 0003). At the chunk driver, a
+submission is one of many in a shared chunk and cannot be individually withdrawn
+once buffered. The API must say so.
+
+## Correctness
+
+`committed` inherits the kernel's guarantee exactly: Qw durable copies,
+address-ordered completion, and a seal check after ordered completion — nothing
+weaker, and nothing renamed.
+
+Idempotence: a record identified by `(producer_id, producer_epoch, sequence)`
+appears at most once in the visible log. Steady-state duplicates are absorbed by
+the dedup window; crash-time duplicates cannot occur because the indeterminate
+copy is excluded by the cutover boundary.
+
+Ordering: per `(producer, journal)`, records appear in sequence order, because
+the owner rejects gaps and allocates offsets in submission order under one
+fenced epoch.
+
+## Deterministic validation
+
+- A receipt is never released before the kernel acknowledges (counted through an
+  instrumented log).
+- Duplicate `sequence` in-window returns byte-identical offsets to the original.
+- Duplicate out-of-window returns `Indeterminate`, never a guessed offset.
+- `OutOfSequence` and `FencedProducer` are rejected without side effects.
+- A dropped-response retry after commit yields exactly one visible record.
+- A submitter that cancels still has its record committed, and the chunk is
+  unaffected.
+- The dedup window rebuilt from a log tail equals the window in memory before a
+  simulated owner restart.
+
+## Cost and observability
+
+`committed` costs exactly one chunk PUT (plus the kernel's seal GET per append —
+irreducible, per holylog 0006). Levels below `committed` trade requests for
+latency and buy a loss budget; the budget is the cost, and it is denominated in
+bytes, age, and in-flight chunks (0011).
+
+Required metrics: receipts by achieved level, dedup hits, `Indeterminate` count,
+`OutOfSequence` count, and oldest uncommitted age.
+
+## Alternatives and consequences
+
+Acknowledging at `Sealed` (bytes final, append in flight) was rejected: it is the
+exact shape of a promise that is nearly true, and it would make the loss budget
+unbounded in upload latency.
+
+A monotonic global sequence per producer (rather than per producer *per journal*)
+was rejected: it couples journals that have no ordering relationship and would
+make a slow journal stall a fast one.
+
+Consequence: producers must carry identity and sequence to get idempotence. A
+producer that will not is offered at-least-once and must be told so plainly.
