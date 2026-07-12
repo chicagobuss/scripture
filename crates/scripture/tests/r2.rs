@@ -93,12 +93,13 @@ async fn run_scripture_history(store: Arc<dyn ObjectStore>, root: &Path) -> Test
     let seal_drive = drive(&store, root.clone().join("seal"))?;
     let trim_drive = drive(&store, root.clone().join("trim"))?;
     let seal = Arc::new(LogDriveSeal::new(
-        seal_drive as Arc<dyn LogDrive>,
+        Arc::clone(&seal_drive) as Arc<dyn LogDrive>,
         Address::new(0)?,
         Bytes::from_static(b"sealed"),
     )) as Arc<dyn Seal>;
-    let trim =
-        Arc::new(LogDriveTrimPoint::new(trim_drive as Arc<dyn LogDrive>)) as Arc<dyn TrimPoint>;
+    let trim = Arc::new(LogDriveTrimPoint::new(
+        Arc::clone(&trim_drive) as Arc<dyn LogDrive>
+    )) as Arc<dyn TrimPoint>;
     let log = AtomicLog::builder(data.clone() as Arc<dyn LogDrive>, 4)
         .seal(seal)
         .trim(trim)
@@ -130,9 +131,36 @@ async fn run_scripture_history(store: Arc<dyn ObjectStore>, root: &Path) -> Test
 
     log.seal().await?;
     assert_eq!(log.check_tail().await?.tail, 2);
-    let metrics = data.metrics().snapshot();
-    assert_eq!(metrics.puts, 2);
-    assert!(metrics.gets >= 3);
+
+    // Measured provider requests, per namespace. Reported in the same shape as
+    // the GCS run so the two are comparable: a cost *model* needs at least two
+    // providers, or it is only a trace of one.
+    let data_cost = data.metrics().snapshot();
+    let seal_cost = seal_drive.metrics().snapshot();
+    let trim_cost = trim_drive.metrics().snapshot();
+    println!(
+        "R2 cost — data: {} PUT, {} GET, {} LIST, {} B up, {} B down",
+        data_cost.puts,
+        data_cost.gets,
+        data_cost.lists,
+        data_cost.uploaded_bytes,
+        data_cost.downloaded_bytes
+    );
+    println!(
+        "R2 cost — seal: {} PUT, {} GET | trim: {} PUT, {} GET, {} LIST",
+        seal_cost.puts, seal_cost.gets, trim_cost.puts, trim_cost.gets, trim_cost.lists
+    );
+
+    assert_eq!(data_cost.puts, 2, "one PUT per batch, not per record");
+    assert_eq!(seal_cost.puts, 1, "the seal is written exactly once");
+    assert_eq!(trim_cost.puts, 1, "one trim register write for one advance");
+
+    // The invariant that must hold on every provider: the trim register lists
+    // once per instance, on cold discovery, and never once per log read.
+    assert_eq!(
+        trim_cost.lists, 1,
+        "the trim register lists exactly once, on cold discovery, and never per read"
+    );
     Ok(())
 }
 
