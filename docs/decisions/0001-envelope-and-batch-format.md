@@ -26,6 +26,16 @@ cannot interpret. Framing extensibility is not a compatibility promise.
 Duplicate attribute keys, malformed values, non-canonical
 ordering, trailing bytes, and unknown major versions are rejected.
 
+**The retained scalar set is transitional.** The accepted direction (see the
+family's opaque-core note) is that the durable envelope carries opaque payload
+bytes, an immutable schema reference, and bounded transport-neutral context —
+not an application type system. `string | i64 | bool` survives only because the
+raw-lines lab path uses static listener attributes; it is not an endorsement of
+a universal attribute-value enum, and it must not grow. Removing or replacing
+it belongs to the envelope/schema-reference decision record, which supersedes
+this section when it lands. No production bytes exist yet, so that change is
+still free; it will not remain so.
+
 Application types, including floating-point values and event timestamps, are
 deliberately deferred. Scripture transports opaque payload bytes; a future
 immutable schema reference and parser/projection layer will define typed views
