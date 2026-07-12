@@ -417,6 +417,39 @@ fn submissions_must_tile_the_records_exactly() {
     );
 }
 
+/// A producer sequence names exactly one submission. Tiling alone does not
+/// establish that: two adjacent spans could use the same identity and make a
+/// recovered dedup receipt ambiguous.
+#[test]
+fn duplicate_submission_identity_is_rejected() {
+    let result = seal_single_frame_chunk(
+        header(),
+        vec![Frame {
+            journal_id: journal(1),
+            base_offset: RecordOffset::new(0),
+            records: vec![record(1), record(2)],
+            submissions: vec![
+                SubmissionRef {
+                    producer_id: producer(1),
+                    producer_epoch: 1,
+                    sequence: 7,
+                    first_record: 0,
+                    record_count: 1,
+                },
+                SubmissionRef {
+                    producer_id: producer(1),
+                    producer_epoch: 1,
+                    sequence: 7,
+                    first_record: 1,
+                    record_count: 1,
+                },
+            ],
+        }],
+    );
+
+    assert_eq!(result, Err(ChunkError::DuplicateSubmissionIdentity));
+}
+
 /// The multi-frame layout works — it is the format co-packing will use once the
 /// range-read gate opens (decision 0009). Phase 1's *driver* never emits more
 /// than one frame; the codec is proved general anyway so that enabling
