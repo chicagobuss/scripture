@@ -27,7 +27,7 @@
 //! therefore a pure function of its inputs, and a [`SealedChunk`] is immutable:
 //! a retry re-sends the same buffer and never re-encodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -339,6 +339,12 @@ pub enum ChunkError {
     /// A frame's submissions do not tile its records exactly.
     #[error("frame submissions do not tile its records")]
     InvalidSubmissionSpans,
+    /// A producer submission identity appears more than once in one frame.
+    ///
+    /// A duplicate would make recovery's dedup window ambiguous: one lookup
+    /// could return the first span while reconstruction retained the second.
+    #[error("frame contains a duplicate producer submission identity")]
+    DuplicateSubmissionIdentity,
     /// Phase 1 forbids co-packing: see decision 0009's gate.
     #[error("co-packing is not permitted: this chunk has {frames} frames")]
     CoPackingForbidden {
@@ -437,7 +443,15 @@ fn validate_submission_tiling(
     record_count: usize,
 ) -> Result<(), ChunkError> {
     let mut cursor = 0_usize;
+    let mut identities = BTreeSet::new();
     for submission in submissions {
+        if !identities.insert((
+            submission.producer_id,
+            submission.producer_epoch,
+            submission.sequence,
+        )) {
+            return Err(ChunkError::DuplicateSubmissionIdentity);
+        }
         if submission.record_count == 0 || submission.first_record as usize != cursor {
             return Err(ChunkError::InvalidSubmissionSpans);
         }
