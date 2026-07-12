@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod clock;
 pub mod journal;
 pub mod model;
+pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
 pub use chunk::{
@@ -25,3 +26,4 @@ pub use journal::{
 pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
+pub use trace::{CostScope, Effect, Event, Ledger, RejectReason, TerminalOutcome};

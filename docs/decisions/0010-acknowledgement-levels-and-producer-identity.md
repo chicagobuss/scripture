@@ -126,15 +126,44 @@ The bound is a published policy value and appears alongside the loss budget
 (0011). It is the price of not carrying an unbounded producer registry, and it is
 stated rather than hidden.
 
-Submission handling:
+Submission handling. **The gap check is against the highest *admitted* sequence,
+not the highest *committed* one** (amended 2026-07-12; the reference model caught
+this):
 
 | Condition | Outcome |
 |---|---|
-| `sequence == last_committed + 1` | accept, allocate offsets |
-| `sequence <= last_committed`, in window | **duplicate** — return the *original* receipt (same offsets). Idempotent. |
-| `sequence <= last_committed`, outside window | `Indeterminate` — the producer must reconcile by reading the log. Honest; never guessed. |
-| `sequence > last_committed + 1` | `OutOfSequence` — a gap. Reject; the producer must resync. |
-| `producer_epoch` < the highest seen | `FencedProducer` — a zombie instance. Reject. |
+| `sequence == last_admitted + 1` | accept, allocate offsets |
+| `sequence <= last_admitted`, still in flight | **an in-flight duplicate.** Do not admit a second copy — that would duplicate the record. Join the caller to the original receipt future |
+| `sequence <= last_committed`, in the dedup window | **duplicate** — return the *original* receipt (same offsets). Idempotent |
+| `sequence <= last_committed`, outside the window | `Indeterminate` — the producer must reconcile by reading the log. Honest; never guessed |
+| `sequence > last_admitted + 1` | `OutOfSequence` — a gap. Reject; the producer must resync |
+| `producer_epoch` < the highest seen | `FencedProducer` — a zombie instance. Reject |
+
+**Why admitted, not committed.** An earlier draft of this table said
+`last_committed + 1`, which quietly means **a producer may have only one
+submission in flight at a time**: sequence 1 would be rejected as `OutOfSequence`
+until sequence 0 committed. That caps every producer at one submission per
+durable round trip — and destroys the entire reason chunks exist, since a chunk
+is supposed to *contain many submissions*. The batching thesis and the sequence
+rule were in direct contradiction, and only one of them could be right.
+
+`last_admitted` is in-memory state; `last_committed` is durable. Recovery rebuilds
+`last_admitted` **from the committed window**, because the in-flight submissions
+are precisely what a crash loses. A producer that had pipelined past the commit
+point re-sends from the recovered point, and its retries are absorbed normally.
+
+**Every in-flight append becomes uncertain together, not one at a time.** The
+kernel completes appends in address order (`complete_slot` waits for all earlier
+slots), so if one chunk's slot is abandoned, no *later* chunk's append can ever
+acknowledge — it blocks forever behind the hole. Allowing a later in-flight append
+to acknowledge after an earlier one went uncertain leaves a permanent gap in the
+offset space, which the reference model found immediately.
+
+Consequently, **pipeline depth is not only a loss-budget multiplier: an uncertain
+append makes the entire pipeline uncertain.** A profile with
+`max_inflight_chunks = 4` does not risk one chunk on a transient failure; it risks
+four. This is the mechanical proof of the warning in 0011 that "we can lose at
+most one chunk" is true *only* when `max_inflight_chunks == 1`.
 
 **The dedup window is recovered from the log, not from memory.** Each frame
 records, per submission, `(producer_id, producer_epoch, sequence, first_record,
