@@ -33,6 +33,7 @@ gcs-smoke = [
 
 [dependencies]
 bytes.workspace = true
+crc32fast.workspace = true
 holylog.workspace = true
 holylog-object-store = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }

@@ -6,11 +6,17 @@
 //! consumer groups, and cross-process writer fencing are not v0 features.
 
 pub mod batch;
+pub mod chunk;
 pub mod clock;
 pub mod journal;
 pub mod model;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
+pub use chunk::{
+    Chunk, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef, ProducerId,
+    ProducerRange, SealedChunk, WriterId, decode_chunk, decode_frame, decode_index,
+    encoded_chunk_len, seal_chunk,
+};
 pub use clock::{BatchAccumulator, BatchPolicy, Clock, ManualClock, PushResult, SystemClock};
 pub use journal::{
     AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError,
