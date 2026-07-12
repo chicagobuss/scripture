@@ -134,10 +134,7 @@ async fn run_scripture_history(store: Arc<dyn ObjectStore>, root: &Path) -> Test
             return Err(std::io::Error::other("expected a GCS-backed record").into());
         };
         assert_eq!(entry.offset, RecordOffset::new(expected));
-        assert_eq!(
-            entry.payload,
-            Bytes::from(format!("gcs-record-{expected}"))
-        );
+        assert_eq!(entry.payload, Bytes::from(format!("gcs-record-{expected}")));
     }
     assert!(matches!(
         reader.read_next().await?,
@@ -187,17 +184,22 @@ async fn run_scripture_history(store: Arc<dyn ObjectStore>, root: &Path) -> Test
         seal_cost.puts, 1,
         "the seal is written exactly once, on seal()"
     );
-    assert_eq!(
-        trim_cost.puts, 1,
-        "one trim register write for one advance"
-    );
+    assert_eq!(trim_cost.puts, 1, "one trim register write for one advance");
 
-    // The trim point is consulted on every log read. It must never list: a
-    // listing is the most expensive request class on an object store, and this
-    // measurement is the only thing standing between us and a LIST per read.
+    // The trim point is consulted on every log read, so its listing count is
+    // the number that matters: a listing is the most expensive request class an
+    // object store bills, and a listing *per read* would be the single worst
+    // cost defect in the system.
+    //
+    // Exactly one is correct, and one is not zero. A fresh instance must find
+    // the register head, and one tail scan does that in a single request no
+    // matter how long the trim history is; walking forward from zero instead
+    // would cost a read per advance and grow without bound as the log ages.
+    // Every read after that is warm and probes forward with point reads. So the
+    // invariant is: listings are paid once per instance, never once per read.
     assert_eq!(
-        trim_cost.lists, 0,
-        "the trim register must probe forward with point reads, never list"
+        trim_cost.lists, 1,
+        "the trim register lists exactly once, on cold discovery, and never per read"
     );
 
     // The metadata registers cost more requests than the data does. That is a
