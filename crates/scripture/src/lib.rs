@@ -7,6 +7,7 @@
 
 pub mod batch;
 pub mod chunk;
+pub mod chunklog;
 pub mod clock;
 pub mod journal;
 pub mod model;
@@ -17,6 +18,9 @@ pub use chunk::{
     Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,
     ProducerId, SealedChunk, SubmissionRef, WriterId, decode_chunk, decode_frame, decode_index,
     encoded_chunk_len, seal_chunk, seal_single_frame_chunk,
+};
+pub use chunklog::{
+    ChunkAppendAck, ChunkLogError, ChunkLogRecovery, ChunkLogWriter, RecoveredChunk, RecoveryBound,
 };
 pub use clock::{BatchAccumulator, BatchPolicy, Clock, ManualClock, PushResult, SystemClock};
 pub use journal::{
