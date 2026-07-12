@@ -13,13 +13,21 @@ r2-smoke = [
     "dep:holylog-object-store",
     "dep:object_store",
     "dep:tokio",
+    "holylog-object-store/s3",
     "object_store/aws",
+]
+gcs-smoke = [
+    "dep:holylog-object-store",
+    "dep:object_store",
+    "dep:tokio",
+    "holylog-object-store/gcp",
+    "object_store/gcp",
 ]
 
 [dependencies]
 bytes.workspace = true
 holylog.workspace = true
-holylog-object-store = { workspace = true, optional = true, features = ["s3"] }
+holylog-object-store = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
