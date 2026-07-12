@@ -22,6 +22,7 @@ use futures::task::{AtomicWaker, SpawnExt};
 use holylog::atomic::AtomicLog;
 use holylog::drive::{DriveError, DriveFuture, LogDrive};
 use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
+use proptest::prelude::*;
 use scripture::{
     AttributeValue, ChunkDriverActor, ChunkLogWriter, ChunkPolicy, CohortId, DriverError, Frame,
     JournalId, ManualClock, ManualTimer, PolicyError, ProducerId, Record, RecordOffset,
@@ -1248,4 +1249,81 @@ fn max_uncommitted_age_parks_new_admission() {
     let second_receipt = second_receipt.expect("second receipt");
     assert_eq!(second_receipt.first_offset, RecordOffset::new(1));
     assert_eq!(drive.write_count(), 2);
+}
+
+// A small generated schedule over the *real* actor and AtomicLog. The pure
+// model remains the broad oracle; this catches implementation drift in the
+// normal admission/flush/timer path before fault scheduling is added.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+    #[test]
+    fn generated_real_actor_schedules_preserve_dense_unique_receipts(
+        operations in prop::collection::vec((any::<bool>(), 1_usize..3), 1..32),
+    ) {
+        let drive = ScriptedLogDrive::new();
+        let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+            .build()
+            .expect("log");
+        let writer = ChunkLogWriter::new(journal(), cohort(), 1, log.clone(), RecordOffset::new(0));
+        let clock = Arc::new(ManualClock::new());
+        let timer = ManualTimer::new(Arc::clone(&clock));
+        let (handle, actor) = ChunkDriverActor::new(
+            journal(), cohort(), writer_id(), 1, writer, &[], policy(), clock, timer, 32,
+        ).expect("actor");
+        let mut pool = LocalPool::new();
+        pool.spawner().spawn(async move { let _ = actor.run().await; }).expect("spawn actor");
+
+        let mut next_sequence = 0_u64;
+        let mut committed_sequences = Vec::new();
+        let mut pending = Vec::new();
+        let mut receipts = Vec::new();
+        for (index, (retry, records)) in operations.into_iter().enumerate() {
+            let sequence = if retry && !committed_sequences.is_empty() {
+                *committed_sequences.last().expect("non-empty")
+            } else {
+                let sequence = next_sequence;
+                next_sequence += 1;
+                sequence
+            };
+            let submission = Submission {
+                producer_id: producer(), producer_epoch: 1, sequence,
+                records: (0..records).map(|value| record(i64::try_from(value).expect("small"))).collect(),
+            };
+            let receipt = pool.run_until(handle.submit(submission)).expect("admitted");
+            pending.push((sequence, receipt));
+            if index % 3 == 2 {
+                pool.run_until(handle.flush()).expect("flush");
+                for (sequence, receipt) in std::mem::take(&mut pending) {
+                    let receipt = pool.run_until(receipt).expect("committed receipt");
+                    if !receipt.deduplicated { committed_sequences.push(sequence); }
+                    receipts.push(receipt);
+                }
+            }
+        }
+        pool.run_until(handle.flush()).expect("final flush");
+        for (sequence, receipt) in pending {
+            let receipt = pool.run_until(receipt).expect("committed receipt");
+            if !receipt.deduplicated { committed_sequences.push(sequence); }
+            receipts.push(receipt);
+        }
+
+        let recovery = pool.run_until(ChunkLogWriter::recover(
+            journal(), cohort(), 1, log, RecoveryBound::new(64).expect("bound"),
+        )).expect("recover");
+        let mut expected = 0_u64;
+        let mut identities = BTreeSet::new();
+        for chunk in &recovery.chunks {
+            prop_assert_eq!(chunk.first_offset, RecordOffset::new(expected));
+            expected += u64::from(chunk.record_count);
+            for submission in &chunk.frame.submissions {
+                prop_assert!(identities.insert((submission.producer_id, submission.producer_epoch, submission.sequence)));
+            }
+        }
+        for receipt in receipts {
+            prop_assert_eq!(receipt.level, scripture::AckLevel::Committed);
+            prop_assert!(receipt.next_offset.get() > receipt.first_offset.get());
+            prop_assert!(receipt.first_offset.get() < expected);
+        }
+        prop_assert_eq!(handle.ledger().logical_count(scripture::Effect::ChunkCommitted), recovery.chunks.len());
+    }
 }

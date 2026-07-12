@@ -310,6 +310,7 @@ type AdmissionSender = oneshot::Sender<AdmissionReply>;
 pub struct ChunkDriverHandle {
     commands: mpsc::Sender<Command>,
     metrics: Arc<Mutex<DriverMetrics>>,
+    ledger: SharedLedger,
 }
 
 impl ChunkDriverHandle {
@@ -347,6 +348,12 @@ impl ChunkDriverHandle {
     #[must_use]
     pub fn metrics(&self) -> DriverMetrics {
         self.metrics.lock().map(|guard| *guard).unwrap_or_default()
+    }
+
+    /// Snapshot of protocol events and logical effects observed by this owner.
+    #[must_use]
+    pub fn ledger(&self) -> Ledger {
+        self.ledger.snapshot()
     }
 }
 
@@ -390,6 +397,34 @@ struct SealedWork {
 type DedupEntry = (u64, BTreeMap<u64, (RecordOffset, u32, ChunkId, u64)>);
 type DedupWindow = BTreeMap<(ProducerId, u32), DedupEntry>;
 
+/// Cloneable trace recorder shared by the actor and its handles.
+///
+/// It exists so deterministic integration tests can inspect a completed
+/// `run(self)` without making the core's ledger globally mutable.
+#[derive(Clone, Debug, Default)]
+struct SharedLedger(Arc<Mutex<Ledger>>);
+
+impl SharedLedger {
+    fn event(&self, event: Event) {
+        if let Ok(mut ledger) = self.0.lock() {
+            ledger.event(event);
+        }
+    }
+
+    fn effect(&self, scope: crate::trace::CostScope, effect: Effect) {
+        if let Ok(mut ledger) = self.0.lock() {
+            ledger.effect(scope, effect);
+        }
+    }
+
+    fn snapshot(&self) -> Ledger {
+        self.0
+            .lock()
+            .map(|ledger| ledger.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// The single task that owns the writer, open chunk, and reservation.
 pub struct ChunkDriverActor<C, T> {
     journal_id: JournalId,
@@ -411,7 +446,7 @@ pub struct ChunkDriverActor<C, T> {
     reserved_bytes: usize,
     next_chunk: u64,
     poisoned: bool,
-    ledger: Ledger,
+    ledger: SharedLedger,
     metrics: Arc<Mutex<DriverMetrics>>,
     /// Incomplete age-bound sleep retained across command-winning selects.
     age_sleep: Option<BoxFuture<'static, ()>>,
@@ -459,7 +494,7 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
             reserved_bytes: 0,
             next_chunk: 0,
             poisoned: false,
-            ledger: Ledger::new(),
+            ledger: SharedLedger::default(),
             metrics: Arc::clone(&metrics),
             age_sleep: None,
             age_sleep_deadline: None,
@@ -469,6 +504,7 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
             ChunkDriverHandle {
                 commands: sender,
                 metrics,
+                ledger: actor.ledger.clone(),
             },
             actor,
         ))
@@ -476,8 +512,8 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
 
     /// Shared trace ledger for deterministic harness assertions.
     #[must_use]
-    pub fn ledger(&self) -> &Ledger {
-        &self.ledger
+    pub fn ledger(&self) -> Ledger {
+        self.ledger.snapshot()
     }
 
     fn rebuild_dedup(&mut self, recovered: &[RecoveredChunk]) {
