@@ -178,6 +178,37 @@ admission deadline has tripped, **blocks** (backpressure). It is never
 accepted-and-then-dropped. A spool fleet must never become an unbounded shared
 heap.
 
+## Cancellation, admission, and the poison drain (amended 2026-07-12)
+
+The handle/actor split creates two distinct cancellation points, and both need a
+rule or a caller can hang.
+
+**The linearization point is enqueue into the bounded actor channel.**
+
+| Caller drops... | Effect |
+|---|---|
+| the `submit()` future **before** the command is enqueued | **no effect.** The record was never admitted; nothing was reserved; it is as if the call never happened |
+| the `ReceiptFuture` **after** the command is enqueued | the record is **collective** and commits normally. The caller loses its *receipt*, not its *record* (0010, invariant 5) |
+
+Once a command is in the channel it belongs to the actor.
+
+**The poison drain.** When the actor takes the `Uncertain` path, **every accepted
+command must resolve** — none may be left waiting on a future that will never
+complete:
+
+| Command's state at poison | Resolves as |
+|---|---|
+| in the chunk whose append is uncertain | `Uncertain { chunk_id }` — its fate is genuinely unknown; recovery decides |
+| buffered in the open (unsealed, never appended) chunk | `DriverStopped` — **retryable**: the actor knows no append was issued for it |
+| still queued in the channel, never buffered | `DriverStopped` — retryable, same reason |
+
+`DriverStopped` and `Uncertain` are deliberately different types. Collapsing them
+would force a caller to treat a record we *know* was never written as if it might
+have been — which turns a clean retry into an unnecessary reconciliation.
+
+Reservations and metrics stay coherent until the actor terminates, and the actor
+issues **no second append** on this path.
+
 ## Correctness
 
 Fencing safety reduces to the kernel's, which is proved and attested: at most one

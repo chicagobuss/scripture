@@ -86,13 +86,45 @@ event, and it will commit both. Such a producer gets at-least-once and must be
 told so — exactly-once across a producer restart requires an
 application-level idempotency key, which Scripture does not invent for it.
 
-**Recovery scan is bounded.** Rebuilding the window on ownership change scans the
-sealed predecessor's tail backwards, bounded by
-`max(dedup_window_chunks, dedup_window_bytes)` — never "scan the tail" in the
-sense of an unbounded walk of a long-lived journal, which would make recovery
-time grow without limit in the log's age. Sequences older than the scanned
-boundary yield `Indeterminate`, not a guess. The bound is a published policy
-value and appears in the loss/recovery budget alongside the others (0011).
+**Recovery scan is bounded — and the bound limits what we can know about
+producers, not just about sequences (amended 2026-07-12).**
+
+```rust
+pub struct RecoveryBound {
+    pub max_chunks: usize,        // stop after this many chunks
+    pub max_encoded_bytes: usize, // or after this many bytes
+}
+```
+
+Both limits are enforced: the scan walks the sealed predecessor's tail backwards
+and stops before the next chunk would exceed **either** budget. (They are
+different units and neither substitutes for the other.)
+
+The consequence runs deeper than sequence numbers. `highest_epoch[producer_id]`
+has the same persistence problem: **a bounded scan cannot reconstruct a global
+fact.** If producer `P`'s newest chunk lies before the recovery window, the new
+owner does not know `P` exists, and an arriving `(P, epoch, 0)` is
+indistinguishable from a brand-new producer and from a zombie that has been
+asleep for a week. Admitting it and *later* claiming `FencedProducer` semantics
+would be a promise the owner cannot keep.
+
+Therefore:
+
+- Producer epoch and dedup knowledge is retained **only within the configured
+  recovery window**, unless a separate durable producer registry is introduced
+  (which would be its own decision, with its own storage and cost).
+- A producer absent from the recovered window yields **`IndeterminateProducer`**,
+  not automatic admission and not automatic fencing. The owner says "I cannot
+  know", which is the truth.
+- **A genuinely new logical producer uses a new `producer_id`.** The owner must
+  never infer that a reused ID is new. A producer that lost its session state
+  needs an explicit re-registration policy at the application layer; Scripture
+  will not guess on its behalf.
+- Sequences older than the scanned boundary yield `Indeterminate`, not a guess.
+
+The bound is a published policy value and appears alongside the loss budget
+(0011). It is the price of not carrying an unbounded producer registry, and it is
+stated rather than hidden.
 
 Submission handling:
 
