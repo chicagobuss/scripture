@@ -149,6 +149,36 @@ kernel's `LogDrive` contract. It will need its own decision, including:
 - capability attestation per backend, exactly as conditional writes were;
 - a cost model term, since a range GET is billed like a GET but transfers less.
 
+## The chunk supersedes the batch envelope (amended 2026-07-12)
+
+Decision 0001 defined a `Batch` envelope — one journal, a base offset, records, a
+footer index — and `JournalWriter::append_batch` serializes *that* format and
+nothing else. A chunk driver cannot hand `SealedChunk::bytes` to it.
+
+There are three ways out, and only one is honest:
+
+1. **Double-wrap** a chunk inside a legacy batch. Rejected: two envelopes, two
+   checksums, two version fields, and a canonical format that is a lie about
+   itself.
+2. **Keep both formats** and choose per journal. Rejected: two decoders, two
+   recovery paths, two corruption models, forever.
+3. **The chunk *is* the canonical payload.** Accepted.
+
+**Decision 0009 supersedes decision 0001's `Batch` as Scripture's durable payload
+format.** A single-frame chunk is the direct successor to a batch — it carries the
+same `(journal_id, base_offset, records)` and adds cohort, generation, writer
+identity, producer ranges, and per-frame integrity. Phase 1 therefore ships
+`ChunkLogWriter` / `ChunkLogReader` over `AtomicLog` and **retires** the `Batch`
+codec, `JournalWriter`, and `JournalReader` along with the transitional
+`AttributeValue` scalars (0001's own note already marks those transitional).
+
+This is a format break with no cost, and it is the last moment it will be free:
+**no production bytes exist.** Making it now is cheaper than carrying two
+envelopes for the life of the system.
+
+The raw-lines lab listener and `scripture-service`'s `JournalActor` are rewired
+onto the chunk path in the same change. Neither has durable data.
+
 ## Correctness
 
 Immutability and single-value: a chunk is sealed to bytes before its append, and
