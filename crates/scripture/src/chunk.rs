@@ -45,11 +45,11 @@ const MINOR_VERSION: u8 = 0;
 const HEADER_LEN: usize = 4 + 1 + 1 + 16 + 16 + 8 + 16 + 4 + 4 + 4 + 4 + 4 + 8 + 4;
 
 /// `journal_id(16) + base_offset(8) + record_count(4) + frame_offset(4) +
-/// frame_len(4) + frame_crc(4) + producer_count(4)`, then producer ranges.
+/// frame_len(4) + frame_crc(4) + submission_count(4)`, then submissions.
 const INDEX_ENTRY_FIXED_LEN: usize = 16 + 8 + 4 + 4 + 4 + 4 + 4;
 
-/// `producer_id(16) + epoch(4) + first_seq(8) + last_seq(8)`
-const PRODUCER_RANGE_LEN: usize = 16 + 4 + 8 + 8;
+/// `producer_id(16) + epoch(4) + sequence(8) + first_record(4) + record_count(4)`
+const SUBMISSION_REF_LEN: usize = 16 + 4 + 8 + 4 + 4;
 
 /// `index_offset(4) + index_len(4) + magic(4)`
 const TRAILER_LEN: usize = 4 + 4 + 4;
@@ -144,20 +144,29 @@ opaque_id!(ChunkId, "chunk identity");
 opaque_id!(WriterId, "writer identity");
 opaque_id!(ProducerId, "producer identity");
 
-/// The span of one producer's sequences inside a frame.
+/// One producer submission, and exactly which records it produced.
 ///
-/// Recorded durably so that a new owner can rebuild the dedup window from the
-/// log rather than from memory (decision 0010).
+/// Recorded durably so a new owner can rebuild the dedup window from the log
+/// rather than from memory (decision 0010) — and, crucially, so it can return
+/// the **original receipt** for a deduplicated retry.
+///
+/// A sequence identifies a *submission*, which may carry many records. Knowing
+/// only that a sequence was committed is not enough: the retry must be told the
+/// same offsets the first attempt was told, so the record span is stored, not
+/// inferred. `first_record` is an index within the frame; the submission's
+/// offsets are `frame.base_offset + first_record` for `record_count` records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProducerRange {
+pub struct SubmissionRef {
     /// The producer.
     pub producer_id: ProducerId,
     /// The producer's incarnation.
     pub producer_epoch: u32,
-    /// First sequence contained in the frame.
-    pub first_sequence: u64,
-    /// Last sequence contained in the frame, inclusive.
-    pub last_sequence: u64,
+    /// The submission's sequence, unique per `(producer, epoch, journal)`.
+    pub sequence: u64,
+    /// Index of the submission's first record within the frame.
+    pub first_record: u32,
+    /// How many records the submission carried. Never zero.
+    pub record_count: u32,
 }
 
 /// One index entry: where a journal's records live inside the chunk.
@@ -175,8 +184,36 @@ pub struct FrameRef {
     pub frame_len: u32,
     /// CRC32C of the frame's bytes, so the frame can be verified alone.
     pub frame_crc: u32,
-    /// Producer sequence spans inside the frame, for dedup-window recovery.
-    pub producers: Vec<ProducerRange>,
+    /// The submissions that produced this frame's records, in record order.
+    ///
+    /// They tile `[0, record_count)` exactly: every record came from exactly one
+    /// submission, so a gap or an overlap is corruption.
+    pub submissions: Vec<SubmissionRef>,
+}
+
+impl FrameRef {
+    /// Returns the offsets a submission received, for reconstructing the
+    /// original receipt of a deduplicated retry (decision 0010).
+    #[must_use]
+    pub fn offsets_for(
+        &self,
+        producer_id: ProducerId,
+        producer_epoch: u32,
+        sequence: u64,
+    ) -> Option<(RecordOffset, u32)> {
+        self.submissions
+            .iter()
+            .find(|submission| {
+                submission.producer_id == producer_id
+                    && submission.producer_epoch == producer_epoch
+                    && submission.sequence == sequence
+            })
+            .and_then(|submission| {
+                self.base_offset
+                    .checked_add(submission.first_record as usize)
+                    .map(|first| (first, submission.record_count))
+            })
+    }
 }
 
 /// One journal's records, before sealing.
@@ -188,8 +225,8 @@ pub struct Frame {
     pub base_offset: RecordOffset,
     /// The records, in order.
     pub records: Vec<Record>,
-    /// Producer sequence spans contained here.
-    pub producers: Vec<ProducerRange>,
+    /// The submissions that produced them, tiling `[0, records.len())`.
+    pub submissions: Vec<SubmissionRef>,
 }
 
 /// A chunk's header fields, fixed at seal time.
@@ -299,9 +336,9 @@ pub enum ChunkError {
     /// Bytes remained after the declared value.
     #[error("chunk has trailing or misplaced bytes")]
     TrailingBytes,
-    /// A frame declared a producer range that is not increasing.
-    #[error("producer sequence range is not increasing")]
-    InvalidProducerRange,
+    /// A frame's submissions do not tile its records exactly.
+    #[error("frame submissions do not tile its records")]
+    InvalidSubmissionSpans,
     /// Phase 1 forbids co-packing: see decision 0009's gate.
     #[error("co-packing is not permitted: this chunk has {frames} frames")]
     CoPackingForbidden {
@@ -374,7 +411,9 @@ pub fn encoded_chunk_len(frames: &[Frame]) -> Result<usize, ChunkError> {
     for frame in frames {
         index_len = index_len
             .checked_add(INDEX_ENTRY_FIXED_LEN)
-            .and_then(|len| len.checked_add(frame.producers.len().checked_mul(PRODUCER_RANGE_LEN)?))
+            .and_then(|len| {
+                len.checked_add(frame.submissions.len().checked_mul(SUBMISSION_REF_LEN)?)
+            })
             .ok_or(ChunkError::Oversized)?;
         frames_len = frames_len
             .checked_add(encode_frame_records(&frame.records)?.len())
@@ -385,6 +424,31 @@ pub fn encoded_chunk_len(frames: &[Frame]) -> Result<usize, ChunkError> {
         .and_then(|len| len.checked_add(frames_len))
         .and_then(|len| len.checked_add(TRAILER_LEN))
         .ok_or(ChunkError::Oversized)
+}
+
+/// Every record came from exactly one submission, so the submissions must tile
+/// `[0, record_count)` in order, without gaps or overlaps.
+///
+/// This is what makes the spans trustworthy enough to reconstruct a receipt: a
+/// gap would mean a record no producer claims, and an overlap would mean two
+/// producers claiming the same offsets. Both are corruption.
+fn validate_submission_tiling(
+    submissions: &[SubmissionRef],
+    record_count: usize,
+) -> Result<(), ChunkError> {
+    let mut cursor = 0_usize;
+    for submission in submissions {
+        if submission.record_count == 0 || submission.first_record as usize != cursor {
+            return Err(ChunkError::InvalidSubmissionSpans);
+        }
+        cursor = cursor
+            .checked_add(submission.record_count as usize)
+            .ok_or(ChunkError::Oversized)?;
+    }
+    if cursor != record_count {
+        return Err(ChunkError::InvalidSubmissionSpans);
+    }
+    Ok(())
 }
 
 /// Seals frames into immutable chunk bytes.
@@ -407,11 +471,7 @@ pub fn seal_chunk(header: ChunkHeader, mut frames: Vec<Frame>) -> Result<SealedC
         }
     }
     for frame in &frames {
-        for producer in &frame.producers {
-            if producer.first_sequence > producer.last_sequence {
-                return Err(ChunkError::InvalidProducerRange);
-            }
-        }
+        validate_submission_tiling(&frame.submissions, frame.records.len())?;
         frame
             .base_offset
             .checked_add(frame.records.len())
@@ -427,7 +487,7 @@ pub fn seal_chunk(header: ChunkHeader, mut frames: Vec<Frame>) -> Result<SealedC
 
     let index_len: usize = frames
         .iter()
-        .map(|frame| INDEX_ENTRY_FIXED_LEN + frame.producers.len() * PRODUCER_RANGE_LEN)
+        .map(|frame| INDEX_ENTRY_FIXED_LEN + frame.submissions.len() * SUBMISSION_REF_LEN)
         .sum();
     let index_offset = HEADER_LEN;
     let frames_offset = index_offset
@@ -443,12 +503,13 @@ pub fn seal_chunk(header: ChunkHeader, mut frames: Vec<Frame>) -> Result<SealedC
         index.put_u32(u32_len(cursor)?);
         index.put_u32(u32_len(body.len())?);
         index.put_u32(crc32c(body));
-        index.put_u32(u32_len(frame.producers.len())?);
-        for producer in &frame.producers {
-            index.put_slice(&producer.producer_id.as_bytes());
-            index.put_u32(producer.producer_epoch);
-            index.put_u64(producer.first_sequence);
-            index.put_u64(producer.last_sequence);
+        index.put_u32(u32_len(frame.submissions.len())?);
+        for submission in &frame.submissions {
+            index.put_slice(&submission.producer_id.as_bytes());
+            index.put_u32(submission.producer_epoch);
+            index.put_u64(submission.sequence);
+            index.put_u32(submission.first_record);
+            index.put_u32(submission.record_count);
         }
         cursor = cursor
             .checked_add(body.len())
@@ -647,7 +708,7 @@ pub fn decode_index(prefix: &[u8]) -> Result<ChunkIndex, ChunkError> {
         let frame_offset = index.u32()?;
         let frame_len = index.u32()?;
         let frame_crc = index.u32()?;
-        let producer_count = usize::try_from(index.u32()?).map_err(|_| ChunkError::Oversized)?;
+        let submission_count = usize::try_from(index.u32()?).map_err(|_| ChunkError::Oversized)?;
 
         // Canonical order, and no journal twice.
         if previous.is_some_and(|last| last >= (journal_id, base_offset)) {
@@ -664,22 +725,20 @@ pub fn decode_index(prefix: &[u8]) -> Result<ChunkIndex, ChunkError> {
         }
         region_end = end;
 
-        let mut producers = Vec::with_capacity(producer_count.min(1024));
-        for _ in 0..producer_count {
-            let producer_id = ProducerId::from_bytes(index.id()?);
-            let producer_epoch = index.u32()?;
-            let first_sequence = index.u64()?;
-            let last_sequence = index.u64()?;
-            if first_sequence > last_sequence {
-                return Err(ChunkError::InvalidProducerRange);
-            }
-            producers.push(ProducerRange {
-                producer_id,
-                producer_epoch,
-                first_sequence,
-                last_sequence,
+        let mut submissions = Vec::with_capacity(submission_count.min(4096));
+        for _ in 0..submission_count {
+            submissions.push(SubmissionRef {
+                producer_id: ProducerId::from_bytes(index.id()?),
+                producer_epoch: index.u32()?,
+                sequence: index.u64()?,
+                first_record: index.u32()?,
+                record_count: index.u32()?,
             });
         }
+        validate_submission_tiling(
+            &submissions,
+            usize::try_from(record_count).map_err(|_| ChunkError::Oversized)?,
+        )?;
 
         frames.push(FrameRef {
             journal_id,
@@ -688,7 +747,7 @@ pub fn decode_index(prefix: &[u8]) -> Result<ChunkIndex, ChunkError> {
             frame_offset,
             frame_len,
             frame_crc,
-            producers,
+            submissions,
         });
     }
 
@@ -802,7 +861,7 @@ pub fn decode_chunk(bytes: &Bytes) -> Result<Chunk, ChunkError> {
     let index_len: usize = index
         .frames
         .iter()
-        .map(|frame| INDEX_ENTRY_FIXED_LEN + frame.producers.len() * PRODUCER_RANGE_LEN)
+        .map(|frame| INDEX_ENTRY_FIXED_LEN + frame.submissions.len() * SUBMISSION_REF_LEN)
         .sum();
     if trailer_index_offset as usize != HEADER_LEN || trailer_index_len as usize != index_len {
         return Err(ChunkError::CorruptIndex);
@@ -827,7 +886,7 @@ pub fn decode_chunk(bytes: &Bytes) -> Result<Chunk, ChunkError> {
             journal_id: entry.journal_id,
             base_offset: entry.base_offset,
             records,
-            producers: entry.producers.clone(),
+            submissions: entry.submissions.clone(),
         });
     }
 
