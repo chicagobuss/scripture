@@ -88,6 +88,14 @@ Property-tested round-trip and byte-identical re-encode, as in decision 0001.
   range-read future real rather than aspirational.
 - `index_crc32c` over the index — so a reader that range-reads only the
   header+index can trust the offsets it is about to seek to.
+
+**CRC-32C means Castagnoli, not CRC-32/IEEE.** The two are trivially confused —
+the first implementation of this codec named the field `crc32c` while computing
+IEEE — and a reader that computes the wrong polynomial rejects every valid chunk.
+Castagnoli is what storage formats use (Parquet, ext4, Btrfs, iSCSI): better
+error detection over the short spans we checksum, and hardware-accelerated on x86
+and ARM. A known-answer test against the standard `"123456789"` vector pins it, so
+the format's name and its algorithm cannot drift apart again.
 - The chunk's content digest (BLAKE3-256 over the sealed bytes) is **not stored
   inside the chunk** (it cannot be, self-reference), but is computed at seal and
   carried in receipts and in the producer dedup window (0010). It is the natural

@@ -33,7 +33,8 @@ gcs-smoke = [
 
 [dependencies]
 bytes.workspace = true
-crc32fast.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
 holylog.workspace = true
 holylog-object-store = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
@@ -41,6 +42,7 @@ thiserror.workspace = true
 tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
+crc32c.workspace = true
 futures.workspace = true
 proptest.workspace = true
 

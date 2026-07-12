@@ -79,6 +79,39 @@ pub struct WriterId([u8; 16]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProducerId([u8; 16]);
 
+/// A content digest over a chunk's sealed bytes (BLAKE3-256).
+///
+/// It is deliberately **not stored inside the chunk** — a value cannot contain
+/// its own digest — but is computed at seal and carried in receipts and in the
+/// producer dedup window (decision 0010). It is the natural identity for
+/// deduplication, for verifying a chunk fetched from an untrusted cache, and for
+/// a future content-addressed lakehouse projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkDigest([u8; 32]);
+
+impl ChunkDigest {
+    /// Computes the digest of sealed chunk bytes.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(*blake3::hash(bytes).as_bytes())
+    }
+
+    /// Returns the durable representation.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ChunkDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 macro_rules! opaque_id {
     ($name:ident, $label:literal) => {
         impl $name {
@@ -192,6 +225,9 @@ pub struct Chunk {
 pub struct SealedChunk {
     /// Identity, as recorded in the header.
     pub chunk_id: ChunkId,
+    /// Content digest of `bytes`. Two sealed chunks with equal digests are the
+    /// same durable value, which is what makes a retry provably a retry.
+    pub digest: ChunkDigest,
     /// The sealed bytes. Immutable.
     pub bytes: Bytes,
 }
@@ -274,10 +310,15 @@ pub enum ChunkError {
     },
 }
 
+/// CRC-32C (Castagnoli), not CRC-32/IEEE.
+///
+/// The distinction is not cosmetic: it is the on-wire contract. Castagnoli is
+/// what storage formats use (Parquet, ext4, Btrfs, iSCSI) because it has better
+/// error detection for the short spans we checksum and is hardware-accelerated
+/// on x86 and ARM. A reader that computed IEEE over these bytes would reject
+/// every valid chunk, so the name and the algorithm must not drift apart.
 fn crc32c(bytes: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(bytes);
-    hasher.finalize()
+    crc32c::crc32c(bytes)
 }
 
 fn u32_len(value: usize) -> Result<u32, ChunkError> {
@@ -442,10 +483,36 @@ pub fn seal_chunk(header: ChunkHeader, mut frames: Vec<Frame>) -> Result<SealedC
     out.put_u32(u32_len(index_len)?);
     out.put_slice(TRAILER_MAGIC);
 
+    let bytes = out.freeze();
     Ok(SealedChunk {
         chunk_id: header.chunk_id,
-        bytes: out.freeze(),
+        digest: ChunkDigest::of(&bytes),
+        bytes,
     })
+}
+
+/// Seals a chunk for **one** journal — the only sealing path Phase 1 permits.
+///
+/// Co-packing several journals into one chunk is forbidden until an attested
+/// range-read capability exists (decision 0009's gate). Without one, a reader of
+/// a sparse journal inside a co-packed chunk downloads the *entire* chunk to
+/// reach its frame, turning its cost from the size of its own data into the size
+/// of the whole cohort.
+///
+/// The codec below is deliberately general and already handles multi-frame
+/// chunks correctly, so that opening the gate later is a policy change and not a
+/// format break. This function is the gate: the Phase-1 writer calls it, and it
+/// cannot co-pack even by mistake.
+pub fn seal_single_frame_chunk(
+    header: ChunkHeader,
+    frames: Vec<Frame>,
+) -> Result<SealedChunk, ChunkError> {
+    if frames.len() != 1 {
+        return Err(ChunkError::CoPackingForbidden {
+            frames: frames.len(),
+        });
+    }
+    seal_chunk(header, frames)
 }
 
 struct Cursor<'a> {
