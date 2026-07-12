@@ -15,6 +15,23 @@ fn journal() -> JournalId {
     JournalId::from_bytes(*b"journal-id-01234")
 }
 
+#[test]
+fn rejects_sealed_carrier_metadata_that_does_not_match_its_bytes() {
+    block_on(async {
+        let drive = Arc::new(InMemoryLogDrive::new());
+        let log = AtomicLog::builder(drive, 0).build().expect("log");
+        let mut writer = ChunkLogWriter::new(journal(), cohort(), 4, log, RecordOffset::new(0));
+        let mut forged = chunk(1, 0, 1);
+        forged.chunk_id = ChunkId::from_bytes([99; 16]);
+
+        assert!(matches!(
+            writer.append(&forged).await,
+            Err(scripture::ChunkLogError::SealedMetadataMismatch)
+        ));
+        assert_eq!(writer.next_offset(), RecordOffset::new(0));
+    });
+}
+
 fn cohort() -> CohortId {
     CohortId::from_bytes(*b"cohort-id-012345")
 }
