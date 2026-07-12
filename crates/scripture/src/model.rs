@@ -47,7 +47,9 @@ impl RecordOffset {
         self.0
     }
 
-    pub(crate) fn checked_add(self, count: usize) -> Option<Self> {
+    /// Advances by `count` records, or `None` on overflow.
+    #[must_use]
+    pub fn checked_add(self, count: usize) -> Option<Self> {
         u64::try_from(count)
             .ok()
             .and_then(|count| self.0.checked_add(count))
