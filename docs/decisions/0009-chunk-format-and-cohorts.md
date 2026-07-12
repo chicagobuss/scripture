@@ -52,7 +52,10 @@ semantics; see 0010.
 |  index_crc32c (u32)                                          |
 +-- Index (sorted by journal_id, then base_offset) ------------+
 |  [ journal_id(16B) | base_offset(u64) | record_count(u32)    |
-|    frame_offset(u32) | frame_len(u32) | frame_crc32c(u32) ]  |
+|    frame_offset(u32) | frame_len(u32) | frame_crc32c(u32)    |
+|    submission_count(u32)                                     |
+|    [ producer_id(16B) | epoch(u32) | sequence(u64)           |
+|      first_record(u32) | record_count(u32) ] * n ]           |
 +-- Frames (record data, one region per index entry) ----------+
 +-- Trailer: index_offset | index_len | magic "SCRE" ----------+
 ```
@@ -118,6 +121,27 @@ policy that must age, travel, and die together:
 Proximity in time is **not** a cohort. The cohort, not the journal name, is the
 scheduling and reclamation unit — which is what lets sealed generation prefixes
 be reclaimed by provider lifecycle rules instead of DELETE loops (holylog 0002).
+
+### Submissions carry their record span, not a sequence range
+
+A sequence identifies a **submission**, and a submission may carry many records.
+So the frame records, per submission, `(producer_id, epoch, sequence,
+first_record, record_count)` — not a `first..last` sequence range.
+
+The difference is the whole idempotence contract. A deduplicated retry must be
+handed back **the same offsets the first attempt received** (0010). Knowing only
+that a sequence was committed answers "did it land?" but not "where?", and a
+receipt without offsets is not the original receipt. A sequence range cannot
+answer the second question when submissions have differing record counts, so the
+span is **stored, never inferred**.
+
+Submissions tile `[0, record_count)` exactly, in order. A gap would mean a record
+no producer claims; an overlap would mean two producers claiming the same
+offsets. Both are corruption and both are rejected at seal and at decode.
+
+Cost: 36 bytes of index per submission. For a 64 MiB chunk that is ~0.05% even at
+one record per submission, and it is the price of being able to answer a retry
+truthfully.
 
 ### Per-journal dense offsets under co-packing
 

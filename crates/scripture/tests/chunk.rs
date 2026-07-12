@@ -7,7 +7,7 @@ use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
 use scripture::{
     AttributeValue, ChunkDigest, ChunkError, ChunkHeader, ChunkId, CohortId, Frame, JournalId,
-    ProducerId, ProducerRange, Record, RecordOffset, WriterId, decode_chunk, decode_frame,
+    ProducerId, Record, RecordOffset, SubmissionRef, WriterId, decode_chunk, decode_frame,
     decode_index, encoded_chunk_len, seal_chunk, seal_single_frame_chunk,
 };
 
@@ -38,13 +38,23 @@ fn record(value: i64) -> Record {
     )
 }
 
-fn producers(count: u64) -> Vec<ProducerRange> {
-    vec![ProducerRange {
-        producer_id: ProducerId::from_bytes(*b"producer-id-0123"),
-        producer_epoch: 3,
-        first_sequence: 0,
-        last_sequence: count.saturating_sub(1),
-    }]
+fn producer(tag: u8) -> ProducerId {
+    let mut bytes = *b"producer-id-0123";
+    bytes[15] = tag;
+    ProducerId::from_bytes(bytes)
+}
+
+/// One single-record submission per record, which is the simple case.
+fn submissions(count: u64) -> Vec<SubmissionRef> {
+    (0..count)
+        .map(|index| SubmissionRef {
+            producer_id: producer(1),
+            producer_epoch: 3,
+            sequence: index,
+            first_record: u32::try_from(index).expect("small"),
+            record_count: 1,
+        })
+        .collect()
 }
 
 fn frame(tag: u8, base: u64, count: i64) -> Frame {
@@ -52,7 +62,7 @@ fn frame(tag: u8, base: u64, count: i64) -> Frame {
         journal_id: journal(tag),
         base_offset: RecordOffset::new(base),
         records: (0..count).map(record).collect(),
-        producers: producers(count.max(0) as u64),
+        submissions: submissions(count.max(0) as u64),
     }
 }
 
@@ -266,6 +276,147 @@ fn the_wire_checksum_is_crc32c_castagnoli() {
     );
 }
 
+/// The reason `SubmissionRef` stores a record *span* rather than a sequence
+/// range: a submission may carry many records, and a deduplicated retry must be
+/// handed back the **same offsets the first attempt received** (decision 0010).
+///
+/// Knowing only that a sequence was committed is not enough. Recovery has to
+/// answer "and where did it land?" — so the span is stored, never inferred.
+#[test]
+fn a_multi_record_submissions_offsets_are_recoverable_from_the_chunk() {
+    // Three submissions of 2, 3, and 1 records, landing at base offset 100.
+    let records: Vec<Record> = (0..6).map(record).collect();
+    let spans = vec![
+        SubmissionRef {
+            producer_id: producer(1),
+            producer_epoch: 2,
+            sequence: 40,
+            first_record: 0,
+            record_count: 2,
+        },
+        SubmissionRef {
+            producer_id: producer(1),
+            producer_epoch: 2,
+            sequence: 41,
+            first_record: 2,
+            record_count: 3,
+        },
+        SubmissionRef {
+            producer_id: producer(2),
+            producer_epoch: 9,
+            sequence: 0,
+            first_record: 5,
+            record_count: 1,
+        },
+    ];
+    let sealed = seal_single_frame_chunk(
+        header(),
+        vec![Frame {
+            journal_id: journal(1),
+            base_offset: RecordOffset::new(100),
+            records,
+            submissions: spans,
+        }],
+    )
+    .expect("seal");
+
+    // Recovery reads only the index — no frame bytes — and reconstructs the
+    // exact receipt each submission was given.
+    let index = decode_index(&sealed.bytes).expect("index");
+    let entry = &index.frames[0];
+
+    assert_eq!(
+        entry.offsets_for(producer(1), 2, 40),
+        Some((RecordOffset::new(100), 2)),
+        "the first submission's two records began at offset 100"
+    );
+    assert_eq!(
+        entry.offsets_for(producer(1), 2, 41),
+        Some((RecordOffset::new(102), 3)),
+        "the second submission began after the first, not at a guessed offset"
+    );
+    assert_eq!(
+        entry.offsets_for(producer(2), 9, 0),
+        Some((RecordOffset::new(105), 1))
+    );
+
+    // An epoch or producer that did not write here has no offsets to return.
+    assert_eq!(entry.offsets_for(producer(1), 3, 40), None);
+    assert_eq!(entry.offsets_for(producer(9), 2, 40), None);
+}
+
+/// Submissions must tile the frame's records exactly. A gap would mean a record
+/// no producer claims; an overlap would mean two producers claiming the same
+/// offsets. Both are corruption, and both are rejected at seal and at decode.
+#[test]
+fn submissions_must_tile_the_records_exactly() {
+    let malformed = |spans: Vec<SubmissionRef>| {
+        seal_single_frame_chunk(
+            header(),
+            vec![Frame {
+                journal_id: journal(1),
+                base_offset: RecordOffset::new(0),
+                records: (0..3).map(record).collect(),
+                submissions: spans,
+            }],
+        )
+    };
+
+    // A gap: records 0..1 claimed, record 2 orphaned.
+    assert_eq!(
+        malformed(vec![SubmissionRef {
+            producer_id: producer(1),
+            producer_epoch: 1,
+            sequence: 0,
+            first_record: 0,
+            record_count: 2,
+        }]),
+        Err(ChunkError::InvalidSubmissionSpans)
+    );
+
+    // An overlap: two submissions both claim record 1.
+    assert_eq!(
+        malformed(vec![
+            SubmissionRef {
+                producer_id: producer(1),
+                producer_epoch: 1,
+                sequence: 0,
+                first_record: 0,
+                record_count: 2,
+            },
+            SubmissionRef {
+                producer_id: producer(1),
+                producer_epoch: 1,
+                sequence: 1,
+                first_record: 1,
+                record_count: 2,
+            },
+        ]),
+        Err(ChunkError::InvalidSubmissionSpans)
+    );
+
+    // An empty submission produced no records and cannot be identified.
+    assert_eq!(
+        malformed(vec![
+            SubmissionRef {
+                producer_id: producer(1),
+                producer_epoch: 1,
+                sequence: 0,
+                first_record: 0,
+                record_count: 0,
+            },
+            SubmissionRef {
+                producer_id: producer(1),
+                producer_epoch: 1,
+                sequence: 1,
+                first_record: 0,
+                record_count: 3,
+            },
+        ]),
+        Err(ChunkError::InvalidSubmissionSpans)
+    );
+}
+
 /// The multi-frame layout works — it is the format co-packing will use once the
 /// range-read gate opens (decision 0009). Phase 1's *driver* never emits more
 /// than one frame; the codec is proved general anyway so that enabling
@@ -320,7 +471,7 @@ proptest! {
             journal_id: journal(1),
             base_offset: RecordOffset::new(u64::from(base)),
             records,
-            producers: producers(count),
+            submissions: submissions(count),
         }];
 
         let predicted = encoded_chunk_len(&frames).expect("predict");

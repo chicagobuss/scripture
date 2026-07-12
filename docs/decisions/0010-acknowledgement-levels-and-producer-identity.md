@@ -137,11 +137,16 @@ Submission handling:
 | `producer_epoch` < the highest seen | `FencedProducer` — a zombie instance. Reject. |
 
 **The dedup window is recovered from the log, not from memory.** Each frame
-records the `(producer_id, producer_epoch, sequence)` range it contains, so a
-new owner rebuilds the window by scanning the tail of the sealed predecessor. A
-window that cannot be rebuilt (because the required chunks were trimmed) yields
-`Indeterminate` for sequences below the trim point — which is correct, not a
-degradation.
+records, per submission, `(producer_id, producer_epoch, sequence, first_record,
+record_count)` — a record **span**, not a sequence range (0009). A new owner
+rebuilds the window by scanning the tail of the sealed predecessor and can then
+answer a retry with the *original offsets*, because the span says exactly where
+that submission landed. A sequence range would say only that the sequence
+committed, which is not a receipt.
+
+A window that cannot be rebuilt (because the required chunks were trimmed or lie
+outside the recovery bound) yields `Indeterminate` for those sequences — which is
+correct, not a degradation.
 
 This is the mechanism the fleet gate names as "Scripture producer idempotence."
 
