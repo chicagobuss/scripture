@@ -44,6 +44,37 @@ addressed.
    (see the spike's `SetupError`); the builder removes most of the wiring that
    made this annoying.
 
+3b. **`AtomicLog::append` does not classify its failure phase — so no append
+   error is retryable, and every transient upload blip costs a full recovery.**
+   (Raised 2026-07-12 by the chunk-protocol spike; see scripture decision 0010.)
+
+   `append` acquires a slot, *then* writes, *then* completes the slot. If the
+   write fails or the future is cancelled after acquisition, the slot is
+   allocated and never completed — the sequencer's tail cannot advance past it,
+   so **every later `complete_slot` blocks forever.** A retry therefore does not
+   merely risk a duplicate: it wedges the log. This is the kernel's intentional
+   wedging, and it is correct — but it means a consumer must treat *every*
+   non-`Ok` append as poisoned, including a plain 503 from the object store,
+   which is by far the most common failure in practice.
+
+   The information needed to do better already exists inside `append`: an error
+   from `acquire_slot` provably happened **before** any slot was taken and is
+   cleanly retryable; anything after it is not. The error type does not carry
+   that distinction (a `SequencerError` can arise from either `acquire_slot` or
+   `complete_slot`), so a caller cannot recover it.
+
+   **Proposal:** have `append` return a failure that names its phase — e.g.
+   `AtomicLogError::PreAcquire(..)` (no slot taken; safe to retry the identical
+   bytes) versus `AtomicLogError::Uncertain { .. }` (a slot was taken; the
+   outcome is unknown; do not retry). This is purely additive, changes no
+   protocol semantics, and converts the common transient-error case from
+   "poison the writer and run recovery" into "retry and continue." At scale that
+   is the difference between an ordinary retry and a fenced generation change on
+   every provider hiccup.
+
+   Scripture Phase 1 does **not** assume this and treats all failures as
+   uncertain. → holylog, high value.
+
 4. **Every tail poll costs a sequencer call plus a seal read.** `check_tail`
    is the only way to learn about new entries, so a polling consumer pays that
    pair per poll (a real GET against durable seal storage). Not a kernel

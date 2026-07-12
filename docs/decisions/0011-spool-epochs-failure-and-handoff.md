@@ -125,27 +125,58 @@ and a cell-wide event loses it entirely.
 The loss budget is the maximum acknowledged-but-uncommitted data a profile may
 hold. It must be **enforced by reservation**, not merely documented.
 
+**Bytes are a hard bound. Time is not — and the record must not pretend
+otherwise (amended 2026-07-12).**
+
 ```text
+# HARD BOUND, enforced by reservation. No admission may exceed it.
 bytes_at_risk = max_buffered_bytes                       # not yet sealed
               + max_inflight_chunks × max_chunk_bytes    # sealed, append in flight
-
-age_at_risk   = max_chunk_age                            # time to seal
-              + append_latency_p99                       # time to commit
-              × max_inflight_chunks                      # pipeline depth
-
-records_at_risk = bytes_at_risk / min_record_bytes       # an upper bound
 ```
 
-**Pipeline depth is part of the budget.** "We can lose at most one chunk" is only
-true when `max_inflight_chunks == 1`. A profile that pipelines four chunks to hide
-upload latency has quadrupled its exposure, and the sentence that used to be true
-is now false by a factor of four. This is the single easiest place for a future
-implementation to quietly distort the contract, which is why the budget is a
-formula and not a slogan.
+This is a true maximum only if **no chunk can exceed `max_chunk_bytes`**.
+Therefore a hard `max_record_bytes` is mandatory, with
+`max_record_bytes + chunk_overhead <= max_chunk_bytes`, and a record above it is
+**rejected** (`RecordTooLarge`) rather than sealed into an oversized chunk of its
+own. An earlier draft allowed an oversized record to "seal alone rather than
+deadlock" — that avoids a deadlock by silently breaching the published
+bytes-at-risk ceiling, which is worse. Reject it and say why.
 
-A submission that would exceed `bytes_at_risk` **blocks** (backpressure). It is
-never accepted-and-then-dropped. A spool fleet must never become an unbounded
-shared heap.
+**Pipeline depth is in the bound.** "We can lose at most one chunk" is true *only*
+when `max_inflight_chunks == 1`. A profile that pipelines four chunks to hide
+upload latency has quadrupled its exposure, and the sentence that used to be true
+is now false by a factor of four. This is the easiest place for an implementation
+to quietly distort the contract, which is why it is a formula and not a slogan.
+
+**Time is not a hard bound, and the honest statement is uncomfortable:**
+
+```text
+# NOT A BOUND. p99 is a measurement; a provider outage exceeds it arbitrarily.
+age_at_risk ≠ max_chunk_age + append_latency_p99 × max_inflight_chunks
+```
+
+An in-flight append can hang for as long as the provider is unwell. Nothing
+Scripture does can bound that, because it cannot un-issue an append and it cannot
+learn the outcome. What it *can* bound is **admission**:
+
+- `max_chunk_age` bounds the time from a record's acceptance to its **seal**.
+- `max_uncommitted_age` is an **admission deadline**, not a resolution deadline:
+  when the oldest uncommitted chunk exceeds it, the driver **stops accepting new
+  submissions** and raises `oldest_uncommitted_age` on its metrics. It does not,
+  and cannot, promise the in-flight data resolves by then.
+
+So the published contract is: **bounded bytes at risk, bounded admission,
+unbounded resolution time under provider failure.** A profile that advertises a
+time-bounded loss window is lying about a dependency it does not control. If an
+operator needs a resolution deadline, the only honest mechanism is to fail the
+in-flight window explicitly — which, per the state machine (0010), means the
+driver poisons and recovery decides what was committed. That is a *loss
+declaration*, not a timeout.
+
+A submission that would exceed `bytes_at_risk`, or that arrives after the
+admission deadline has tripped, **blocks** (backpressure). It is never
+accepted-and-then-dropped. A spool fleet must never become an unbounded shared
+heap.
 
 ## Correctness
 

@@ -62,9 +62,37 @@ Every submission carries `(producer_id, producer_epoch, sequence)`:
 - `sequence` — strictly increasing per `(producer_id, producer_epoch, journal)`,
   starting at 0.
 
-The owner keeps a bounded **dedup window** per `(producer_id, journal)`: the
-highest committed sequence and a bounded map from recent sequence → assigned
-offsets.
+**The durable dedup key is `(producer_id, producer_epoch, journal)`** — not
+`(producer_id, journal)`. The owner keeps, per journal:
+
+- `highest_epoch[producer_id]` — the greatest epoch ever admitted; and
+- a bounded **dedup window** keyed by `(producer_id, producer_epoch)`, holding the
+  highest committed sequence and a bounded map from recent sequence → assigned
+  offsets.
+
+**Epoch admission rules:**
+
+| Condition | Outcome |
+|---|---|
+| `epoch > highest_epoch` | admit; record the new `highest_epoch`; the expected initial sequence for that epoch is **0** |
+| `epoch == highest_epoch` | admit; sequence rules below apply |
+| `epoch < highest_epoch` | `FencedProducer` — a zombie instance. Reject, no side effects |
+
+**A retry preserves its original `(epoch, sequence)`.** This is a contract on the
+producer, and it is the only thing that makes a retry a *retry*. A producer that
+restarts, bumps its epoch, and re-sends the same logical event under the new
+epoch has **created a new identity**: the owner cannot know the two are the same
+event, and it will commit both. Such a producer gets at-least-once and must be
+told so — exactly-once across a producer restart requires an
+application-level idempotency key, which Scripture does not invent for it.
+
+**Recovery scan is bounded.** Rebuilding the window on ownership change scans the
+sealed predecessor's tail backwards, bounded by
+`max(dedup_window_chunks, dedup_window_bytes)` — never "scan the tail" in the
+sense of an unbounded walk of a long-lived journal, which would make recovery
+time grow without limit in the log's age. Sequences older than the scanned
+boundary yield `Indeterminate`, not a guess. The bound is a published policy
+value and appears in the loss/recovery budget alongside the others (0011).
 
 Submission handling:
 
@@ -128,10 +156,11 @@ States of one submission inside the owner:
                 │ Holylog append issued
                 ▼
           ┌─────────────┐
-          │  Appending  │
-          └──┬───┬───┬──┘
-             │   │   └── kernel Sealed (fenced) ─────► Indeterminate → owner resigns (0011)
-             │   └────── kernel error/timeout ───────► Failed(retryable) ─► chunk re-appended, same bytes
+          │  Appending  │  the append future is OWNED and AWAITED; never dropped
+          └──┬───────┬──┘
+             │       └── any non-Ok outcome ─────────► Uncertain ─► owner poisons,
+             │           (error, timeout, cancel,                   stops accepting,
+             │            kernel Sealed)                            recovers (0011)
              ▼
         append acknowledged
              │
@@ -143,6 +172,55 @@ States of one submission inside the owner:
              ▼
           (steady state)
 ```
+
+### There is no retryable append failure (amended 2026-07-12)
+
+An earlier draft of this record had `Appending` fall back to
+`Failed(retryable) → re-append the same bytes`. **That is unsound, and it would
+deadlock.**
+
+`AtomicLog::append` acquires a slot, *then* writes, *then* completes the slot:
+
+```rust
+let address = self.sequencer.acquire_slot().await?;
+self.drive.write(address, value).await?;      // an error here abandons the slot
+self.sequencer.complete_slot(address).await?; // never reached
+```
+
+If the write fails or the future is cancelled after the slot was acquired, that
+slot is **allocated and never completed**. The sequencer's completed tail cannot
+advance past it, so *every subsequent* `complete_slot` — including the retry's —
+blocks forever. A retry would not merely risk a duplicate; it would **hang the
+driver permanently on the first transient upload error.** This is the kernel's
+documented intentional wedging (holylog `docs/atomic_log.md`), and it is the same
+reason `JournalWriter` poisons after an uncertain append (decision 0003). The
+draft state machine contradicted a decision this repo had already made.
+
+**The rule, therefore:**
+
+> **Every non-`Ok` outcome of `AtomicLog::append` — error, timeout, cancellation,
+> or `Sealed` — is `Uncertain`. The driver poisons: it stops accepting
+> submissions, it does **not** retry into the same AtomicLog, and it enters the
+> recovery/reconfiguration path of 0011.**
+
+Two corollaries the implementation must honour:
+
+1. **The append future is owned by the driver and always awaited to completion.**
+   It is never dropped, never raced against a timeout that abandons it, and never
+   placed in a `select!` that can cancel it. Cancelling it is what creates the
+   wedge.
+2. **`Sealed` is not the only uncertain case.** It is merely the one where we also
+   know *why*. A network error and a fence are handled identically by the driver;
+   they differ only in what recovery finds.
+
+**Kernel gap (not a Phase-1 dependency).** A retry could be made safe for the
+*pre-acquire* case if `AtomicLog::append` classified its failure phase — "no slot
+was acquired" versus "a slot was acquired and its fate is unknown". The first is
+cleanly retryable; the second never is. No such classification exists today, and
+Phase 1 does not assume one. It is recorded in `docs/kernel-gap-report.md` as a
+proposal, because it would convert the common transient-error case from
+"poison and recover" into "retry and continue" — which is worth real money at
+scale.
 
 Invariants over this machine, and they are the properties the model in 0011 must
 check:
