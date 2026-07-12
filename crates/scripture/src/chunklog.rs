@@ -8,7 +8,7 @@
 
 use holylog::atomic::{AtomicLog, AtomicLogError};
 
-use crate::chunk::{ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
+use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
 use crate::model::{JournalId, RecordOffset};
 
 /// A bounded number of tail chunks to inspect during owner recovery.
@@ -118,6 +118,9 @@ pub enum ChunkLogError {
     /// A prior append had an unknown outcome; this writer cannot be reused.
     #[error("chunk writer is poisoned; recover a fenced successor")]
     Poisoned,
+    /// The public sealed-chunk carrier did not agree with its immutable bytes.
+    #[error("sealed chunk metadata does not match its bytes")]
+    SealedMetadataMismatch,
 }
 
 /// One non-cloneable owner of chunk appends for a journal and generation.
@@ -167,6 +170,10 @@ impl ChunkLogWriter {
             return Err(ChunkLogError::Poisoned);
         }
         let index = decode_index(&chunk.bytes)?;
+        if index.header.chunk_id != chunk.chunk_id || ChunkDigest::of(&chunk.bytes) != chunk.digest
+        {
+            return Err(ChunkLogError::SealedMetadataMismatch);
+        }
         if index.header.cohort_id != self.cohort_id {
             return Err(ChunkLogError::CohortMismatch);
         }
