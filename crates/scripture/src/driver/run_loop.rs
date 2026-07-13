@@ -293,6 +293,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                             records,
                             pending.sealed.chunk_id,
                             ack.slot,
+                            self.generation,
                         ),
                     );
                     self.ledger.event(Event::ReceiptReleased {
@@ -309,6 +310,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                         next_offset,
                         chunk_id: pending.sealed.chunk_id,
                         slot: ack.slot,
+                        canon_revision: self.generation,
                         deduplicated: false,
                     };
                     for waiter in placed.waiters {

@@ -65,6 +65,11 @@ pub struct RecoveredChunk {
     pub chunk_id: ChunkId,
     /// Content digest of the durable bytes.
     pub digest: ChunkDigest,
+    /// Chunk header generation (Canon revision for VirtualLog-backed writers).
+    ///
+    /// Preserved so deduplicated receipts after recovery can name the generation
+    /// that originally accepted the submission, not the active successor.
+    pub generation: u64,
     /// The start of the record span.
     pub first_offset: RecordOffset,
     /// Number of records in the span.
@@ -538,6 +543,7 @@ impl ChunkLogWriter {
                 slot,
                 chunk_id: index.header.chunk_id,
                 digest: ChunkDigest::of(&payload),
+                generation: index.header.generation,
                 first_offset: frame.base_offset,
                 record_count: frame.record_count,
                 frame: frame.clone(),

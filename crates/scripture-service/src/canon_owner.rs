@@ -391,6 +391,7 @@ mod tests {
         let receipt = pending.await.expect("commit");
         assert_eq!(receipt.first_offset.get(), 0);
         assert_eq!(receipt.slot, 0);
+        assert_eq!(receipt.canon_revision, 0);
     }
 
     #[tokio::test]
@@ -427,7 +428,8 @@ mod tests {
             .await
             .expect("admit");
         service.flush(journal()).await.expect("flush");
-        pending_a.await.expect("commit");
+        let receipt = pending_a.await.expect("commit");
+        assert_eq!(receipt.canon_revision, 0);
         service.stop_owner(journal()).await.expect("stop a");
 
         harness
@@ -461,12 +463,25 @@ mod tests {
         assert_eq!(recovered_b.authority().revision(), 1);
         assert_eq!(recovered_b.recovered_chunks().len(), 1);
         assert_eq!(recovered_b.recovered_chunks()[0].first_offset.get(), 0);
+        assert_eq!(recovered_b.recovered_chunks()[0].generation, 0);
 
         // A separate process-local registry — not an in-place owner replacement.
         let mut service_b = crate::ChunkJournalService::new();
         service_b
             .register_canon_owner(recovered_b)
             .expect("register b");
+        let retry_a = service_b
+            .submit(
+                journal(),
+                Submission {
+                    producer_id: ProducerId::from_bytes(*b"factory-producer"),
+                    producer_epoch: 0,
+                    sequence: 0,
+                    records: vec![Record::new([], Bytes::from_static(b"a0"))],
+                },
+            )
+            .await
+            .expect("dedup admit");
         let pending_b = service_b
             .submit(
                 journal(),
@@ -480,9 +495,14 @@ mod tests {
             .await
             .expect("admit");
         service_b.flush(journal()).await.expect("flush");
+        let retry = retry_a.await.expect("dedup receipt");
+        assert!(retry.deduplicated);
+        assert_eq!(retry.canon_revision, 0, "dedup must preserve generation-0");
         let receipt = pending_b.await.expect("commit");
         assert_eq!(receipt.first_offset.get(), 1);
         assert_eq!(receipt.slot, 1);
+        assert_eq!(receipt.canon_revision, 1);
+        assert!(!receipt.deduplicated);
     }
 
     #[tokio::test]
