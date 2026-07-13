@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 526bbfe0ef7530be628988bcfc1084e167175da99f8fd54dbd36a503c0fdcd14 # shrinks to operations = [SubmitNew(1), RetryInFlight, Flush]
+cc d245aba96f0ffa7a5b01ea31522b16511366ddd411976c5df86c0de96a5f2736 # shrinks to operations = [SubmitNew(1), RetryCommitted, SubmitNew(1), SubmitNew(1), SubmitNew(1), SubmitNew(1), SubmitNew(1)]
+cc 5c954ffef929809fcd036654f9b905487562c4365ff67f615c927bb9d63eeaae # shrinks to operations = [Quiesce, SubmitNew(1), DropLastReceipt]
