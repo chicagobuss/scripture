@@ -11,6 +11,10 @@ dense record offsets, one in-process durable writer, direct pull reads,
 operator-configured stable journal identity, consumer-owned checkpoints/manual
 retention, and backend-neutral cost accounting.
 
+See [`ROADMAP.md`](ROADMAP.md) for the direction: the backend deployment-tier
+ladder (free-tier, flat-fee SQL, object storage, hot per-KB stores), the
+elastic journal-ownership fleet, and the bring-your-own-backend adapter story.
+
 The `scripture` crate implements that bounded surface. It deliberately makes
 no directory, cross-process writer fencing/restart, filtering, consumer-group,
 queue, or physical-reclamation claim. Those remain later decisions rather
