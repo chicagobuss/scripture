@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use holylog::virtual_log::{ApplicationFence, VirtualLogState};
+use holylog::virtual_log::{ApplicationFence, VirtualLog, VirtualLogError, VirtualLogState};
 
 use crate::model::JournalId;
 
@@ -330,5 +330,110 @@ impl<'a> Cursor<'a> {
 
     fn is_at_end(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+}
+
+/// Fresh Canon authority observation used to start one owner attempt.
+///
+/// This is not a forever lease. Callers must treat a later register advance or
+/// seal fence as invalidating the attempt and re-inspect before serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonAuthoritySnapshot {
+    /// Linearizable VirtualLog membership observation.
+    pub state: VirtualLogState,
+    /// Fence bound to [`VirtualLogState::revision`].
+    pub fence: CanonFence,
+}
+
+impl CanonAuthoritySnapshot {
+    /// Canon / VirtualLog revision used for this observation.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.fence.revision
+    }
+}
+
+/// Why a fresh Canon observation refused to authorize an owner.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonAuthorityError {
+    /// Holylog register or VirtualLog failed.
+    #[error(transparent)]
+    VirtualLog(#[from] VirtualLogError),
+    /// Opaque fence bytes failed to decode or bind.
+    #[error(transparent)]
+    Fence(#[from] CanonFenceError),
+    /// The Canon fence names a different Scripture journal.
+    #[error("Canon journal {actual} does not match expected {expected}")]
+    JournalMismatch {
+        /// Expected journal.
+        expected: JournalId,
+        /// Journal named by the fence.
+        actual: JournalId,
+    },
+    /// The Canon fence names a different physical Line.
+    #[error("Canon Line {actual} does not match expected {expected}")]
+    LineMismatch {
+        /// Expected Line.
+        expected: LineId,
+        /// Line named by the fence.
+        actual: LineId,
+    },
+    /// The Line is explicitly unowned / recovering.
+    #[error("Canon revision {revision} leaves Line {line_id} unowned")]
+    Unowned {
+        /// Observed revision.
+        revision: u64,
+        /// Line that is unowned.
+        line_id: LineId,
+    },
+    /// The fence names a different owner identity.
+    #[error("Canon owner {actual} does not match expected {expected} at revision {revision}")]
+    NotOwner {
+        /// Observed revision.
+        revision: u64,
+        /// Expected owner.
+        expected: OwnerId,
+        /// Owner named by the fence.
+        actual: OwnerId,
+    },
+}
+
+/// Reads a fresh VirtualLog register state and validates Canon identity/owner.
+///
+/// Always uses [`VirtualLog::state`] (linearizable). Cached membership is never
+/// treated as startup authority.
+pub async fn observe_canon_authority(
+    virtual_log: &VirtualLog,
+    expected_journal_id: JournalId,
+    expected_line_id: LineId,
+    expected_owner_id: OwnerId,
+) -> Result<CanonAuthoritySnapshot, CanonAuthorityError> {
+    let state = virtual_log.state().await?;
+    let fence = CanonFence::from_virtual_log_state(&state)?;
+    if fence.journal_id != expected_journal_id {
+        return Err(CanonAuthorityError::JournalMismatch {
+            expected: expected_journal_id,
+            actual: fence.journal_id,
+        });
+    }
+    if fence.line_id != expected_line_id {
+        return Err(CanonAuthorityError::LineMismatch {
+            expected: expected_line_id,
+            actual: fence.line_id,
+        });
+    }
+    match &fence.owner {
+        CanonOwner::Unowned => Err(CanonAuthorityError::Unowned {
+            revision: fence.revision,
+            line_id: fence.line_id,
+        }),
+        CanonOwner::Owned { owner_id, .. } if *owner_id != expected_owner_id => {
+            Err(CanonAuthorityError::NotOwner {
+                revision: fence.revision,
+                expected: expected_owner_id,
+                actual: *owner_id,
+            })
+        }
+        CanonOwner::Owned { .. } => Ok(CanonAuthoritySnapshot { state, fence }),
     }
 }
