@@ -4,6 +4,7 @@ members = [
     "crates/scripture",
     "crates/scripture-service",
     "crates/scriptured",
+    "crates/scripture-load",
 ]
 resolver = "3"
 
