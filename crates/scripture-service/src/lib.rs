@@ -6,17 +6,26 @@
 //! duplicating admission or durability logic.
 //!
 //! Canon-authorized startup after a fenced handoff uses
-//! [`recover_canon_owner`]. [`ChunkJournalService::register_owner`] is a local
-//! lab registry only and does not grant distributed fencing.
+//! [`recover_canon_owner`]. Operator-directed A→B handoff uses
+//! [`ChunkJournalService::drain_owner`] then [`publish_canon_transition`].
+//! [`ChunkJournalService::register_owner`] is a local lab registry only and does
+//! not grant distributed fencing.
 
 mod canon_owner;
+mod canon_transition;
 mod chunk_service;
 pub mod reconcile;
 
 pub use canon_owner::{
     CanonOwnerError, CanonOwnerRequest, RecoveredCanonOwner, recover_canon_owner,
 };
-pub use chunk_service::{ChunkJournalService, ChunkServiceError, OwnerHealth, OwnerStatus};
+pub use canon_transition::{
+    CanonTransitionError, CanonTransitionOutcome, CanonTransitionRequest, PublishedCanon,
+    publish_canon_transition,
+};
+pub use chunk_service::{
+    ChunkJournalService, ChunkServiceError, DrainError, DrainedOwner, OwnerHealth, OwnerStatus,
+};
 pub use reconcile::{
     OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,
     RecoveryFacts, RecoveryFinding, RecoveryMode, RecoveryPlan, plan as plan_recovery,

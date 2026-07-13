@@ -18,7 +18,8 @@ pub mod trace;
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
 pub use canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, CanonFence, CanonFenceError, CanonOwner, LineId,
-    OwnerEndpoint, OwnerId, observe_canon_authority,
+    OwnerEndpoint, OwnerId, WitnessedCanonAuthority, observe_canon_authority,
+    observe_canon_authority_witnessed,
 };
 pub use chunk::{
     Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,

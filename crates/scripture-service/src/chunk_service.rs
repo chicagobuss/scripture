@@ -1,16 +1,18 @@
 //! Multi-journal local owner service over Phase 1 [`ChunkDriverActor`].
 //!
-//! This layer owns task lifecycle and journal routing only. It never duplicates
-//! admission, dedup, offset allocation, or timer policy — those stay in
+//! This layer owns task lifecycle, journal routing, and the local draining gate
+//! for an operator-directed Canon handoff. It never duplicates admission,
+//! dedup, offset allocation, or timer policy — those stay in
 //! [`scripture::ChunkDriverHandle`].
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use scripture::{
-    ChunkDriverActor, ChunkDriverHandle, Clock, DriverError, JournalId, ReceiptFuture, Submission,
-    Timer,
+    CanonAuthorityError, CanonAuthoritySnapshot, CanonOwner, ChunkDriverActor, ChunkDriverHandle,
+    Clock, DriverError, JournalId, OwnerId, ReceiptFuture, Submission, Timer,
 };
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Observable status of one registered local owner.
@@ -18,6 +20,10 @@ use tokio::task::JoinHandle;
 pub enum OwnerStatus {
     /// The actor `run` future is still live and accepting work.
     Running,
+    /// Local drain is in progress or complete; new submit/flush are refused.
+    ///
+    /// This is a process-local lifecycle bit, not distributed Canon ownership.
+    Draining,
     /// The actor observed an uncertain append and refuses new work.
     Poisoned,
     /// The actor task finished (channel closed / run returned). Not restarted.
@@ -48,13 +54,19 @@ pub enum ChunkServiceError {
         /// Requested journal.
         journal_id: JournalId,
     },
-    /// The owner is poisoned or its task has finished.
+    /// The owner is poisoned, draining, or its task has finished.
     #[error("owner for journal {journal_id:?} is unavailable ({status:?})")]
     OwnerUnavailable {
         /// Journal whose owner cannot accept work.
         journal_id: JournalId,
         /// Observed status.
         status: OwnerStatus,
+    },
+    /// The local owner has entered drain and refuses new admissions.
+    #[error("owner for journal {journal_id:?} is draining")]
+    OwnerDraining {
+        /// Journal whose owner is draining.
+        journal_id: JournalId,
     },
     /// A registered owner rejected or failed a request.
     #[error(transparent)]
@@ -67,18 +79,96 @@ pub enum ChunkServiceError {
     },
 }
 
+/// Failures entering the local draining gate.
+#[derive(Debug, thiserror::Error)]
+pub enum DrainError {
+    /// No owner is registered for this journal.
+    #[error(transparent)]
+    Service(#[from] ChunkServiceError),
+    /// Canon authority refused the drain.
+    #[error(transparent)]
+    Authority(#[from] CanonAuthorityError),
+    /// The owner is not in a serving state that can drain.
+    #[error("owner for journal {journal_id:?} cannot drain from status {status:?}")]
+    NotServing {
+        /// Journal that cannot drain.
+        journal_id: JournalId,
+        /// Observed local status.
+        status: OwnerStatus,
+    },
+    /// Flush or an admitted outcome left the owner poisoned/uncertain.
+    #[error("drain failed for journal {journal_id:?}: owner is poisoned or uncertain")]
+    DrainFailed {
+        /// Journal whose drain failed.
+        journal_id: JournalId,
+    },
+}
+
+/// Proof that a local owner drained and may be passed to Canon publish.
+///
+/// Constructed only by [`ChunkJournalService::drain_owner`]. It is not a
+/// distributed lease and does not authorize serving.
+#[derive(Debug)]
+pub struct DrainedOwner {
+    journal_id: JournalId,
+    owner_id: OwnerId,
+    revision: u64,
+}
+
+impl DrainedOwner {
+    /// Journal that was drained.
+    #[must_use]
+    pub const fn journal_id(&self) -> JournalId {
+        self.journal_id
+    }
+
+    /// Owner identity validated against Canon at drain time.
+    #[must_use]
+    pub const fn owner_id(&self) -> OwnerId {
+        self.owner_id
+    }
+
+    /// Canon revision observed when drain was authorized.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Test-only constructor for fail-closed publish validation paths.
+    #[cfg(test)]
+    pub(crate) const fn for_test(journal_id: JournalId, owner_id: OwnerId, revision: u64) -> Self {
+        Self {
+            journal_id,
+            owner_id,
+            revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalLifecycle {
+    Serving,
+    Draining,
+    Stopped,
+}
+
 struct OwnerSlot {
     journal_id: JournalId,
     registered_owner_generation: u64,
     handle: Option<ChunkDriverHandle>,
-    status: Arc<Mutex<OwnerStatus>>,
+    lifecycle: Arc<Mutex<LocalLifecycle>>,
     /// Held so the actor task is not detached without observation.
     task: JoinHandle<()>,
 }
 
 impl OwnerSlot {
     fn health(&self) -> OwnerHealth {
-        let status = if self.task.is_finished() {
+        let lifecycle = self
+            .lifecycle
+            .try_lock()
+            .map(|guard| *guard)
+            .unwrap_or(LocalLifecycle::Stopped);
+        let status = if self.task.is_finished() || lifecycle == LocalLifecycle::Stopped {
             OwnerStatus::TaskFinished
         } else if self
             .handle
@@ -86,11 +176,10 @@ impl OwnerSlot {
             .is_some_and(|handle| handle.metrics().poisoned)
         {
             OwnerStatus::Poisoned
+        } else if lifecycle == LocalLifecycle::Draining {
+            OwnerStatus::Draining
         } else {
-            self.status
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(OwnerStatus::TaskFinished)
+            OwnerStatus::Running
         };
         OwnerHealth {
             journal_id: self.journal_id,
@@ -99,34 +188,9 @@ impl OwnerSlot {
         }
     }
 
-    fn mark_poisoned(&self) {
-        if let Ok(mut status) = self.status.lock()
-            && *status == OwnerStatus::Running
-        {
-            *status = OwnerStatus::Poisoned;
-        }
-    }
-
-    fn ensure_accepting(&self) -> Result<&ChunkDriverHandle, ChunkServiceError> {
-        let status = self.health().status;
-        if status != OwnerStatus::Running {
-            return Err(ChunkServiceError::OwnerUnavailable {
-                journal_id: self.journal_id,
-                status,
-            });
-        }
-        self.handle
-            .as_ref()
-            .ok_or(ChunkServiceError::OwnerUnavailable {
-                journal_id: self.journal_id,
-                status: OwnerStatus::TaskFinished,
-            })
-    }
-
     fn map_driver_error(&self, error: DriverError) -> ChunkServiceError {
         match error {
             DriverError::Poisoned | DriverError::Uncertain { .. } | DriverError::Unavailable => {
-                self.mark_poisoned();
                 ChunkServiceError::OwnerUnavailable {
                     journal_id: self.journal_id,
                     status: OwnerStatus::Poisoned,
@@ -177,13 +241,11 @@ impl ChunkJournalService {
         if self.owners.contains_key(&journal_id) {
             return Err(ChunkServiceError::AlreadyRegistered { journal_id });
         }
-        let status = Arc::new(Mutex::new(OwnerStatus::Running));
-        let task_status = Arc::clone(&status);
+        let lifecycle = Arc::new(Mutex::new(LocalLifecycle::Serving));
+        let task_lifecycle = Arc::clone(&lifecycle);
         let task = tokio::spawn(async move {
             let _ = actor.run().await;
-            if let Ok(mut guard) = task_status.lock() {
-                *guard = OwnerStatus::TaskFinished;
-            }
+            *task_lifecycle.lock().await = LocalLifecycle::Stopped;
         });
         self.owners.insert(
             journal_id,
@@ -191,7 +253,7 @@ impl ChunkJournalService {
                 journal_id,
                 registered_owner_generation,
                 handle: Some(handle),
-                status,
+                lifecycle,
                 task,
             },
         );
@@ -207,16 +269,108 @@ impl ChunkJournalService {
             .owners
             .get_mut(&journal_id)
             .ok_or(ChunkServiceError::UnknownJournal { journal_id })?;
+        {
+            let mut life = owner.lifecycle.lock().await;
+            *life = LocalLifecycle::Stopped;
+        }
         drop(owner.handle.take());
         // Replace the join handle with a finished noop so we can await the old one.
         let task = std::mem::replace(&mut owner.task, tokio::spawn(async {}));
-        let status = Arc::clone(&owner.status);
+        let lifecycle = Arc::clone(&owner.lifecycle);
         let _ = owner;
         let _ = task.await;
-        if let Ok(mut guard) = status.lock() {
-            *guard = OwnerStatus::TaskFinished;
-        }
+        *lifecycle.lock().await = LocalLifecycle::Stopped;
         Ok(())
+    }
+
+    /// Stops new admissions, flushes open work, and returns a drained token.
+    ///
+    /// Requires `authority` to name this journal and `expected_owner_id` as the
+    /// current Canon owner. On success the owner stays locally
+    /// [`OwnerStatus::Draining`] until publish stops it or an operator inspects.
+    /// Poison or uncertain flush yields [`DrainError::DrainFailed`] and must not
+    /// publish a successor.
+    pub async fn drain_owner(
+        &mut self,
+        journal_id: JournalId,
+        authority: &CanonAuthoritySnapshot,
+        expected_owner_id: OwnerId,
+    ) -> Result<DrainedOwner, DrainError> {
+        if authority.fence.journal_id != journal_id {
+            return Err(DrainError::Authority(
+                CanonAuthorityError::JournalMismatch {
+                    expected: journal_id,
+                    actual: authority.fence.journal_id,
+                },
+            ));
+        }
+        match &authority.fence.owner {
+            CanonOwner::Unowned => {
+                return Err(DrainError::Authority(CanonAuthorityError::Unowned {
+                    revision: authority.revision(),
+                    line_id: authority.fence.line_id,
+                }));
+            }
+            CanonOwner::Owned { owner_id, .. } if *owner_id != expected_owner_id => {
+                return Err(DrainError::Authority(CanonAuthorityError::NotOwner {
+                    revision: authority.revision(),
+                    expected: expected_owner_id,
+                    actual: *owner_id,
+                }));
+            }
+            CanonOwner::Owned { .. } => {}
+        }
+
+        let owner = self
+            .owners
+            .get_mut(&journal_id)
+            .ok_or(ChunkServiceError::UnknownJournal { journal_id })?;
+
+        let handle = {
+            let mut life = owner.lifecycle.lock().await;
+            if *life != LocalLifecycle::Serving {
+                let status = match *life {
+                    LocalLifecycle::Draining => OwnerStatus::Draining,
+                    LocalLifecycle::Stopped => OwnerStatus::TaskFinished,
+                    LocalLifecycle::Serving => OwnerStatus::Running,
+                };
+                return Err(DrainError::NotServing { journal_id, status });
+            }
+            let handle = owner
+                .handle
+                .as_ref()
+                .ok_or(ChunkServiceError::OwnerUnavailable {
+                    journal_id,
+                    status: OwnerStatus::TaskFinished,
+                })?;
+            if handle.metrics().poisoned {
+                return Err(DrainError::NotServing {
+                    journal_id,
+                    status: OwnerStatus::Poisoned,
+                });
+            }
+            *life = LocalLifecycle::Draining;
+            handle.clone()
+        };
+
+        // Already-admitted driver work reaches a terminal durability outcome via
+        // flush. New submit/flush at this service boundary sees Draining.
+        match handle.flush().await {
+            Ok(()) => {
+                if handle.metrics().poisoned {
+                    return Err(DrainError::DrainFailed { journal_id });
+                }
+                Ok(DrainedOwner {
+                    journal_id,
+                    owner_id: expected_owner_id,
+                    revision: authority.revision(),
+                })
+            }
+            Err(DriverError::Poisoned)
+            | Err(DriverError::Uncertain { .. })
+            | Err(DriverError::Unavailable) => Err(DrainError::DrainFailed { journal_id }),
+            Err(other) => Err(DrainError::Service(ChunkServiceError::Driver(other))),
+        }
     }
 
     /// Submits through the registered owner for `journal_id`.
@@ -226,7 +380,38 @@ impl ChunkJournalService {
         submission: Submission,
     ) -> Result<ReceiptFuture, ChunkServiceError> {
         let owner = self.owner(journal_id)?;
-        let handle = owner.ensure_accepting()?;
+        // Hold the lifecycle lock across admission so drain cannot interleave
+        // between the Serving check and ChunkDriverHandle::submit.
+        let _life = owner.lifecycle.lock().await;
+        match *_life {
+            LocalLifecycle::Draining => {
+                return Err(ChunkServiceError::OwnerDraining { journal_id });
+            }
+            LocalLifecycle::Stopped => {
+                return Err(ChunkServiceError::OwnerUnavailable {
+                    journal_id,
+                    status: OwnerStatus::TaskFinished,
+                });
+            }
+            LocalLifecycle::Serving => {}
+        }
+        if owner
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.metrics().poisoned)
+        {
+            return Err(ChunkServiceError::OwnerUnavailable {
+                journal_id,
+                status: OwnerStatus::Poisoned,
+            });
+        }
+        let handle = owner
+            .handle
+            .as_ref()
+            .ok_or(ChunkServiceError::OwnerUnavailable {
+                journal_id,
+                status: OwnerStatus::TaskFinished,
+            })?;
         match handle.submit(submission).await {
             Ok(receipt) => Ok(receipt),
             Err(error) => Err(owner.map_driver_error(error)),
@@ -236,7 +421,36 @@ impl ChunkJournalService {
     /// Flushes the registered owner's open chunk.
     pub async fn flush(&self, journal_id: JournalId) -> Result<(), ChunkServiceError> {
         let owner = self.owner(journal_id)?;
-        let handle = owner.ensure_accepting()?;
+        let _life = owner.lifecycle.lock().await;
+        match *_life {
+            LocalLifecycle::Draining => {
+                return Err(ChunkServiceError::OwnerDraining { journal_id });
+            }
+            LocalLifecycle::Stopped => {
+                return Err(ChunkServiceError::OwnerUnavailable {
+                    journal_id,
+                    status: OwnerStatus::TaskFinished,
+                });
+            }
+            LocalLifecycle::Serving => {}
+        }
+        if owner
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.metrics().poisoned)
+        {
+            return Err(ChunkServiceError::OwnerUnavailable {
+                journal_id,
+                status: OwnerStatus::Poisoned,
+            });
+        }
+        let handle = owner
+            .handle
+            .as_ref()
+            .ok_or(ChunkServiceError::OwnerUnavailable {
+                journal_id,
+                status: OwnerStatus::TaskFinished,
+            })?;
         match handle.flush().await {
             Ok(()) => Ok(()),
             Err(error) => Err(owner.map_driver_error(error)),

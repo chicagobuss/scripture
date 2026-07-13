@@ -8,7 +8,9 @@
 
 use std::fmt;
 
-use holylog::virtual_log::{ApplicationFence, VirtualLog, VirtualLogError, VirtualLogState};
+use holylog::virtual_log::{
+    ApplicationFence, VersionedState, VirtualLog, VirtualLogError, VirtualLogState,
+};
 
 use crate::model::JournalId;
 
@@ -353,6 +355,36 @@ impl CanonAuthoritySnapshot {
     }
 }
 
+/// Canon authority bound to an exact register observation and storage witness.
+///
+/// Use this for operator-directed seal-and-publish transitions that must CAS
+/// only against the validated observation. Startup recovery that does not need
+/// the witness may keep using [`CanonAuthoritySnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessedCanonAuthority {
+    /// Linearizable membership plus adapter-private compare token.
+    pub observed: VersionedState,
+    /// Fence decoded from [`VersionedState::state`] and revision-bound.
+    pub fence: CanonFence,
+}
+
+impl WitnessedCanonAuthority {
+    /// Canon / VirtualLog revision used for this observation.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.fence.revision
+    }
+
+    /// Drops the storage witness, retaining membership and fence.
+    #[must_use]
+    pub fn snapshot(&self) -> CanonAuthoritySnapshot {
+        CanonAuthoritySnapshot {
+            state: self.observed.state.clone(),
+            fence: self.fence.clone(),
+        }
+    }
+}
+
 /// Why a fresh Canon observation refused to authorize an owner.
 #[derive(Debug, thiserror::Error)]
 pub enum CanonAuthorityError {
@@ -408,8 +440,29 @@ pub async fn observe_canon_authority(
     expected_line_id: LineId,
     expected_owner_id: OwnerId,
 ) -> Result<CanonAuthoritySnapshot, CanonAuthorityError> {
-    let state = virtual_log.state().await?;
-    let fence = CanonFence::from_virtual_log_state(&state)?;
+    Ok(observe_canon_authority_witnessed(
+        virtual_log,
+        expected_journal_id,
+        expected_line_id,
+        expected_owner_id,
+    )
+    .await?
+    .snapshot())
+}
+
+/// Observes membership with its storage witness and validates Canon ownership.
+///
+/// Uses [`VirtualLog::observe_membership`] so a later
+/// [`VirtualLog::reconfigure_from_observation`] can CAS against the exact
+/// validated observation.
+pub async fn observe_canon_authority_witnessed(
+    virtual_log: &VirtualLog,
+    expected_journal_id: JournalId,
+    expected_line_id: LineId,
+    expected_owner_id: OwnerId,
+) -> Result<WitnessedCanonAuthority, CanonAuthorityError> {
+    let observed = virtual_log.observe_membership().await?;
+    let fence = CanonFence::from_virtual_log_state(&observed.state)?;
     if fence.journal_id != expected_journal_id {
         return Err(CanonAuthorityError::JournalMismatch {
             expected: expected_journal_id,
@@ -434,6 +487,6 @@ pub async fn observe_canon_authority(
                 actual: *owner_id,
             })
         }
-        CanonOwner::Owned { .. } => Ok(CanonAuthoritySnapshot { state, fence }),
+        CanonOwner::Owned { .. } => Ok(WitnessedCanonAuthority { observed, fence }),
     }
 }
