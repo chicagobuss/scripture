@@ -226,8 +226,9 @@ mod tests {
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, ManualClock, ManualTimer,
-        OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
-        VerseId, WitnessedCanonAuthority, WriterId, observe_canon_authority_witnessed,
+        OwnedSequencerBinding, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
+        SequencerEpoch, Submission, SystemClock, VerseId, WitnessedCanonAuthority, WriterId,
+        observe_canon_authority_witnessed,
     };
 
     use super::{
@@ -290,21 +291,31 @@ mod tests {
     }
 
     fn owned(revision: u64, owner: OwnerId) -> CanonFence {
+        let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
         CanonFence::new(
             revision,
             journal(),
             verse(),
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                endpoint: endpoint.clone(),
+                sequencer: Some(OwnedSequencerBinding {
+                    epoch: SequencerEpoch::test(revision),
+                    sequencer_endpoint: endpoint,
+                }),
             },
         )
     }
 
     fn owned_owner(owner: OwnerId) -> CanonOwner {
+        let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
         CanonOwner::Owned {
             owner_id: owner,
-            endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+            endpoint: endpoint.clone(),
+            sequencer: Some(OwnedSequencerBinding {
+                epoch: SequencerEpoch::test(0),
+                sequencer_endpoint: endpoint,
+            }),
         }
     }
 

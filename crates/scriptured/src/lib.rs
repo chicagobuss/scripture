@@ -154,6 +154,7 @@ pub async fn serve_chunk_raw_lines_connection(
 /// Performs one fresh [`VerseRuntime::resolve_route`] before accepting any payload:
 /// - [`CanonRoute::Serve`] admits through [`VerseRuntime::submit`] / [`VerseRuntime::flush`];
 /// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
+/// - [`CanonRoute::Fenced`] writes `ERR fenced …` with the newer route when known;
 /// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
 /// - resolver failure writes `ERR unavailable`.
 ///
@@ -181,6 +182,22 @@ pub async fn serve_canon_raw_lines_connection(
                 &mut writer,
                 &format!(
                     "not-owner canon={canon_revision} endpoint={}",
+                    endpoint.as_str()
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(CanonRoute::Fenced {
+            canon_revision,
+            endpoint,
+            sequencer_epoch,
+            ..
+        }) => {
+            write_error(
+                &mut writer,
+                &format!(
+                    "fenced canon={canon_revision} endpoint={} epoch={sequencer_epoch}",
                     endpoint.as_str()
                 ),
             )
@@ -751,8 +768,8 @@ mod tests {
             ResolveFuture, VirtualLog,
         };
         use scripture::{
-            CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
-            RecoveryBound, SystemClock, VerseId, WriterId,
+            CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnedSequencerBinding,
+            OwnerEndpoint, OwnerId, RecoveryBound, SequencerEpoch, SystemClock, VerseId, WriterId,
         };
         use scripture_service::{VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -799,13 +816,18 @@ mod tests {
         }
 
         fn fence(revision: u64, owner: OwnerId) -> CanonFence {
+            let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
             CanonFence::new(
                 revision,
                 journal(),
                 verse(),
                 CanonOwner::Owned {
                     owner_id: owner,
-                    endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                    endpoint: endpoint.clone(),
+                    sequencer: Some(OwnedSequencerBinding {
+                        epoch: SequencerEpoch::test(revision),
+                        sequencer_endpoint: endpoint,
+                    }),
                 },
             )
         }
@@ -1132,9 +1154,17 @@ mod tests {
             let (runtime, outcome) = runtime
                 .drain_seal_publish(VerseHandoffRequest {
                     successor: second,
-                    next_owner: CanonOwner::Owned {
-                        owner_id: owner_b(),
-                        endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                    next_owner: {
+                        let endpoint =
+                            OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
+                        CanonOwner::Owned {
+                            owner_id: owner_b(),
+                            endpoint: endpoint.clone(),
+                            sequencer: Some(OwnedSequencerBinding {
+                                epoch: SequencerEpoch::test(1),
+                                sequencer_endpoint: endpoint,
+                            }),
+                        }
                     },
                     journal_id: journal(),
                     verse_id: verse(),

@@ -28,7 +28,10 @@ pub use canon_node::{
 pub use canon_owner::{
     CanonOwnerError, CanonOwnerRequest, RecoveredCanonOwner, recover_canon_owner,
 };
-pub use canon_route::{CanonRoute, CanonRouteError, resolve_canon_route};
+pub use canon_route::{
+    AdmissionDisposition, CanonRoute, CanonRouteError, admission_for, resolve_canon_route,
+    resolve_canon_route_with_epoch,
+};
 pub use canon_transition::{
     CanonTransitionError, CanonTransitionOutcome, CanonTransitionRequest, PublishedCanon,
     publish_canon_transition,
