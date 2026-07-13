@@ -90,3 +90,60 @@ fn endpoints_stay_compact_and_log_safe() {
         Err(CanonFenceError::EndpointTooLong { .. })
     ));
 }
+
+#[test]
+fn observe_rejects_malformed_application_fence_bytes() {
+    use futures::executor::block_on;
+    use holylog::atomic::AtomicLog;
+    use holylog::memory::InMemoryLogDrive;
+    use holylog::virtual_log::{
+        ConditionalRegister, InMemoryConditionalRegister, LogletResolver, ResolveFuture, VirtualLog,
+    };
+    use scripture::{CanonAuthorityError, observe_canon_authority};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Resolver {
+        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+    }
+    impl LogletResolver for Resolver {
+        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
+        }
+    }
+
+    block_on(async {
+        let resolver = Arc::new(Resolver::default());
+        let id = LogletId::new("malformed-fence-loglet").expect("id");
+        resolver.loglets.lock().expect("lock").insert(
+            id.clone(),
+            Arc::new(
+                AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                    .build()
+                    .expect("log"),
+            ),
+        );
+        let log = VirtualLog::new(
+            Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>,
+            resolver as Arc<dyn LogletResolver>,
+        );
+        log.bootstrap_with_application_fence(
+            id,
+            ApplicationFence::new(b"not-a-canon-fence".to_vec()),
+        )
+        .await
+        .expect("bootstrap");
+        assert!(matches!(
+            observe_canon_authority(
+                &log,
+                journal(),
+                line(),
+                OwnerId::from_bytes(*b"canon-owner-id!!")
+            )
+            .await,
+            Err(CanonAuthorityError::Fence(CanonFenceError::BadMagic))
+        ));
+    });
+}

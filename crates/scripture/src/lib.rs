@@ -16,7 +16,10 @@ pub mod model;
 pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
-pub use canon::{CanonFence, CanonFenceError, CanonOwner, LineId, OwnerEndpoint, OwnerId};
+pub use canon::{
+    CanonAuthorityError, CanonAuthoritySnapshot, CanonFence, CanonFenceError, CanonOwner, LineId,
+    OwnerEndpoint, OwnerId, observe_canon_authority,
+};
 pub use chunk::{
     Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,
     ProducerId, SealedChunk, SubmissionRef, WriterId, decode_chunk, decode_frame, decode_index,
