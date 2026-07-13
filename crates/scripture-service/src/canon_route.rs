@@ -142,8 +142,7 @@ pub fn admission_for(
         return AdmissionDisposition::Standby;
     }
     if let Some(active_epoch) = fence_epoch
-        && let Some(local) = local_epoch
-        && local != active_epoch
+        && local_epoch != Some(active_epoch)
     {
         return AdmissionDisposition::Fenced;
     }
@@ -367,16 +366,16 @@ mod tests {
     }
 
     fn fence(revision: u64, owner: OwnerId) -> CanonFence {
-        CanonFence::new(
-            revision,
-            journal(),
-            verse(),
-            owned_v2(
-                owner,
-                SequencerEpoch::test(revision),
-                "tcp://owner.local:9000",
-            ),
-        )
+        CanonFence::new(revision, journal(), verse(), owned_legacy(owner))
+    }
+
+    fn owned_legacy(owner: OwnerId) -> CanonOwner {
+        let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
+        CanonOwner::Owned {
+            owner_id: owner,
+            endpoint,
+            sequencer: None,
+        }
     }
 
     fn fence_with_epoch(revision: u64, owner: OwnerId, epoch: SequencerEpoch) -> CanonFence {
@@ -389,7 +388,7 @@ mod tests {
     }
 
     fn owned_owner(owner: OwnerId) -> CanonOwner {
-        owned_v2(owner, SequencerEpoch::test(0), "tcp://owner.local:9000")
+        owned_legacy(owner)
     }
 
     #[derive(Default)]
@@ -546,7 +545,7 @@ mod tests {
         );
         assert_eq!(
             admission_for(owner, None, false, &fence, LocalCanonOwnerMatch::ServeReady,),
-            AdmissionDisposition::Serving
+            AdmissionDisposition::Fenced
         );
         assert_eq!(
             admission_for(
@@ -583,6 +582,57 @@ mod tests {
             ),
             AdmissionDisposition::Serving
         );
+    }
+
+    #[tokio::test]
+    async fn v2_fence_requires_a_matching_local_epoch_before_serving() {
+        let harness = Harness::memory();
+        let epoch = SequencerEpoch::test(42);
+        harness
+            .virtual_log()
+            .bootstrap_with_application_fence(
+                harness.first.clone(),
+                fence_with_epoch(0, owner_a(), epoch).encode(),
+            )
+            .await
+            .expect("bootstrap");
+        let recovered = recover_canon_owner(
+            request(owner_a()),
+            harness.virtual_log(),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+        )
+        .await
+        .expect("recover");
+        let mut service = ChunkJournalService::new();
+        service.register_canon_owner(recovered).expect("register");
+
+        assert!(matches!(
+            resolve_canon_route(
+                &harness.virtual_log(),
+                &service,
+                journal(),
+                verse(),
+                owner_a(),
+            )
+            .await
+            .expect("route without epoch"),
+            CanonRoute::Fenced { sequencer_epoch, .. } if sequencer_epoch == epoch
+        ));
+        assert!(matches!(
+            resolve_canon_route_with_epoch(
+                &harness.virtual_log(),
+                &service,
+                journal(),
+                verse(),
+                owner_a(),
+                Some(epoch),
+                false,
+            )
+            .await
+            .expect("route with matching epoch"),
+            CanonRoute::Serve { sequencer_epoch: Some(observed), .. } if observed == epoch
+        ));
     }
 
     #[test]
@@ -639,9 +689,9 @@ mod tests {
             CanonRoute::Serve {
                 canon_revision: 0,
                 owner_id,
-                sequencer_epoch: Some(epoch),
+                sequencer_epoch: None,
                 ..
-            } if owner_id == owner_a() && epoch == SequencerEpoch::test(0)
+            } if owner_id == owner_a()
         ));
     }
 
@@ -709,9 +759,9 @@ mod tests {
             CanonRoute::NotOwner {
                 canon_revision: 1,
                 owner_id,
-                sequencer_epoch: Some(epoch),
+                sequencer_epoch: None,
                 ..
-            } if owner_id == owner_b() && epoch == SequencerEpoch::test(0)
+            } if owner_id == owner_b()
         ));
 
         assert_eq!(
@@ -772,9 +822,9 @@ mod tests {
             CanonRoute::Serve {
                 canon_revision: 1,
                 owner_id,
-                sequencer_epoch: Some(epoch),
+                sequencer_epoch: None,
                 ..
-            } if owner_id == owner_b() && epoch == SequencerEpoch::test(0)
+            } if owner_id == owner_b()
         ));
     }
 

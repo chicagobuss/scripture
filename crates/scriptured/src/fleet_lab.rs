@@ -23,24 +23,21 @@ use holylog::virtual_log::{
     ConditionalRegister, GenerationDescriptor, LogletId, LogletResolver, Reconfiguration,
     ResolveFuture, VirtualLog, VirtualLogError,
 };
-use scripture::{
-    CanonFence, CanonFenceError, CanonOwner, Clock, OwnedSequencerBinding, OwnerEndpoint, OwnerId,
-    SequencerEpoch, Timer,
-};
+use scripture::{CanonFence, CanonFenceError, CanonOwner, Clock, OwnerEndpoint, OwnerId, Timer};
 use scripture_service::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeStart, VerseHandoffRequest, VerseKey,
     VerseRuntime, VerseRuntimeConfig, VerseRuntimeStartError,
 };
 use tokio::sync::Mutex;
 
-fn owned_with_sequencer(owner_id: OwnerId, endpoint: OwnerEndpoint, revision: u64) -> CanonOwner {
+fn owned_with_sequencer(owner_id: OwnerId, endpoint: OwnerEndpoint, _revision: u64) -> CanonOwner {
     CanonOwner::Owned {
         owner_id,
-        endpoint: endpoint.clone(),
-        sequencer: Some(OwnedSequencerBinding {
-            epoch: SequencerEpoch::test(revision),
-            sequencer_endpoint: endpoint,
-        }),
+        endpoint,
+        // The fleet lab remains legacy until it has a real locally-held remote
+        // sequencer capability. A v2 fence must never be published merely to
+        // make a pre-remote owner look dynamic.
+        sequencer: None,
     }
 }
 

@@ -226,9 +226,8 @@ mod tests {
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, ManualClock, ManualTimer,
-        OwnedSequencerBinding, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
-        SequencerEpoch, Submission, SystemClock, VerseId, WitnessedCanonAuthority, WriterId,
-        observe_canon_authority_witnessed,
+        OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
+        VerseId, WitnessedCanonAuthority, WriterId, observe_canon_authority_witnessed,
     };
 
     use super::{
@@ -298,11 +297,8 @@ mod tests {
             verse(),
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: endpoint.clone(),
-                sequencer: Some(OwnedSequencerBinding {
-                    epoch: SequencerEpoch::test(revision),
-                    sequencer_endpoint: endpoint,
-                }),
+                endpoint,
+                sequencer: None,
             },
         )
     }
@@ -311,11 +307,8 @@ mod tests {
         let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
         CanonOwner::Owned {
             owner_id: owner,
-            endpoint: endpoint.clone(),
-            sequencer: Some(OwnedSequencerBinding {
-                epoch: SequencerEpoch::test(0),
-                sequencer_endpoint: endpoint,
-            }),
+            endpoint,
+            sequencer: None,
         }
     }
 
