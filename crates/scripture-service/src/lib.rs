@@ -20,7 +20,7 @@ mod chunk_service;
 pub mod reconcile;
 
 pub use canon_node::{
-    CanonNode, CanonNodeConfig, CanonNodeConfigError, CanonNodeStart, CanonNodeStartError,
+    CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
 };
 pub use canon_owner::{
     CanonOwnerError, CanonOwnerRequest, RecoveredCanonOwner, recover_canon_owner,

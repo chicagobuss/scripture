@@ -5,8 +5,6 @@
 //! and Unowned outcomes return advisory standby route state without constructing
 //! an actor. This module does not elect, discover, or resume owners.
 
-use std::sync::Arc;
-
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use scripture::{
     CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, ChunkPolicy, Clock, CohortId,
@@ -57,28 +55,27 @@ impl CanonNodeConfig {
             queue_capacity: self.queue_capacity,
         }
     }
-
-    /// Rejects a request whose identity fields disagree with this config.
-    pub fn validated_request(
-        &self,
-        request: &CanonOwnerRequest,
-    ) -> Result<(), CanonNodeConfigError> {
-        if request.journal_id != self.journal_id
-            || request.line_id != self.line_id
-            || request.owner_id != self.owner_id
-        {
-            return Err(CanonNodeConfigError::IdentityMismatch);
-        }
-        Ok(())
-    }
 }
 
-/// Configuration refused before any register observation.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CanonNodeConfigError {
-    /// Embedded recovery request disagreed with the node identity fields.
-    #[error("Canon node config journal/line/owner disagree with recovery request")]
-    IdentityMismatch,
+/// Non-serving route snapshot returned by [`CanonNode::start`].
+///
+/// Narrower than [`CanonRoute`]: a standby result cannot represent `Serve`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonStandbyRoute {
+    /// Fresh Canon names another owner. Endpoint is advisory only.
+    NotOwner {
+        /// Observed Canon / VirtualLog revision.
+        canon_revision: u64,
+        /// Owner identity named by the fence.
+        owner_id: OwnerId,
+        /// Advisory endpoint from the fence.
+        endpoint: scripture::OwnerEndpoint,
+    },
+    /// Fresh Canon is explicitly Unowned.
+    Recovering {
+        /// Observed Canon / VirtualLog revision.
+        canon_revision: u64,
+    },
 }
 
 /// Outcome of [`CanonNode::start`].
@@ -88,7 +85,7 @@ pub enum CanonNodeStart {
     /// Fresh Canon is Unowned or names another owner. No local actor was built.
     Standby {
         /// Advisory route derived from the standby observation.
-        route: CanonRoute,
+        route: CanonStandbyRoute,
     },
 }
 
@@ -118,7 +115,7 @@ pub struct CanonNode {
     line_id: LineId,
     owner_id: OwnerId,
     virtual_log: VirtualLog,
-    service: Arc<ChunkJournalService>,
+    service: ChunkJournalService,
 }
 
 impl CanonNode {
@@ -158,13 +155,13 @@ impl CanonNode {
 
         match &fence.owner {
             CanonOwner::Unowned => Ok(CanonNodeStart::Standby {
-                route: CanonRoute::Recovering {
+                route: CanonStandbyRoute::Recovering {
                     canon_revision: fence.revision,
                 },
             }),
             CanonOwner::Owned { owner_id, endpoint } if *owner_id != config.owner_id => {
                 Ok(CanonNodeStart::Standby {
-                    route: CanonRoute::NotOwner {
+                    route: CanonStandbyRoute::NotOwner {
                         canon_revision: fence.revision,
                         owner_id: *owner_id,
                         endpoint: endpoint.clone(),
@@ -182,7 +179,7 @@ impl CanonNode {
                     line_id: config.line_id,
                     owner_id: config.owner_id,
                     virtual_log,
-                    service: Arc::new(service),
+                    service,
                 }))
             }
         }
@@ -206,19 +203,11 @@ impl CanonNode {
         self.owner_id
     }
 
-    /// Shared service handle for transport adapters that already speak
-    /// [`ChunkJournalService`]. The Arc is cloneable; the service remains
-    /// privately owned and cannot be used to register a non-Canon owner.
-    #[must_use]
-    pub fn service(&self) -> Arc<ChunkJournalService> {
-        Arc::clone(&self.service)
-    }
-
     /// Fresh Canon route resolution for this node's configured Line.
     pub async fn resolve_route(&self) -> Result<CanonRoute, CanonRouteError> {
         resolve_canon_route(
             &self.virtual_log,
-            self.service.as_ref(),
+            &self.service,
             self.journal_id,
             self.line_id,
             self.owner_id,
@@ -279,7 +268,9 @@ mod tests {
         WriterId,
     };
 
-    use super::{CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError};
+    use super::{
+        CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
+    };
     use crate::canon_owner::CanonOwnerError;
     use crate::canon_route::CanonRoute;
 
@@ -494,7 +485,7 @@ mod tests {
             .await
             .expect("standby other"),
             CanonNodeStart::Standby {
-                route: CanonRoute::NotOwner {
+                route: CanonStandbyRoute::NotOwner {
                     canon_revision: 0,
                     owner_id,
                     ..
@@ -521,7 +512,7 @@ mod tests {
             .await
             .expect("standby unowned"),
             CanonNodeStart::Standby {
-                route: CanonRoute::Recovering { canon_revision: 0 }
+                route: CanonStandbyRoute::Recovering { canon_revision: 0 }
             }
         ));
     }
