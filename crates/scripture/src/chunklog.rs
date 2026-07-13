@@ -153,6 +153,16 @@ pub enum ChunkLogError {
         /// Generation encoded in the chunk header.
         actual: u64,
     },
+    /// Recovered VirtualLog history moved backward to an older chunk generation.
+    #[error(
+        "recovered chunk generation regressed from {previous} to {actual}; refusing stale or corrupt history"
+    )]
+    RecoveredGenerationRegression {
+        /// Highest generation already observed earlier in logical order.
+        previous: u64,
+        /// Lower generation carried by the later recovered chunk.
+        actual: u64,
+    },
     /// Phase 1 requires exactly one frame for this writer's journal.
     #[error("phase-1 chunk must contain exactly one frame for journal {journal}")]
     JournalFrameMismatch {
@@ -463,6 +473,7 @@ impl ChunkLogWriter {
         };
         let start = tail.saturating_sub(bound.max_chunks() as u64);
         let mut chunks = Vec::new();
+        let mut previous_virtual_generation = None;
         for slot in start..tail {
             let payload = match log.read_payload(slot, tail).await {
                 Ok(payload) => payload,
@@ -502,6 +513,15 @@ impl ChunkLogWriter {
                             actual: index.header.generation,
                         });
                     }
+                    if let Some(previous) = previous_virtual_generation
+                        && index.header.generation < previous
+                    {
+                        return Err(ChunkLogError::RecoveredGenerationRegression {
+                            previous,
+                            actual: index.header.generation,
+                        });
+                    }
+                    previous_virtual_generation = Some(index.header.generation);
                 }
             }
             let [frame] = index.frames.as_slice() else {
