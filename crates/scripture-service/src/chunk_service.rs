@@ -332,7 +332,7 @@ impl ChunkJournalService {
 
     /// Registers a recovered Canon owner, storing its fence identity for drain.
     ///
-    /// The binding is taken from [`RecoveredCanonOwner::authority`]. Only this
+    /// The binding is taken from the factory-created [`RecoveredCanonOwner`]. Only this
     /// path can later produce a [`DrainedOwner`] suitable for
     /// [`crate::publish_canon_transition`].
     pub fn register_canon_owner<C, T>(
@@ -343,16 +343,11 @@ impl ChunkJournalService {
         C: Clock + Send + 'static,
         T: Timer + Send + 'static,
     {
-        let binding = CanonOwnerBinding::from_fence(&recovered.authority.fence)?;
+        let (authority, handle, actor) = recovered.into_canon_registration();
+        let binding = CanonOwnerBinding::from_fence(&authority.fence)?;
         let journal_id = binding.journal_id;
         let revision = binding.revision;
-        self.insert_owner(
-            journal_id,
-            revision,
-            recovered.handle,
-            recovered.actor,
-            Some(binding),
-        )
+        self.insert_owner(journal_id, revision, handle, actor, Some(binding))
     }
 
     fn insert_owner<C, T>(
