@@ -20,7 +20,7 @@ use scripture::{
     ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, SystemClock, VerseId,
     WriterId,
 };
-use scripture_service::{VerseKey, VerseRuntimeConfig};
+use scripture_service::VerseRuntimeConfig;
 use scriptured::{
     FleetLabResolver, NodeIdentity, ObjectStorePartsFactory, RawLinesConfig, VerseControlOutcome,
     VerseNodeSupervisor, connect_rustfs, serve_canon_raw_lines_connection,
@@ -75,7 +75,6 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
     ));
     let resolver = Arc::new(FleetLabResolver::default());
     let config = verse_config(args.owner);
-    let key = VerseKey::from_config(&config);
     let node = VerseNodeSupervisor::with_parts_factory(
         NodeIdentity {
             owner_id: args.owner,
@@ -84,8 +83,8 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         register,
         resolver,
         parts,
-        vec![config],
-    )?;
+        config,
+    );
 
     if args.bootstrap {
         let loglet = LogletId::new(
@@ -94,29 +93,26 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
                 .ok_or("--bootstrap requires --loglet-id")?,
         )?;
         let outcome = node
-            .bootstrap_verse(
-                key,
-                loglet,
-                SystemClock::new(),
-                scripture::SystemTimer::new(),
-                2,
-            )
+            .bootstrap_verse(loglet, SystemClock::new(), scripture::SystemTimer::new(), 2)
             .await?;
         eprintln!("bootstrap: {outcome:?}");
         if !matches!(outcome, VerseControlOutcome::Serving) {
             return Err("bootstrap did not yield Serving".into());
         }
     } else {
-        let outcomes = node
+        let outcome = node
             .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
             .await?;
-        eprintln!("start_configured: {outcomes:?}");
+        eprintln!("start_configured: {outcome:?}");
+        if matches!(outcome, VerseControlOutcome::RecoveryRequired { .. }) {
+            return Err(
+                "RecoveryRequired: open generation needs explicit seal-and-replace (not serving)"
+                    .into(),
+            );
+        }
     }
 
-    let runtime = node
-        .runtime(key)
-        .await
-        .ok_or("runtime missing after start")?;
+    let runtime = node.runtime().await.ok_or("runtime missing after start")?;
     let listener = TcpListener::bind(&args.bind).await?;
     eprintln!(
         "fleet-lab-node listening on {}; run_id={}; owner={}",

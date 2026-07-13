@@ -16,7 +16,8 @@ mod object_store_lab;
 
 pub use fleet_lab::{
     DurableLogletParts, FleetLabResolver, InMemoryPartsFactory, NodeIdentity, PartsFactory,
-    PartsFactoryError, SupervisorError, VerseControlOutcome, VerseNodeSupervisor,
+    PartsFactoryError, SharedMemoryPartsFactory, SupervisorError, VerseControlOutcome,
+    VerseNodeSupervisor,
 };
 
 #[cfg(feature = "fleet-lab")]

@@ -78,18 +78,23 @@ cargo run -p scripture-load -- \
 
 Record the summary line (accepted records/bytes, ACK percentiles, errors).
 
-### 4. Controlled handoff pause
+### 4. Controlled handoff / recovery (planned operator API)
+
+The `fleet-lab-node` binary does **not** yet expose an administrative control
+endpoint for drain/seal/publish or seal-and-replace. Treat the following as the
+intended operator sequence against the in-process supervisor API
+(`VerseNodeSupervisor::drain_seal_publish` /
+`replace_after_lost_sequencer`), not as a runnable CLI drill:
 
 1. Stop the producer (Ctrl-C is fine for this milestone; transparent reroute is later).
-2. On A, perform an explicit drain/seal/publish to B (operator/control path; not
-   automatic on listener shutdown). The in-process supervisor API is
-   `VerseNodeSupervisor::drain_seal_publish` / `replace_after_lost_sequencer`.
+2. On A, call an explicit drain/seal/publish to B (not automatic on listener shutdown).
 3. Start or promote B only after Canon publishes B’s ownership.
 4. Resume `scripture-load` against B’s bind address with the same `--run-id`.
 
-Crash variant: kill A without handoff. Restarting A without `--bootstrap` must
-not serve the open generation as a writer; seal-and-replace is an explicit
-operator step that provisions a fresh Loglet id.
+Crash variant (partially runnable today): kill A without handoff. Restarting A
+without `--bootstrap` must report `RecoveryRequired` and refuse to serve the
+open generation; seal-and-replace remains an explicit supervisor API step that
+provisions a fresh Loglet id.
 
 ### 5. Cleanup (prefix only)
 
