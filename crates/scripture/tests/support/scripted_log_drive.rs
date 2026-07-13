@@ -166,7 +166,7 @@ impl LogDrive for ScriptedLogDrive {
                 .model
                 .lock()
                 .map_err(|_| DriveError::backend(InjectedFailure))?
-                .weak_tail(k)?)
+                .weak_tail(k))
         })
     }
 }
