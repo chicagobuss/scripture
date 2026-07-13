@@ -5,19 +5,23 @@
 //! which routes Phase 1 [`scripture::ChunkDriverHandle`] owners without
 //! duplicating admission or durability logic.
 //!
-//! Canon-authorized startup uses [`recover_canon_owner`] then
-//! [`ChunkJournalService::register_canon_owner`]. Operator-directed A→B handoff
-//! uses [`ChunkJournalService::drain_owner`] then [`publish_canon_transition`].
-//! Clients discover who may serve a Line via [`resolve_canon_route`].
-//! [`ChunkJournalService::register_owner`] remains a local lab registry only and
-//! cannot drain for Canon publish.
+//! Canon-authorized startup uses [`CanonNode::start`] (or
+//! [`recover_canon_owner`] then [`ChunkJournalService::register_canon_owner`]).
+//! Operator-directed A→B handoff uses [`ChunkJournalService::drain_owner`] then
+//! [`publish_canon_transition`]. Clients discover who may serve a Line via
+//! [`resolve_canon_route`]. [`ChunkJournalService::register_owner`] remains a
+//! local lab registry only and cannot drain for Canon publish.
 
+mod canon_node;
 mod canon_owner;
 mod canon_route;
 mod canon_transition;
 mod chunk_service;
 pub mod reconcile;
 
+pub use canon_node::{
+    CanonNode, CanonNodeConfig, CanonNodeConfigError, CanonNodeStart, CanonNodeStartError,
+};
 pub use canon_owner::{
     CanonOwnerError, CanonOwnerRequest, RecoveredCanonOwner, recover_canon_owner,
 };
