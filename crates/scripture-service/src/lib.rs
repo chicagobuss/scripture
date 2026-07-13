@@ -20,6 +20,7 @@ mod canon_transition;
 mod chunk_service;
 mod line_runtime;
 pub mod reconcile;
+mod scripture_node;
 
 pub use canon_node::{
     CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
@@ -43,6 +44,10 @@ pub use line_runtime::{
 pub use reconcile::{
     OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,
     RecoveryFacts, RecoveryFinding, RecoveryMode, RecoveryPlan, plan as plan_recovery,
+};
+pub use scripture_node::{
+    LineKey, ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError,
+    ScriptureNodeHandoffError, ScriptureNodeStart,
 };
 
 use std::future::Future;
