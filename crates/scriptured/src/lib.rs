@@ -3,7 +3,7 @@
 //! Three raw-lines paths exist during migration:
 //! - [`serve_raw_lines_connection`] — legacy v0 [`JournalHandle`]
 //! - [`serve_chunk_raw_lines_connection`] — Phase 1 lab [`ChunkJournalService`]
-//! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`CanonNode`]
+//! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`LineRuntime`]
 //!
 //! New durable work targets the Canon-gated path. Lab helpers remain for local
 //! composition tests until a separate removal review.
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use scripture::{AttributeValue, ProducerId, Record, Submission};
-use scripture_service::{CanonNode, CanonRoute, ChunkJournalService, JournalHandle};
+use scripture_service::{CanonRoute, ChunkJournalService, JournalHandle, LineRuntime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -134,10 +134,10 @@ pub async fn serve_chunk_raw_lines_connection(
     serve_chunk_raw_lines_from(stream, service, journal_id, config, 0).await
 }
 
-/// Canon-gated raw-lines admission over a started [`CanonNode`].
+/// Canon-gated raw-lines admission over a started [`LineRuntime`].
 ///
-/// Performs one fresh [`CanonNode::resolve_route`] before accepting any payload:
-/// - [`CanonRoute::Serve`] admits through [`CanonNode::submit`] / [`CanonNode::flush`];
+/// Performs one fresh [`LineRuntime::resolve_route`] before accepting any payload:
+/// - [`CanonRoute::Serve`] admits through [`LineRuntime::submit`] / [`LineRuntime::flush`];
 /// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
 /// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
 /// - resolver failure writes `ERR unavailable`.
@@ -145,16 +145,17 @@ pub async fn serve_chunk_raw_lines_connection(
 /// These `ERR` forms are an explicitly provisional raw-lines adapter convention,
 /// not the future generic text-protocol schema. Compare tokens and owner IDs are
 /// never written. The gate is per connection; Holylog's seal fence remains the
-/// append guard if Canon changes mid-connection.
+/// append guard if Canon changes mid-connection. Standby runtimes (no actor)
+/// answer NotOwner/Recovering without constructing an owner.
 pub async fn serve_canon_raw_lines_connection(
     stream: TcpStream,
-    node: Arc<CanonNode>,
+    runtime: Arc<LineRuntime>,
     config: RawLinesConfig,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    match node.resolve_route().await {
+    match runtime.resolve_route().await {
         Ok(CanonRoute::Serve { .. }) => {
-            serve_canon_raw_lines_from_split(reader, writer, node, config, 0).await
+            serve_canon_raw_lines_from_split(reader, writer, runtime, config, 0).await
         }
         Ok(CanonRoute::NotOwner {
             canon_revision,
@@ -275,7 +276,7 @@ where
 async fn serve_canon_raw_lines_from_split<R, W>(
     reader: R,
     mut writer: W,
-    node: Arc<CanonNode>,
+    runtime: Arc<LineRuntime>,
     config: RawLinesConfig,
     mut sequence: u64,
 ) -> io::Result<()>
@@ -306,14 +307,14 @@ where
                     Some(next) => sequence = next,
                     None => exhausted = true,
                 }
-                let receipt = match node.submit(submission).await {
+                let receipt = match runtime.submit(submission).await {
                     Ok(receipt) => receipt,
                     Err(error) => {
                         write_error(&mut writer, &error.to_string()).await?;
                         return Ok(());
                     }
                 };
-                if let Err(error) = node.flush().await {
+                if let Err(error) = runtime.flush().await {
                     write_error(&mut writer, &error.to_string()).await?;
                     return Ok(());
                 }
@@ -738,7 +739,7 @@ mod tests {
             CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint,
             OwnerId, RecoveryBound, SystemClock, WriterId,
         };
-        use scripture_service::{CanonNode, CanonNodeConfig, CanonNodeStart};
+        use scripture_service::{LineHandoffRequest, LineRuntime, LineRuntimeConfig};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
@@ -760,8 +761,8 @@ mod tests {
             OwnerId::from_bytes(*b"canon-raw-own-b!")
         }
 
-        fn config(owner: OwnerId) -> CanonNodeConfig {
-            CanonNodeConfig {
+        fn config(owner: OwnerId) -> LineRuntimeConfig {
+            LineRuntimeConfig {
                 journal_id: journal(),
                 line_id: line(),
                 owner_id: owner,
@@ -845,12 +846,12 @@ mod tests {
             }
         }
 
-        async fn exchange(node: Arc<scripture_service::CanonNode>, payload: &[u8]) -> String {
+        async fn exchange(runtime: Arc<LineRuntime>, payload: &[u8]) -> String {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
-                serve_canon_raw_lines_connection(stream, node, RawLinesConfig::default())
+                serve_canon_raw_lines_connection(stream, runtime, RawLinesConfig::default())
                     .await
                     .expect("serve")
             });
@@ -876,17 +877,16 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let CanonNodeStart::Serving(node) = CanonNode::start(
+            let runtime = LineRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
             )
             .await
-            .expect("start") else {
-                panic!("expected Serving");
-            };
-            let response = exchange(Arc::new(node), b"hello\n").await;
+            .expect("start");
+            assert!(runtime.is_serving());
+            let response = exchange(Arc::new(runtime), b"hello\n").await;
             assert_eq!(response, "OK 0 1\n");
         }
 
@@ -901,16 +901,15 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let CanonNodeStart::Serving(node) = CanonNode::start(
+            let runtime = LineRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
             )
             .await
-            .expect("start a") else {
-                panic!("expected Serving");
-            };
+            .expect("start a");
+            assert!(runtime.is_serving());
             let second = LogletId::new("canon-raw-second").expect("id");
             harness.resolver.insert(
                 second.clone(),
@@ -925,7 +924,7 @@ mod tests {
                 .reconfigure_with_application_fence(second.clone(), fence(1, owner_b()).encode())
                 .await
                 .expect("cutover to B");
-            let response = exchange(Arc::new(node), b"should-not-append\n").await;
+            let response = exchange(Arc::new(runtime), b"should-not-append\n").await;
             assert_eq!(
                 response,
                 "ERR not-owner canon=1 endpoint=tcp://owner.local:9000\n"
@@ -946,16 +945,15 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let CanonNodeStart::Serving(node) = CanonNode::start(
+            let runtime = LineRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
             )
             .await
-            .expect("start") else {
-                panic!("expected Serving");
-            };
+            .expect("start");
+            assert!(runtime.is_serving());
             let second = LogletId::new("canon-raw-unowned").expect("id");
             harness.resolver.insert(
                 second.clone(),
@@ -973,7 +971,7 @@ mod tests {
                 )
                 .await
                 .expect("unowned");
-            let response = exchange(Arc::new(node), b"nope\n").await;
+            let response = exchange(Arc::new(runtime), b"nope\n").await;
             assert_eq!(response, "ERR recovering canon=1\n");
             let tail = harness.virtual_log().check_tail().await.expect("tail");
             assert_eq!(tail.tail, 0);
@@ -1034,19 +1032,101 @@ mod tests {
             log.bootstrap_with_application_fence(first, fence(0, owner_a()).encode())
                 .await
                 .expect("bootstrap");
-            let CanonNodeStart::Serving(node) = CanonNode::start(
+            let runtime = LineRuntime::start(
                 config(owner_a()),
                 log,
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
             )
             .await
-            .expect("start") else {
-                panic!("expected Serving");
-            };
+            .expect("start");
+            assert!(runtime.is_serving());
             register.armed.store(true, Ordering::Release);
-            let response = exchange(Arc::new(node), b"nope\n").await;
+            let response = exchange(Arc::new(runtime), b"nope\n").await;
             assert_eq!(response, "ERR unavailable\n");
+        }
+
+        #[tokio::test]
+        async fn standby_runtime_listener_returns_not_owner_without_append() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_b()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let runtime = LineRuntime::start(
+                config(owner_a()),
+                harness.virtual_log(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("standby");
+            assert!(runtime.is_standby());
+            let response = exchange(Arc::new(runtime), b"nope\n").await;
+            assert_eq!(
+                response,
+                "ERR not-owner canon=0 endpoint=tcp://owner.local:9000\n"
+            );
+            assert_eq!(
+                harness.virtual_log().check_tail().await.expect("tail").tail,
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn after_handoff_old_runtime_never_accepts_payload() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_a()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let runtime = LineRuntime::start(
+                config(owner_a()),
+                harness.virtual_log(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("start");
+            let second = LogletId::new("canon-raw-handoff").expect("id");
+            harness.resolver.insert(
+                second.clone(),
+                Arc::new(
+                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                        .build()
+                        .expect("log"),
+                ),
+            );
+            let (runtime, outcome) = runtime
+                .drain_seal_publish(LineHandoffRequest {
+                    successor: second,
+                    next_owner: CanonOwner::Owned {
+                        owner_id: owner_b(),
+                        endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                    },
+                    journal_id: journal(),
+                    line_id: line(),
+                })
+                .await
+                .expect("handoff");
+            assert!(matches!(
+                outcome,
+                scripture_service::CanonTransitionOutcome::Published(_)
+            ));
+            assert!(runtime.is_terminal());
+            let response = exchange(Arc::new(runtime), b"should-fail\n").await;
+            assert_eq!(
+                response,
+                "ERR not-owner canon=1 endpoint=tcp://owner.local:9000\n"
+            );
         }
     }
 }
