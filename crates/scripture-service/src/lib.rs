@@ -38,7 +38,7 @@ pub use chunk_service::{
     OwnerHealth, OwnerStatus,
 };
 pub use line_runtime::{
-    LineAdmitError, LineHandoffError, LineHandoffReject, LineHandoffRequest, LineRuntime,
+    LineAdmitError, LineHandoffError, LineHandoffFailure, LineHandoffRequest, LineRuntime,
     LineRuntimeConfig, LineRuntimeStartError, LineTerminal, LineUnavailable,
 };
 pub use reconcile::{

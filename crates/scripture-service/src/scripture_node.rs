@@ -93,8 +93,8 @@ pub enum ScriptureNodeHandoffError {
         /// Missing key.
         key: LineKey,
     },
-    /// Pre-drain or mid-handoff rejection; runtime remains in the node on
-    /// pre-drain identity/phase errors, and is terminal on post-take failures.
+    /// Handoff failure. The runtime remains in the node unchanged for a
+    /// precondition error and terminal/non-serving after ownership was taken.
     #[error(transparent)]
     Handoff(#[from] LineHandoffError),
 }
