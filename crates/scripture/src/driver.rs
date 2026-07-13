@@ -218,6 +218,12 @@ pub struct DriverMetrics {
     pub admitted: u64,
     /// Submissions rejected before admission.
     pub rejected: u64,
+    /// True after the actor emits [`crate::trace::Event::OwnerPoisoned`].
+    ///
+    /// Survives while `run` continues in the poisoned drain loop, so a service
+    /// can observe poison from [`ChunkDriverHandle::metrics`] without waiting
+    /// for a later client request.
+    pub poisoned: bool,
 }
 
 /// Errors at the driver boundary.
@@ -1293,6 +1299,7 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
                 self.poison_blocked();
                 self.reserved_bytes = 0;
                 if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.poisoned = true;
                     metrics.inflight_chunks = 0;
                     metrics.reserved_bytes = 0;
                     metrics.bytes_at_risk = self.policy.bytes_at_risk();

@@ -11,11 +11,11 @@ publish = false
 scripture = { path = "../scripture" }
 holylog.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 bytes.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true
