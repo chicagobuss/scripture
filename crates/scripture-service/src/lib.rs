@@ -6,8 +6,13 @@
 //! duplicating admission or durability logic.
 
 mod chunk_service;
+pub mod reconcile;
 
 pub use chunk_service::{ChunkJournalService, ChunkServiceError, OwnerHealth, OwnerStatus};
+pub use reconcile::{
+    OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,
+    RecoveryFacts, RecoveryFinding, RecoveryMode, RecoveryPlan, plan as plan_recovery,
+};
 
 use std::future::Future;
 use std::pin::Pin;
