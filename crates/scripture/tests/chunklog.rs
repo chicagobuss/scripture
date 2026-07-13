@@ -162,7 +162,14 @@ fn virtual_writer_is_fenced_by_a_canon_cutover() {
             0
         );
 
-        reconfigurer.reconfigure(second).await.expect("cutover");
+        {
+            let __observed = reconfigurer.observe_membership().await.expect("observe");
+            let __fence = __observed.state.application_fence.clone();
+            reconfigurer
+                .reconfigure_from_observation(&__observed, second, __fence)
+                .await
+        }
+        .expect("cutover");
 
         assert!(matches!(
             old_owner.append(&chunk_at_generation(12, 1, 1, 0)).await,
@@ -366,10 +373,17 @@ fn virtual_recovery_rebuilds_suffix_across_canon_cutover() {
         assert_eq!(gen0.append(&second).await.expect("second").slot, 1);
 
         let cutter = harness.virtual_log();
-        cutter
-            .reconfigure_with_application_fence(harness.second.clone(), owned(1).encode())
-            .await
-            .expect("cutover");
+        {
+            let __observed = cutter.observe_membership().await.expect("observe");
+            cutter
+                .reconfigure_from_observation(
+                    &__observed,
+                    harness.second.clone(),
+                    owned(1).encode(),
+                )
+                .await
+        }
+        .expect("cutover");
 
         let mut recovery = ChunkLogWriter::recover_virtual(
             journal(),
@@ -413,10 +427,17 @@ fn virtual_recovery_preserves_mixed_generation_suffix_order() {
         gen0.append(&b).await.expect("b");
 
         let cutter = harness.virtual_log();
-        cutter
-            .reconfigure_with_application_fence(harness.second.clone(), owned(1).encode())
-            .await
-            .expect("cutover");
+        {
+            let __observed = cutter.observe_membership().await.expect("observe");
+            cutter
+                .reconfigure_from_observation(
+                    &__observed,
+                    harness.second.clone(),
+                    owned(1).encode(),
+                )
+                .await
+        }
+        .expect("cutover");
 
         let mut gen1 = ChunkLogWriter::new_virtual(
             journal(),
@@ -470,10 +491,17 @@ fn virtual_recovery_rejects_future_chunk_generation() {
             .expect("gen0");
 
         let cutter = harness.virtual_log();
-        cutter
-            .reconfigure_with_application_fence(harness.second.clone(), owned(1).encode())
-            .await
-            .expect("cutover");
+        {
+            let __observed = cutter.observe_membership().await.expect("observe");
+            cutter
+                .reconfigure_from_observation(
+                    &__observed,
+                    harness.second.clone(),
+                    owned(1).encode(),
+                )
+                .await
+        }
+        .expect("cutover");
 
         // Plant a corrupt future-generation payload into the active Loglet.
         let forged = chunk_at_generation(99, 1, 1, 9);
@@ -517,10 +545,17 @@ fn virtual_recovery_rejects_generation_regression_in_logical_order() {
             .expect("gen0 append");
 
         let cutter = harness.virtual_log();
-        cutter
-            .reconfigure_with_application_fence(harness.second.clone(), owned(1).encode())
-            .await
-            .expect("cutover");
+        {
+            let __observed = cutter.observe_membership().await.expect("observe");
+            cutter
+                .reconfigure_from_observation(
+                    &__observed,
+                    harness.second.clone(),
+                    owned(1).encode(),
+                )
+                .await
+        }
+        .expect("cutover");
         let mut gen1 = ChunkLogWriter::new_virtual(
             journal(),
             cohort(),
@@ -626,13 +661,17 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
         );
         // Need an owned appendable log first — reconfigure from current.
         // Current is still first at rev 0. Cutover to second with Unowned fence.
-        unowned
-            .reconfigure_with_application_fence(
-                harness.second.clone(),
-                fence(1, CanonOwner::Unowned).encode(),
-            )
-            .await
-            .expect("unowned cutover");
+        {
+            let __observed = unowned.observe_membership().await.expect("observe");
+            unowned
+                .reconfigure_from_observation(
+                    &__observed,
+                    harness.second.clone(),
+                    fence(1, CanonOwner::Unowned).encode(),
+                )
+                .await
+        }
+        .expect("unowned cutover");
         assert!(matches!(
             observe_canon_authority(&harness.virtual_log(), journal(), verse(), owner_id()).await,
             Err(CanonAuthorityError::Unowned { .. })

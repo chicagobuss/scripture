@@ -432,14 +432,17 @@ mod tests {
         assert_eq!(receipt.canon_revision, 0);
         service.stop_owner(journal()).await.expect("stop a");
 
-        harness
-            .virtual_log()
-            .reconfigure_with_application_fence(
+        {
+            let log = harness.virtual_log();
+            let observed = log.observe_membership().await.expect("observe");
+            log.reconfigure_from_observation(
+                &observed,
                 harness.second.clone(),
                 fence(1, owner_b()).encode(),
             )
             .await
             .expect("cutover");
+        }
 
         assert!(matches!(
             recover_canon_owner(

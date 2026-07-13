@@ -574,11 +574,17 @@ mod tests {
         let drained = service.drain_owner(journal(), &stale).await.expect("drain");
 
         let winner_fence = owned(1, owner_b());
-        harness
-            .virtual_log()
-            .reconfigure_with_application_fence(harness.second.clone(), winner_fence.encode())
+        {
+            let log = harness.virtual_log();
+            let observed = log.observe_membership().await.expect("observe");
+            log.reconfigure_from_observation(
+                &observed,
+                harness.second.clone(),
+                winner_fence.encode(),
+            )
             .await
             .expect("winner");
+        }
 
         let outcome = publish_canon_transition(
             &mut service,
@@ -941,14 +947,17 @@ mod tests {
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
 
-        harness
-            .virtual_log()
-            .reconfigure_with_application_fence(
+        {
+            let log = harness.virtual_log();
+            let observed = log.observe_membership().await.expect("observe");
+            log.reconfigure_from_observation(
+                &observed,
                 harness.second.clone(),
                 owned(1, owner_b()).encode(),
             )
             .await
             .expect("publish B without draining A");
+        }
         let authority_b = observe_canon_authority_witnessed(
             &harness.virtual_log(),
             journal(),

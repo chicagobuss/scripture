@@ -934,11 +934,17 @@ mod tests {
                         .expect("log"),
                 ),
             );
-            harness
-                .virtual_log()
-                .reconfigure_with_application_fence(second.clone(), fence(1, owner_b()).encode())
+            {
+                let log = harness.virtual_log();
+                let observed = log.observe_membership().await.expect("observe");
+                log.reconfigure_from_observation(
+                    &observed,
+                    second.clone(),
+                    fence(1, owner_b()).encode(),
+                )
                 .await
                 .expect("cutover to B");
+            }
             let response = exchange(Arc::new(runtime), b"should-not-append\n").await;
             assert_eq!(
                 response,
@@ -978,14 +984,17 @@ mod tests {
                         .expect("log"),
                 ),
             );
-            harness
-                .virtual_log()
-                .reconfigure_with_application_fence(
+            {
+                let log = harness.virtual_log();
+                let observed = log.observe_membership().await.expect("observe");
+                log.reconfigure_from_observation(
+                    &observed,
                     second.clone(),
                     CanonFence::new(1, journal(), verse(), CanonOwner::Unowned).encode(),
                 )
                 .await
                 .expect("unowned");
+            }
             let response = exchange(Arc::new(runtime), b"nope\n").await;
             assert_eq!(response, "ERR recovering canon=1\n");
             let tail = harness.virtual_log().check_tail().await.expect("tail");
