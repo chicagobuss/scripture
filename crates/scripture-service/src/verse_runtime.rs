@@ -743,11 +743,13 @@ mod tests {
                     .expect("log"),
             ),
         );
-        harness
-            .virtual_log()
-            .reconfigure_with_application_fence(second, fence(1, owner_a()).encode())
-            .await
-            .expect("name self");
+        {
+            let log = harness.virtual_log();
+            let observed = log.observe_membership().await.expect("observe");
+            log.reconfigure_from_observation(&observed, second, fence(1, owner_a()).encode())
+                .await
+                .expect("name self");
+        }
         assert!(matches!(
             runtime.resolve_route().await.expect("route"),
             CanonRoute::Recovering { canon_revision: 1 }
@@ -1007,11 +1009,17 @@ mod tests {
                     .expect("log"),
             ),
         );
-        harness
-            .virtual_log()
-            .reconfigure_with_application_fence(second.clone(), fence(1, owner_b()).encode())
+        {
+            let log = harness.virtual_log();
+            let observed = log.observe_membership().await.expect("observe");
+            log.reconfigure_from_observation(
+                &observed,
+                second.clone(),
+                fence(1, owner_b()).encode(),
+            )
             .await
             .expect("competitor");
+        }
         let loser = LogletId::new("line-rt-loser").expect("id");
         harness.resolver.insert(
             loser.clone(),
