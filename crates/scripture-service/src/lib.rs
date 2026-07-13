@@ -4,10 +4,18 @@
 //! v0 [`scripture::JournalWriter`]. New work targets [`ChunkJournalService`],
 //! which routes Phase 1 [`scripture::ChunkDriverHandle`] owners without
 //! duplicating admission or durability logic.
+//!
+//! Canon-authorized startup after a fenced handoff uses
+//! [`recover_canon_owner`]. [`ChunkJournalService::register_owner`] is a local
+//! lab registry only and does not grant distributed fencing.
 
+mod canon_owner;
 mod chunk_service;
 pub mod reconcile;
 
+pub use canon_owner::{
+    CanonOwnerError, CanonOwnerRequest, RecoveredCanonOwner, recover_canon_owner,
+};
 pub use chunk_service::{ChunkJournalService, ChunkServiceError, OwnerHealth, OwnerStatus};
 pub use reconcile::{
     OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,

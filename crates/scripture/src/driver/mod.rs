@@ -231,6 +231,12 @@ pub struct ChunkDriverActor<C, T> {
 
 impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
     /// Creates a bounded actor and its cloneable handle.
+    ///
+    /// This is a **generic composition** primitive. Callers supply an already
+    /// recovered writer and generation. For Canon-authorized VirtualLog startup,
+    /// use the service-layer `recover_canon_owner` factory so authority
+    /// observation and cross-generation recovery happen exactly once before
+    /// construction.
     #[allow(clippy::too_many_arguments)] // construction surface matches the phase-1 work order
     pub fn new(
         journal_id: JournalId,
