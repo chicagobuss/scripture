@@ -868,14 +868,16 @@ mod tests {
         )
         .await
         .expect("recover");
+        let (recovered_authority, recovered_handle, recovered_actor, _) =
+            recovered.into_unmanaged();
         let mut service = ChunkJournalService::new();
         // Lab path: no Canon binding stored.
         service
             .register_owner(
                 journal(),
-                recovered.authority.revision(),
-                recovered.handle,
-                recovered.actor,
+                recovered_authority.revision(),
+                recovered_handle,
+                recovered_actor,
             )
             .expect("lab register");
         let authority =

@@ -40,21 +40,62 @@ pub struct CanonOwnerRequest {
 
 /// A recovered, unstarted Canon owner for one startup attempt.
 ///
-/// [`Self::authority`] is the observation used to authorize this attempt. It is
+/// This value can only be created by [`recover_canon_owner`]. Its authority is
 /// not a forever lease: after the actor runs, stale ownership is rejected by
 /// the Holylog seal fence on the VirtualLog-backed writer.
 pub struct RecoveredCanonOwner<C, T> {
-    /// Fresh Canon / VirtualLog observation for this attempt.
-    pub authority: CanonAuthoritySnapshot,
-    /// Cloneable submission endpoint.
-    pub handle: ChunkDriverHandle,
-    /// Unstarted actor. The caller owns lifecycle; this factory never spawns it.
-    pub actor: ChunkDriverActor<C, T>,
-    /// Bounded recovered suffix retained for diagnostics only.
+    authority: CanonAuthoritySnapshot,
+    handle: ChunkDriverHandle,
+    actor: ChunkDriverActor<C, T>,
+    recovered_chunks: Vec<RecoveredChunk>,
+}
+
+impl<C, T> RecoveredCanonOwner<C, T> {
+    /// Fresh Canon / VirtualLog observation that authorized this startup attempt.
+    #[must_use]
+    pub const fn authority(&self) -> &CanonAuthoritySnapshot {
+        &self.authority
+    }
+
+    /// Bounded durable suffix retained for diagnostics only.
     ///
-    /// Dedup state already lives inside [`Self::actor`]; callers must not rebuild
-    /// a second producer window from this vector.
-    pub recovered_chunks: Vec<RecoveredChunk>,
+    /// Dedup state already lives inside the actor; callers must not rebuild a
+    /// second producer window from this slice.
+    #[must_use]
+    pub fn recovered_chunks(&self) -> &[RecoveredChunk] {
+        &self.recovered_chunks
+    }
+
+    /// Consumes this factory-created owner for an unmanaged local runtime.
+    ///
+    /// An actor started this way can still be seal-fenced by Holylog, but it
+    /// cannot later be upgraded into a Canon publish-capable service binding.
+    #[must_use]
+    pub fn into_unmanaged(
+        self,
+    ) -> (
+        CanonAuthoritySnapshot,
+        ChunkDriverHandle,
+        ChunkDriverActor<C, T>,
+        Vec<RecoveredChunk>,
+    ) {
+        (
+            self.authority,
+            self.handle,
+            self.actor,
+            self.recovered_chunks,
+        )
+    }
+
+    pub(crate) fn into_canon_registration(
+        self,
+    ) -> (
+        CanonAuthoritySnapshot,
+        ChunkDriverHandle,
+        ChunkDriverActor<C, T>,
+    ) {
+        (self.authority, self.handle, self.actor)
+    }
 }
 
 /// Failures constructing a Canon-authorized owner.
@@ -329,8 +370,8 @@ mod tests {
         )
         .await
         .expect("recover");
-        assert_eq!(recovered.authority.revision(), 0);
-        assert!(recovered.recovered_chunks.is_empty());
+        assert_eq!(recovered.authority().revision(), 0);
+        assert!(recovered.recovered_chunks().is_empty());
 
         let mut service = crate::ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
@@ -417,9 +458,9 @@ mod tests {
         )
         .await
         .expect("owner b");
-        assert_eq!(recovered_b.authority.revision(), 1);
-        assert_eq!(recovered_b.recovered_chunks.len(), 1);
-        assert_eq!(recovered_b.recovered_chunks[0].first_offset.get(), 0);
+        assert_eq!(recovered_b.authority().revision(), 1);
+        assert_eq!(recovered_b.recovered_chunks().len(), 1);
+        assert_eq!(recovered_b.recovered_chunks()[0].first_offset.get(), 0);
 
         // A separate process-local registry — not an in-place owner replacement.
         let mut service_b = crate::ChunkJournalService::new();
@@ -529,8 +570,9 @@ mod tests {
             recover_canon_owner(request(owner_a()), harness.virtual_log(), clock, timer)
                 .await
                 .expect("recover");
-        let task = tokio::spawn(recovered.actor.run());
-        drop(recovered.handle);
+        let (_, handle, actor, _) = recovered.into_unmanaged();
+        let task = tokio::spawn(actor.run());
+        drop(handle);
         let _ = task.await.expect("terminates without restart");
     }
 }
