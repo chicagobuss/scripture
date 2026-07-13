@@ -6,11 +6,9 @@
 //! fleet-plan integration test — see holylog folio
 //! `scripture-cross-cloud-real-driver-and-fleet-plan.md`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -18,192 +16,22 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::executor::LocalPool;
 use futures::future::poll_fn;
-use futures::task::{AtomicWaker, SpawnExt};
+use futures::task::SpawnExt;
 use holylog::atomic::AtomicLog;
-use holylog::drive::{DriveError, DriveFuture, LogDrive};
-use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
+use holylog::drive::LogDrive;
 use proptest::prelude::*;
 use scripture::{
-    AttributeValue, ChunkDriverActor, ChunkLogWriter, ChunkPolicy, CohortId, DriverError, Frame,
-    JournalId, ManualClock, ManualTimer, PolicyError, ProducerId, Record, RecordOffset,
-    RecoveryBound, Submission, SubmissionRef, WriterId, encoded_chunk_len,
+    ChunkDriverActor, ChunkLogWriter, ChunkPolicy, DriverError, Frame, ManualClock, ManualTimer,
+    PolicyError, ProducerId, Record, RecordOffset, RecoveryBound, Submission, SubmissionRef,
+    encoded_chunk_len,
 };
 
-#[derive(Debug, thiserror::Error)]
-#[error("injected scripted-drive failure")]
-struct InjectedFailure;
+#[path = "support/mod.rs"]
+mod support;
 
-#[derive(Debug, Default)]
-struct PollGate {
-    open: AtomicBool,
-    waker: AtomicWaker,
-}
-
-impl PollGate {
-    fn open(&self) {
-        self.open.store(true, Ordering::Release);
-        self.waker.wake();
-    }
-
-    async fn wait(&self) {
-        poll_fn(|context| {
-            if self.open.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            self.waker.register(context.waker());
-            if self.open.load(Ordering::Acquire) {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-    }
-}
-
-/// Scripted LogDrive: gate before durable write, or write then fail (ambiguous).
-#[derive(Debug, Default)]
-struct ScriptedLogDrive {
-    model: Mutex<ReferenceLogDrive>,
-    writes: AtomicU64,
-    write_gates: Mutex<HashMap<Address, Arc<PollGate>>>,
-    fail_before_write: Mutex<BTreeSet<Address>>,
-    fail_after_write: Mutex<BTreeSet<Address>>,
-}
-
-impl ScriptedLogDrive {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    fn gate_write(&self, address: Address) -> Arc<PollGate> {
-        let mut gates = self.write_gates.lock().expect("gates");
-        Arc::clone(gates.entry(address).or_default())
-    }
-
-    fn fail_after_durable_write(&self, address: Address) {
-        self.fail_after_write
-            .lock()
-            .expect("fail-after")
-            .insert(address);
-    }
-
-    fn write_count(&self) -> u64 {
-        self.writes.load(Ordering::Relaxed)
-    }
-
-    fn contains(&self, address: Address) -> bool {
-        self.model.lock().expect("model").read(address).is_some()
-    }
-}
-
-impl LogDrive for ScriptedLogDrive {
-    fn write(&self, address: Address, value: Bytes) -> DriveFuture<'_, ()> {
-        Box::pin(async move {
-            let gate = self
-                .write_gates
-                .lock()
-                .expect("gates")
-                .get(&address)
-                .cloned();
-            if let Some(gate) = gate {
-                gate.wait().await;
-            }
-            if self
-                .fail_before_write
-                .lock()
-                .expect("fail-before")
-                .contains(&address)
-            {
-                return Err(DriveError::backend(InjectedFailure));
-            }
-            self.writes.fetch_add(1, Ordering::Relaxed);
-            self.model
-                .lock()
-                .map_err(|_| DriveError::backend(InjectedFailure))?
-                .write(address, value)?;
-            if self
-                .fail_after_write
-                .lock()
-                .expect("fail-after")
-                .contains(&address)
-            {
-                return Err(DriveError::backend(InjectedFailure));
-            }
-            Ok(())
-        })
-    }
-
-    fn read(&self, address: Address) -> DriveFuture<'_, Option<Bytes>> {
-        Box::pin(async move {
-            Ok(self
-                .model
-                .lock()
-                .map_err(|_| DriveError::backend(InjectedFailure))?
-                .read(address)
-                .cloned())
-        })
-    }
-
-    fn weak_tail(&self, k: u64) -> DriveFuture<'_, TailDescription> {
-        Box::pin(async move {
-            Ok(self
-                .model
-                .lock()
-                .map_err(|_| DriveError::backend(InjectedFailure))?
-                .weak_tail(k)?)
-        })
-    }
-}
-
-fn journal() -> JournalId {
-    JournalId::from_bytes(*b"driver-journal!!")
-}
-
-fn cohort() -> CohortId {
-    CohortId::from_bytes(*b"driver-cohort!!!")
-}
-
-fn writer_id() -> WriterId {
-    WriterId::from_bytes(*b"driver-writer!!!")
-}
-
-fn producer() -> ProducerId {
-    ProducerId::from_bytes(*b"driver-producer!")
-}
-
-fn record(n: i64) -> Record {
-    Record::new(
-        [("n".into(), AttributeValue::I64(n))],
-        Bytes::from(format!("payload-{n}")),
-    )
-}
-
-fn policy() -> ChunkPolicy {
-    ChunkPolicy {
-        max_chunk_bytes: 64 * 1024,
-        max_record_bytes: 16 * 1024,
-        max_chunk_records: 8,
-        max_chunk_age: Duration::from_secs(60),
-        max_buffered_bytes: 64 * 1024,
-        max_inflight_chunks: 1,
-        max_uncommitted_age: Duration::from_secs(60),
-        recovery_scan: RecoveryBound::new(16).expect("bound"),
-    }
-}
-
-fn tiny_policy() -> ChunkPolicy {
-    ChunkPolicy {
-        max_chunk_bytes: 512,
-        max_record_bytes: 256,
-        max_chunk_records: 2,
-        max_chunk_age: Duration::from_secs(60),
-        max_buffered_bytes: 1024,
-        max_inflight_chunks: 1,
-        max_uncommitted_age: Duration::from_secs(60),
-        recovery_scan: RecoveryBound::new(8).expect("bound"),
-    }
-}
+use support::{
+    ScriptedLogDrive, address, cohort, journal, policy, producer, record, tiny_policy, writer_id,
+};
 
 fn submission(sequence: u64, values: &[i64]) -> Submission {
     Submission {
@@ -212,10 +40,6 @@ fn submission(sequence: u64, values: &[i64]) -> Submission {
         sequence,
         records: values.iter().copied().map(record).collect(),
     }
-}
-
-fn address(slot: u64) -> Address {
-    Address::new(slot).expect("address")
 }
 
 #[test]
