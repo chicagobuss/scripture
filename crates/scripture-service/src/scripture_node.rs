@@ -241,8 +241,8 @@ mod tests {
         VirtualLog,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnedSequencerBinding,
-        OwnerEndpoint, OwnerId, RecoveryBound, SequencerEpoch, SystemClock, VerseId, WriterId,
+        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
+        RecoveryBound, SystemClock, VerseId, WriterId,
     };
 
     use super::{ScriptureNode, ScriptureNodeConfigError, VerseKey};
@@ -303,11 +303,8 @@ mod tests {
             line,
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: endpoint.clone(),
-                sequencer: Some(OwnedSequencerBinding {
-                    epoch: SequencerEpoch::test(revision),
-                    sequencer_endpoint: endpoint,
-                }),
+                endpoint,
+                sequencer: None,
             },
         )
     }

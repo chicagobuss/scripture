@@ -823,11 +823,8 @@ mod tests {
                 verse(),
                 CanonOwner::Owned {
                     owner_id: owner,
-                    endpoint: endpoint.clone(),
-                    sequencer: Some(OwnedSequencerBinding {
-                        epoch: SequencerEpoch::test(revision),
-                        sequencer_endpoint: endpoint,
-                    }),
+                    endpoint,
+                    sequencer: None,
                 },
             )
         }

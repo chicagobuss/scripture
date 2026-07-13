@@ -469,9 +469,8 @@ mod tests {
         LogletResolver, RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId,
-        OwnedSequencerBinding, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
-        SequencerEpoch, Submission, SystemClock, VerseId, WriterId,
+        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, OwnerEndpoint,
+        OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock, VerseId, WriterId,
     };
 
     use super::{
@@ -530,11 +529,8 @@ mod tests {
             verse(),
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: endpoint.clone(),
-                sequencer: Some(OwnedSequencerBinding {
-                    epoch: SequencerEpoch::test(revision),
-                    sequencer_endpoint: endpoint,
-                }),
+                endpoint,
+                sequencer: None,
             },
         )
     }
@@ -543,11 +539,8 @@ mod tests {
         let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
         CanonOwner::Owned {
             owner_id: owner,
-            endpoint: endpoint.clone(),
-            sequencer: Some(OwnedSequencerBinding {
-                epoch: SequencerEpoch::test(0),
-                sequencer_endpoint: endpoint,
-            }),
+            endpoint,
+            sequencer: None,
         }
     }
 

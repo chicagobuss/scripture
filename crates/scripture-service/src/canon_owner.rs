@@ -169,8 +169,8 @@ mod tests {
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, ManualClock,
-        ManualTimer, OwnedSequencerBinding, OwnerEndpoint, OwnerId, ProducerId, Record,
-        RecoveryBound, SequencerEpoch, Submission, SystemClock, VerseId, WriterId,
+        ManualTimer, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission,
+        SystemClock, VerseId, WriterId,
     };
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -236,11 +236,8 @@ mod tests {
             verse(),
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: endpoint.clone(),
-                sequencer: Some(OwnedSequencerBinding {
-                    epoch: SequencerEpoch::test(revision),
-                    sequencer_endpoint: endpoint,
-                }),
+                endpoint,
+                sequencer: None,
             },
         )
     }
