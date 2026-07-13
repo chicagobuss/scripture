@@ -525,6 +525,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -536,6 +538,18 @@ dependencies = [
  "futures",
  "holylog",
  "object_store",
+ "thiserror",
+]
+
+[[package]]
+name = "holylog-object-store-register"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "holylog",
+ "object_store",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1498,6 +1512,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scripture-load"
+version = "0.1.0"
+dependencies = [
+ "holylog",
+ "scripture",
+ "scripture-service",
+ "scriptured",
+ "tokio",
+]
+
+[[package]]
 name = "scripture-service"
 version = "0.1.0"
 dependencies = [
@@ -1515,6 +1540,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "holylog",
+ "holylog-object-store",
+ "holylog-object-store-register",
+ "object_store",
  "scripture",
  "scripture-service",
  "thiserror",
