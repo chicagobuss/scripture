@@ -15,6 +15,7 @@ scripture-service = { path = "../scripture-service" }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 
 [dev-dependencies]
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

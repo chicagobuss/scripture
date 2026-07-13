@@ -7,39 +7,74 @@
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 use holylog::atomic::AtomicLog;
 use holylog::drive::LogDrive;
 use holylog::memory::InMemoryLogDrive;
-use scripture::{JournalId, JournalWriter, RecordOffset};
-use scripture_service::JournalActor;
-use scriptured::{RawLinesConfig, serve_raw_lines_connection};
+use scripture::{
+    ChunkDriverActor, ChunkLogWriter, ChunkPolicy, CohortId, JournalId, RecordOffset,
+    RecoveryBound, SystemClock, WriterId,
+};
+use scripture_service::ChunkJournalService;
+use scriptured::{RawLinesConfig, serve_chunk_raw_lines_connection};
 use tokio::net::TcpListener;
 
 const DEFAULT_BIND: &str = "0.0.0.0:9000";
 const LAB_JOURNAL_ID: JournalId = JournalId::from_bytes(*b"scriptured-lab!!");
+const LAB_COHORT_ID: CohortId = CohortId::from_bytes(*b"scriptured-cohrt");
+const LAB_WRITER_ID: WriterId = WriterId::from_bytes(*b"scriptured-writr");
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let bind = parse_bind(env::args().skip(1))?;
     let drive = Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>;
-    let log = AtomicLog::builder(drive, 4).build()?;
-    let writer = JournalWriter::new(LAB_JOURNAL_ID, log, RecordOffset::new(0));
-    let (journal, actor) = JournalActor::new(writer, 1_024);
-    tokio::spawn(actor.run());
+    let log = AtomicLog::builder(drive, 0).build()?;
+    let writer = ChunkLogWriter::new(LAB_JOURNAL_ID, LAB_COHORT_ID, 1, log, RecordOffset::new(0));
+    let (clock, timer) = SystemClock::pair();
+    let policy = ChunkPolicy {
+        max_chunk_bytes: 64 * 1024,
+        max_record_bytes: 16 * 1024,
+        max_chunk_records: 8,
+        max_chunk_age: Duration::from_secs(60),
+        max_buffered_bytes: 64 * 1024,
+        max_inflight_chunks: 1,
+        max_uncommitted_age: Duration::from_secs(60),
+        recovery_scan: RecoveryBound::new(16).ok_or("invalid recovery bound")?,
+    };
+    let (handle, actor) = ChunkDriverActor::new(
+        LAB_JOURNAL_ID,
+        LAB_COHORT_ID,
+        LAB_WRITER_ID,
+        1,
+        writer,
+        &[],
+        policy,
+        clock,
+        timer,
+        1_024,
+    )?;
+    let mut service = ChunkJournalService::new();
+    service.register_owner(LAB_JOURNAL_ID, 1, handle, actor)?;
+    let service = Arc::new(service);
 
     let listener = TcpListener::bind(&bind).await?;
     eprintln!(
         "scriptured raw-lines lab listening on {}; journal={LAB_JOURNAL_ID}; \
-         in-memory only",
+         chunk-driver owner; in-memory only",
         listener.local_addr()?
     );
     loop {
         let (stream, peer) = listener.accept().await?;
-        let journal = journal.clone();
+        let service = Arc::clone(&service);
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_raw_lines_connection(stream, journal, RawLinesConfig::default()).await
+            if let Err(error) = serve_chunk_raw_lines_connection(
+                stream,
+                service,
+                LAB_JOURNAL_ID,
+                RawLinesConfig::default(),
+            )
+            .await
             {
                 eprintln!("raw-lines connection {peer} failed: {error}");
             }

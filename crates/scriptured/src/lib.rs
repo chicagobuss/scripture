@@ -1,16 +1,20 @@
 //! Lab-grade network adapters for Scripture.
 //!
-//! The first adapter is deliberately small: newline-delimited raw bytes in,
-//! one durable acknowledgement line out. It proves the transport can stay
-//! thin over [`scripture_service::JournalHandle`]; it is not a production
-//! listener, schema registry, or restart-safe daemon.
+//! Two raw-lines paths exist during migration:
+//! - [`serve_raw_lines_connection`] — legacy v0 [`JournalHandle`]
+//! - [`serve_chunk_raw_lines_connection`] — Phase 1 [`ChunkJournalService`]
+//!
+//! New work targets the chunk path. The legacy path remains until a separate
+//! removal review.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use scripture::{AttributeValue, Record};
-use scripture_service::JournalHandle;
+use scripture::{AttributeValue, ProducerId, Record, Submission};
+use scripture_service::{ChunkJournalService, JournalHandle};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -36,14 +40,30 @@ impl Default for RawLinesConfig {
     }
 }
 
-/// Serves one newline-delimited, durable raw-lines connection.
+/// Allocates a fresh lab producer identity for one accepted connection.
 ///
-/// Each input line becomes one record whose payload is the exact line bytes
-/// excluding `\n` and an optional preceding `\r`. For every accepted line the
-/// server writes `OK <first-offset> <next-offset>\n` in FIFO input order. An
-/// error is reported as `ERR <reason>\n` and closes the connection; a client
-/// that disconnects before an `OK` has an unknown durable outcome and must
-/// retry at-least-once.
+/// Sequences are monotonic within that connection starting at zero. This does
+/// not claim reconnect deduplication across connections.
+#[must_use]
+pub fn allocate_connection_producer() -> ProducerId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0_u8; 16];
+    bytes[0..8].copy_from_slice(b"rawline\0");
+    bytes[8..16].copy_from_slice(&n.to_be_bytes());
+    ProducerId::from_bytes(bytes)
+}
+
+/// Advances a producer sequence after it has been used in a submission.
+///
+/// Returns [`None`] when `used == u64::MAX` so the caller can refuse further
+/// payloads under the same identity instead of silently replaying.
+#[must_use = "callers must fail closed when the sequence space is exhausted"]
+pub fn next_producer_sequence(used: u64) -> Option<u64> {
+    used.checked_add(1)
+}
+
+/// Serves one newline-delimited connection over the legacy v0 journal handle.
 pub async fn serve_raw_lines_connection(
     stream: TcpStream,
     journal: JournalHandle,
@@ -73,6 +93,95 @@ pub async fn serve_raw_lines_connection(
                                     "OK {} {}\n",
                                     acknowledgement.first_offset.get(),
                                     acknowledgement.next_offset.get()
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        writer.flush().await?;
+                    }
+                    Err(error) => {
+                        write_error(&mut writer, &error.to_string()).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                write_error(&mut writer, &error.to_string()).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Serves one newline-delimited connection over [`ChunkJournalService`].
+///
+/// Each line becomes a one-record [`Submission`]. The connection owns a freshly
+/// allocated producer identity at epoch 0. `OK` is written only after a
+/// committed receipt.
+pub async fn serve_chunk_raw_lines_connection(
+    stream: TcpStream,
+    service: Arc<ChunkJournalService>,
+    journal_id: scripture::JournalId,
+    config: RawLinesConfig,
+) -> io::Result<()> {
+    serve_chunk_raw_lines_from(stream, service, journal_id, config, 0).await
+}
+
+/// Like [`serve_chunk_raw_lines_connection`], but starts at `initial_sequence`.
+///
+/// Used by tests to exercise sequence exhaustion without 2^64 requests.
+pub async fn serve_chunk_raw_lines_from(
+    stream: TcpStream,
+    service: Arc<ChunkJournalService>,
+    journal_id: scripture::JournalId,
+    config: RawLinesConfig,
+    mut sequence: u64,
+) -> io::Result<()> {
+    let producer_id = allocate_connection_producer();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut exhausted = false;
+    loop {
+        match read_line(&mut reader, config.max_line_bytes).await {
+            Ok(Some(line)) => {
+                if exhausted {
+                    write_error(&mut writer, "producer sequence space exhausted").await?;
+                    return Ok(());
+                }
+                let submission = Submission {
+                    producer_id,
+                    producer_epoch: 0,
+                    sequence,
+                    records: vec![Record {
+                        attributes: config.attributes.clone(),
+                        payload: Bytes::from(line),
+                    }],
+                };
+                match next_producer_sequence(sequence) {
+                    Some(next) => sequence = next,
+                    None => exhausted = true,
+                }
+                let receipt = match service.submit(journal_id, submission).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        write_error(&mut writer, &error.to_string()).await?;
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = service.flush(journal_id).await {
+                    write_error(&mut writer, &error.to_string()).await?;
+                    return Ok(());
+                }
+                match receipt.await {
+                    Ok(receipt) => {
+                        writer
+                            .write_all(
+                                format!(
+                                    "OK {} {}\n",
+                                    receipt.first_offset.get(),
+                                    receipt.next_offset.get()
                                 )
                                 .as_bytes(),
                             )
@@ -140,16 +249,74 @@ async fn read_line<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
+    use bytes::Bytes;
     use holylog::atomic::AtomicLog;
-    use holylog::drive::LogDrive;
+    use holylog::drive::{DriveError, DriveFuture, LogDrive};
+    use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
     use holylog::memory::InMemoryLogDrive;
-    use scripture::{JournalId, JournalReader, JournalWriter, ReadEvent, RecordOffset};
-    use scripture_service::JournalActor;
+    use scripture::{
+        ChunkDriverActor, ChunkLogWriter, ChunkPolicy, CohortId, JournalId, JournalReader,
+        JournalWriter, ReadEvent, RecordOffset, RecoveryBound, SystemClock, WriterId,
+    };
+    use scripture_service::{ChunkJournalService, JournalActor};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{RawLinesConfig, serve_raw_lines_connection};
+    use super::{
+        RawLinesConfig, next_producer_sequence, serve_chunk_raw_lines_connection,
+        serve_raw_lines_connection,
+    };
+
+    fn policy() -> ChunkPolicy {
+        ChunkPolicy {
+            max_chunk_bytes: 64 * 1024,
+            max_record_bytes: 16 * 1024,
+            max_chunk_records: 8,
+            max_chunk_age: Duration::from_secs(60),
+            max_buffered_bytes: 64 * 1024,
+            max_inflight_chunks: 1,
+            max_uncommitted_age: Duration::from_secs(60),
+            recovery_scan: RecoveryBound::new(16).expect("bound"),
+        }
+    }
+
+    fn cohort() -> CohortId {
+        CohortId::from_bytes(*b"raw-cohort!!!!!!")
+    }
+
+    fn writer_id() -> WriterId {
+        WriterId::from_bytes(*b"raw-writer!!!!!!")
+    }
+
+    async fn chunk_service(
+        journal_id: JournalId,
+        drive: Arc<dyn LogDrive>,
+    ) -> Arc<ChunkJournalService> {
+        let log = AtomicLog::builder(drive, 0).build().expect("log");
+        let writer = ChunkLogWriter::new(journal_id, cohort(), 1, log, RecordOffset::new(0));
+        let (clock, timer) = SystemClock::pair();
+        let (handle, actor) = ChunkDriverActor::new(
+            journal_id,
+            cohort(),
+            writer_id(),
+            1,
+            writer,
+            &[],
+            policy(),
+            clock,
+            timer,
+            16,
+        )
+        .expect("actor");
+        let mut service = ChunkJournalService::new();
+        service
+            .register_owner(journal_id, 1, handle, actor)
+            .expect("register");
+        Arc::new(service)
+    }
 
     #[tokio::test]
     async fn raw_lines_is_a_thin_durable_fifo_adapter() {
@@ -214,7 +381,6 @@ mod tests {
 
         let mut client = TcpStream::connect(address).await.expect("connect");
 
-        // Write a single line split across many small writes with yields
         for byte in b"hello split world\n" {
             client.write_all(&[*byte]).await.expect("write byte");
             tokio::task::yield_now().await;
@@ -235,5 +401,182 @@ mod tests {
 
         drop(handle);
         actor.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn chunk_raw_lines_is_a_thin_durable_fifo_adapter() {
+        let journal_id = JournalId::from_bytes(*b"chunk-raw-lines!");
+        let drive = Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>;
+        let service = chunk_service(journal_id, Arc::clone(&drive)).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_service = Arc::clone(&service);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_chunk_raw_lines_connection(
+                stream,
+                server_service,
+                journal_id,
+                RawLinesConfig::default(),
+            )
+            .await
+            .expect("serve")
+        });
+
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        client.write_all(b"first\r\nsecond\n").await.expect("write");
+        client.shutdown().await.expect("finish input");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read acks");
+        assert_eq!(response, b"OK 0 1\nOK 1 2\n");
+        server.await.expect("server joins");
+    }
+
+    #[tokio::test]
+    async fn chunk_raw_lines_buffering_handles_split_writes() {
+        let journal_id = JournalId::from_bytes(*b"chunk-split-wr!!");
+        let drive = Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>;
+        let service = chunk_service(journal_id, drive).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_service = Arc::clone(&service);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_chunk_raw_lines_connection(
+                stream,
+                server_service,
+                journal_id,
+                RawLinesConfig::default(),
+            )
+            .await
+            .expect("serve")
+        });
+
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        for byte in b"hello split world\n" {
+            client.write_all(&[*byte]).await.expect("write byte");
+            tokio::task::yield_now().await;
+        }
+        client.shutdown().await.expect("finish input");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read acks");
+        assert_eq!(response, b"OK 0 1\n");
+        server.await.expect("server joins");
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected durable-then-error")]
+    struct InjectedFailure;
+
+    #[derive(Debug, Default)]
+    struct FailAfterWriteDrive {
+        model: std::sync::Mutex<ReferenceLogDrive>,
+        armed: AtomicBool,
+    }
+
+    impl FailAfterWriteDrive {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Release);
+        }
+    }
+
+    impl LogDrive for FailAfterWriteDrive {
+        fn write(&self, address: Address, value: Bytes) -> DriveFuture<'_, ()> {
+            Box::pin(async move {
+                self.model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .write(address, value)?;
+                if self.armed.load(Ordering::Acquire) {
+                    return Err(DriveError::backend(InjectedFailure));
+                }
+                Ok(())
+            })
+        }
+
+        fn read(&self, address: Address) -> DriveFuture<'_, Option<Bytes>> {
+            Box::pin(async move {
+                Ok(self
+                    .model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .read(address)
+                    .cloned())
+            })
+        }
+
+        fn weak_tail(&self, k: u64) -> DriveFuture<'_, TailDescription> {
+            Box::pin(async move {
+                Ok(self
+                    .model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .weak_tail(k)?)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_raw_lines_poison_returns_err_and_closes() {
+        let journal_id = JournalId::from_bytes(*b"chunk-poison-rl!");
+        let drive = FailAfterWriteDrive::new();
+        drive.arm();
+        let service = chunk_service(journal_id, Arc::clone(&drive) as Arc<dyn LogDrive>).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_service = Arc::clone(&service);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_chunk_raw_lines_connection(
+                stream,
+                server_service,
+                journal_id,
+                RawLinesConfig::default(),
+            )
+            .await
+            .expect("serve")
+        });
+
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        client.write_all(b"boom\n").await.expect("write");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read");
+        let text = String::from_utf8(response).expect("utf8");
+        assert!(
+            text.starts_with("ERR "),
+            "expected ERR response, got {text}"
+        );
+        server.await.expect("server joins");
+    }
+
+    #[test]
+    fn next_producer_sequence_fails_closed_at_max() {
+        assert_eq!(next_producer_sequence(0), Some(1));
+        assert_eq!(next_producer_sequence(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(next_producer_sequence(u64::MAX), None);
+    }
+
+    #[test]
+    fn exhausted_flag_blocks_further_payloads_after_max() {
+        // Models the connection loop: after using u64::MAX, the next payload
+        // must fail closed before another submit under the same identity.
+        let mut sequence = u64::MAX - 1;
+        let mut exhausted = false;
+        for _ in 0..2 {
+            assert!(!exhausted, "must still accept until MAX is used");
+            match next_producer_sequence(sequence) {
+                Some(next) => sequence = next,
+                None => exhausted = true,
+            }
+        }
+        assert!(exhausted);
+        assert!(next_producer_sequence(sequence).is_none());
     }
 }
