@@ -7,6 +7,7 @@
 //! this writer and poisons on every non-OK append outcome.
 
 use holylog::atomic::{AtomicLog, AtomicLogError};
+use holylog::virtual_log::{VirtualLog, VirtualLogError};
 
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
 use crate::model::{JournalId, RecordOffset};
@@ -39,7 +40,8 @@ impl RecoveryBound {
 /// Durable acknowledgement of a sealed chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkAppendAck {
-    /// Holylog slot that contains the chunk.
+    /// Holylog position that contains the chunk: a local AtomicLog address for
+    /// Phase 1, or a global VirtualLog position for a fenced Canon Line.
     pub slot: u64,
     /// Stable identifier of the committed immutable bytes.
     pub chunk_id: ChunkId,
@@ -83,9 +85,20 @@ pub struct ChunkLogRecovery {
 /// Errors at the chunk-to-Holylog boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkLogError {
-    /// Holylog failed, rejected the append, or observed a seal.
+    /// An AtomicLog-backed Holylog failed, rejected the append, or observed a seal.
     #[error(transparent)]
-    Log(#[from] AtomicLogError),
+    AtomicLog(#[from] AtomicLogError),
+    /// A VirtualLog-backed Holylog failed or fenced this owner at a seal.
+    #[error(transparent)]
+    VirtualLog(#[from] VirtualLogError),
+    /// The cached VirtualLog membership no longer names this writer generation.
+    #[error("VirtualLog generation changed: expected {expected}, observed {actual}")]
+    VirtualGenerationChanged {
+        /// Generation encoded in this writer's chunks.
+        expected: u64,
+        /// Membership revision currently cached by VirtualLog.
+        actual: u64,
+    },
     /// Chunk bytes are malformed.
     #[error(transparent)]
     Chunk(#[from] ChunkError),
@@ -136,9 +149,60 @@ pub struct ChunkLogWriter {
     journal_id: JournalId,
     cohort_id: CohortId,
     generation: u64,
-    log: AtomicLog,
+    log: ChunkLog,
     next_offset: RecordOffset,
     poisoned: bool,
+}
+
+/// The Holylog scope used by one chunk writer.
+///
+/// The Atomic variant is retained for the Phase 1 local-owner laboratory. The
+/// Virtual variant routes through the Conflux generation chain and receives a
+/// seal fence whenever a Canon cutover has replaced its Line.
+#[derive(Debug)]
+enum ChunkLog {
+    Atomic(AtomicLog),
+    Virtual(VirtualLog),
+}
+
+impl ChunkLog {
+    async fn append(
+        &self,
+        bytes: bytes::Bytes,
+        expected_generation: u64,
+    ) -> Result<u64, ChunkLogError> {
+        match self {
+            Self::Atomic(log) => Ok(log.append(bytes).await?.get()),
+            Self::Virtual(log) => {
+                // This catches an in-process owner whose shared VirtualLog
+                // cache was advanced by a reconfigurer. A remote stale owner
+                // keeps its old cache and is fenced by the predecessor seal in
+                // VirtualLog::append instead.
+                let actual = log.cached_membership().await?.revision;
+                if actual != expected_generation {
+                    return Err(ChunkLogError::VirtualGenerationChanged {
+                        expected: expected_generation,
+                        actual,
+                    });
+                }
+                Ok(log.append(bytes).await?.position)
+            }
+        }
+    }
+
+    async fn checked_tail(&self) -> Result<u64, ChunkLogError> {
+        match self {
+            Self::Atomic(log) => Ok(log.check_tail().await?.tail),
+            Self::Virtual(log) => Ok(log.check_tail().await?.tail),
+        }
+    }
+
+    async fn read_payload(&self, min: u64, max: u64) -> Result<bytes::Bytes, ChunkLogError> {
+        match self {
+            Self::Atomic(log) => Ok(log.read_next(min, max).await?.payload),
+            Self::Virtual(log) => Ok(log.read_next(min, max).await?.payload),
+        }
+    }
 }
 
 impl ChunkLogWriter {
@@ -155,7 +219,33 @@ impl ChunkLogWriter {
             journal_id,
             cohort_id,
             generation,
-            log,
+            log: ChunkLog::Atomic(log),
+            next_offset,
+            poisoned: false,
+        }
+    }
+
+    /// Constructs a writer over a fenced Holylog VirtualLog generation.
+    ///
+    /// The caller must obtain and validate a fresh Scripture Canon fence before
+    /// construction. If a later Canon cutover advances a shared membership
+    /// cache, the next append returns [`ChunkLogError::VirtualGenerationChanged`].
+    /// A remote stale owner instead reaches the sealed predecessor and returns
+    /// [`VirtualLogError::StaleGeneration`]. In either case the writer is
+    /// poisoned and must be replaced through recovery rather than retried.
+    #[must_use]
+    pub fn new_virtual(
+        journal_id: JournalId,
+        cohort_id: CohortId,
+        generation: u64,
+        log: VirtualLog,
+        next_offset: RecordOffset,
+    ) -> Self {
+        Self {
+            journal_id,
+            cohort_id,
+            generation,
+            log: ChunkLog::Virtual(log),
             next_offset,
             poisoned: false,
         }
@@ -212,11 +302,14 @@ impl ChunkLogWriter {
             .ok_or(ChunkError::OffsetOverflow)?;
 
         self.poisoned = true;
-        let slot = self.log.append(chunk.bytes.clone()).await?;
+        let slot = self
+            .log
+            .append(chunk.bytes.clone(), self.generation)
+            .await?;
         self.poisoned = false;
         self.next_offset = next_offset;
         Ok(ChunkAppendAck {
-            slot: slot.get(),
+            slot,
             chunk_id: chunk.chunk_id,
             first_offset: frame.base_offset,
             next_offset,
@@ -232,12 +325,29 @@ impl ChunkLogWriter {
         log: AtomicLog,
         bound: RecoveryBound,
     ) -> Result<ChunkLogRecovery, ChunkLogError> {
-        let tail = log.check_tail().await?.tail;
+        Self::recover_from_log(
+            journal_id,
+            cohort_id,
+            generation,
+            ChunkLog::Atomic(log),
+            bound,
+        )
+        .await
+    }
+
+    async fn recover_from_log(
+        journal_id: JournalId,
+        cohort_id: CohortId,
+        generation: u64,
+        log: ChunkLog,
+        bound: RecoveryBound,
+    ) -> Result<ChunkLogRecovery, ChunkLogError> {
+        let tail = log.checked_tail().await?;
         let start = tail.saturating_sub(bound.max_chunks() as u64);
         let mut chunks = Vec::new();
         for slot in start..tail {
-            let entry = log.read_next(slot, tail).await?;
-            let index = decode_index(&entry.payload)?;
+            let payload = log.read_payload(slot, tail).await?;
+            let index = decode_index(&payload)?;
             if index.header.cohort_id != cohort_id {
                 return Err(ChunkLogError::CohortMismatch);
             }
@@ -260,7 +370,7 @@ impl ChunkLogWriter {
             chunks.push(RecoveredChunk {
                 slot,
                 chunk_id: index.header.chunk_id,
-                digest: ChunkDigest::of(&entry.payload),
+                digest: ChunkDigest::of(&payload),
                 first_offset: frame.base_offset,
                 record_count: frame.record_count,
                 frame: frame.clone(),
@@ -281,7 +391,14 @@ impl ChunkLogWriter {
                 .checked_add(chunk.record_count as usize)
                 .ok_or(ChunkError::OffsetOverflow)?;
         }
-        let writer = Self::new(journal_id, cohort_id, generation, log, next_offset);
+        let writer = Self {
+            journal_id,
+            cohort_id,
+            generation,
+            log,
+            next_offset,
+            poisoned: false,
+        };
         Ok(ChunkLogRecovery { writer, chunks })
     }
 }
