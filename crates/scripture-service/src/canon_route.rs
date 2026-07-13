@@ -119,6 +119,8 @@ mod tests {
     use std::time::Duration;
 
     use holylog::atomic::AtomicLog;
+    use holylog::drive::{DriveError, DriveFuture, LogDrive};
+    use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
     use holylog::memory::InMemoryLogDrive;
     use holylog::virtual_log::{
         ApplicationFence, ConditionalRegister, InMemoryConditionalRegister, LogletId,
@@ -126,7 +128,8 @@ mod tests {
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint, OwnerId,
-        RecoveryBound, SystemClock, WriterId, observe_canon_authority_witnessed,
+        ProducerId, Record, RecoveryBound, Submission, SystemClock, WriterId,
+        observe_canon_authority_witnessed,
     };
 
     use super::{CanonRoute, CanonRouteError, resolve_canon_route};
@@ -232,19 +235,25 @@ mod tests {
 
     impl Harness {
         fn memory() -> Self {
+            Self::with_first_drive(Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>)
+        }
+
+        fn with_first_drive(first_drive: Arc<dyn LogDrive>) -> Self {
             let resolver = Arc::new(Resolver::default());
             let first = LogletId::new("route-first").expect("id");
             let second = LogletId::new("route-second").expect("id");
-            for id in [&first, &second] {
-                resolver.insert(
-                    id.clone(),
-                    Arc::new(
-                        AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                            .build()
-                            .expect("log"),
-                    ),
-                );
-            }
+            resolver.insert(
+                first.clone(),
+                Arc::new(AtomicLog::builder(first_drive, 0).build().expect("log")),
+            );
+            resolver.insert(
+                second.clone(),
+                Arc::new(
+                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                        .build()
+                        .expect("log"),
+                ),
+            );
             Self {
                 register: Arc::new(InMemoryConditionalRegister::new()),
                 resolver,
@@ -258,6 +267,62 @@ mod tests {
                 Arc::clone(&self.register),
                 Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
             )
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("injected durable-then-error")]
+    struct InjectedFailure;
+
+    #[derive(Debug, Default)]
+    struct FailAfterWriteDrive {
+        model: std::sync::Mutex<ReferenceLogDrive>,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailAfterWriteDrive {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl LogDrive for FailAfterWriteDrive {
+        fn write(&self, address: Address, value: bytes::Bytes) -> DriveFuture<'_, ()> {
+            Box::pin(async move {
+                self.model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .write(address, value)?;
+                if self.armed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(DriveError::backend(InjectedFailure));
+                }
+                Ok(())
+            })
+        }
+
+        fn read(&self, address: Address) -> DriveFuture<'_, Option<bytes::Bytes>> {
+            Box::pin(async move {
+                Ok(self
+                    .model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .read(address)
+                    .cloned())
+            })
+        }
+
+        fn weak_tail(&self, k: u64) -> DriveFuture<'_, TailDescription> {
+            Box::pin(async move {
+                Ok(self
+                    .model
+                    .lock()
+                    .map_err(|_| DriveError::backend(InjectedFailure))?
+                    .weak_tail(k)?)
+            })
         }
     }
 
@@ -499,6 +564,96 @@ mod tests {
             )
             .await
             .expect("draining"),
+            CanonRoute::Recovering { canon_revision: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn poisoned_canon_owner_resolves_recovering() {
+        let drive = FailAfterWriteDrive::new();
+        let harness = Harness::with_first_drive(Arc::clone(&drive) as Arc<dyn LogDrive>);
+        harness
+            .virtual_log()
+            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
+            .await
+            .expect("bootstrap");
+        let recovered = recover_canon_owner(
+            request(owner_a()),
+            harness.virtual_log(),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+        )
+        .await
+        .expect("recover");
+        let mut service = ChunkJournalService::new();
+        service.register_canon_owner(recovered).expect("register");
+        drive.arm();
+        let pending = service
+            .submit(
+                journal(),
+                Submission {
+                    producer_id: ProducerId::from_bytes(*b"route-producer!!"),
+                    producer_epoch: 0,
+                    sequence: 0,
+                    records: vec![Record::new([], bytes::Bytes::from_static(b"poison"))],
+                },
+            )
+            .await
+            .expect("admit");
+        let _ = service.flush(journal()).await;
+        let _ = pending.await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.health(journal()).expect("health").status,
+            OwnerStatus::Poisoned
+        );
+        assert!(matches!(
+            resolve_canon_route(
+                &harness.virtual_log(),
+                &service,
+                journal(),
+                line(),
+                owner_a(),
+            )
+            .await
+            .expect("poisoned"),
+            CanonRoute::Recovering { canon_revision: 0 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn finished_canon_owner_resolves_recovering() {
+        let harness = Harness::memory();
+        harness
+            .virtual_log()
+            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
+            .await
+            .expect("bootstrap");
+        let recovered = recover_canon_owner(
+            request(owner_a()),
+            harness.virtual_log(),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+        )
+        .await
+        .expect("recover");
+        let mut service = ChunkJournalService::new();
+        service.register_canon_owner(recovered).expect("register");
+        service.stop_owner(journal()).await.expect("stop");
+        assert_eq!(
+            service.health(journal()).expect("health").status,
+            OwnerStatus::TaskFinished
+        );
+        assert!(matches!(
+            resolve_canon_route(
+                &harness.virtual_log(),
+                &service,
+                journal(),
+                line(),
+                owner_a(),
+            )
+            .await
+            .expect("finished"),
             CanonRoute::Recovering { canon_revision: 0 }
         ));
     }
