@@ -12,10 +12,10 @@ bytes.workspace = true
 holylog.workspace = true
 scripture = { path = "../scripture" }
 scripture-service = { path = "../scripture-service" }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
 
 [dev-dependencies]
-thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

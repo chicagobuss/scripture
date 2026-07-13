@@ -5,8 +5,16 @@
 //! - [`serve_chunk_raw_lines_connection`] — Phase 1 lab [`ChunkJournalService`]
 //! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`VerseRuntime`]
 //!
+//! Fleet-lab composition lives in [`fleet_lab`].
+//!
 //! New durable work targets the Canon-gated path. Lab helpers remain for local
 //! composition tests until a separate removal review.
+
+mod fleet_lab;
+
+pub use fleet_lab::{
+    FleetLabResolver, NodeIdentity, SupervisorError, VerseControlOutcome, VerseNodeSupervisor,
+};
 
 use std::collections::BTreeMap;
 use std::io;
