@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use holylog::remote_sequencer::SequencerEpoch;
 use holylog::virtual_log::{
     ApplicationFence, VersionedState, VirtualLog, VirtualLogError, VirtualLogState,
 };
@@ -15,12 +16,14 @@ use holylog::virtual_log::{
 use crate::model::JournalId;
 
 const MAGIC: &[u8; 4] = b"SCNF";
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION_LEGACY: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const UNOWNED: u8 = 0;
 const OWNED: u8 = 1;
 const MAX_ENDPOINT_BYTES: usize = 1024;
 const FIXED_PREFIX_BYTES: usize = 4 + 1 + 8 + 16 + 16 + 1;
-const OWNED_FIXED_BYTES: usize = 16 + 2;
+const OWNED_OWNER_FIXED_BYTES: usize = 16 + 2;
+const OWNED_SEQUENCER_FIXED_BYTES: usize = 16 + 2;
 
 /// Stable identity of a physical ordered Scripture Verse (append lane).
 ///
@@ -113,6 +116,15 @@ impl OwnerEndpoint {
     }
 }
 
+/// Remote sequencer binding carried by a v2 Owned Canon fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSequencerBinding {
+    /// Activation epoch that must match a locally held remote sequencer.
+    pub epoch: SequencerEpoch,
+    /// Advisory endpoint for the epoch-fenced remote sequencer.
+    pub sequencer_endpoint: OwnerEndpoint,
+}
+
 /// Owner state encoded inside a Canon fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonOwner {
@@ -124,6 +136,8 @@ pub enum CanonOwner {
         owner_id: OwnerId,
         /// Advisory endpoint clients may try after validating this revision.
         endpoint: OwnerEndpoint,
+        /// `None` = legacy v1; `Some` = v2 remote sequencer fence.
+        sequencer: Option<OwnedSequencerBinding>,
     },
 }
 
@@ -159,35 +173,67 @@ impl CanonFence {
         }
     }
 
+    /// Returns true when this fence authorizes remote sequencer activation (v2 Owned).
+    #[must_use]
+    pub fn allows_remote_sequencer(&self) -> bool {
+        matches!(
+            &self.owner,
+            CanonOwner::Owned {
+                sequencer: Some(_),
+                ..
+            }
+        )
+    }
+
     /// Returns canonical bytes suitable for Holylog's opaque application fence.
     #[must_use]
     pub fn encode(&self) -> ApplicationFence {
-        let endpoint_len = match &self.owner {
-            CanonOwner::Unowned => 0,
-            CanonOwner::Owned { endpoint, .. } => endpoint.as_str().len(),
+        let (format_version, owned_tail_len) = match &self.owner {
+            // Unowned payload is identical across versions; publish as v2 so new
+            // writers speak one format. Legacy decoders still accept v1 bytes.
+            CanonOwner::Unowned => (FORMAT_VERSION, 0),
+            CanonOwner::Owned {
+                endpoint,
+                sequencer,
+                ..
+            } => {
+                let endpoint_len = endpoint.as_str().len();
+                let tail = OWNED_OWNER_FIXED_BYTES + endpoint_len;
+                match sequencer {
+                    None => (FORMAT_VERSION_LEGACY, tail),
+                    Some(binding) => (
+                        FORMAT_VERSION,
+                        tail + OWNED_SEQUENCER_FIXED_BYTES
+                            + binding.sequencer_endpoint.as_str().len(),
+                    ),
+                }
+            }
         };
-        let mut encoded = Vec::with_capacity(
-            FIXED_PREFIX_BYTES
-                + if endpoint_len == 0 {
-                    0
-                } else {
-                    OWNED_FIXED_BYTES + endpoint_len
-                },
-        );
+        let mut encoded = Vec::with_capacity(FIXED_PREFIX_BYTES + owned_tail_len);
         encoded.extend_from_slice(MAGIC);
-        encoded.push(FORMAT_VERSION);
+        encoded.push(format_version);
         encoded.extend_from_slice(&self.revision.to_be_bytes());
         encoded.extend_from_slice(&self.journal_id.as_bytes());
         encoded.extend_from_slice(&self.verse_id.as_bytes());
         match &self.owner {
             CanonOwner::Unowned => encoded.push(UNOWNED),
-            CanonOwner::Owned { owner_id, endpoint } => {
+            CanonOwner::Owned {
+                owner_id,
+                endpoint,
+                sequencer,
+            } => {
                 encoded.push(OWNED);
                 encoded.extend_from_slice(&owner_id.as_bytes());
                 // OwnerEndpoint enforces a maximum far below u16::MAX.
                 let length = endpoint.as_str().len() as u16;
                 encoded.extend_from_slice(&length.to_be_bytes());
                 encoded.extend_from_slice(endpoint.as_str().as_bytes());
+                if let Some(binding) = sequencer {
+                    encoded.extend_from_slice(&binding.epoch.as_bytes());
+                    let sequencer_len = binding.sequencer_endpoint.as_str().len() as u16;
+                    encoded.extend_from_slice(&sequencer_len.to_be_bytes());
+                    encoded.extend_from_slice(binding.sequencer_endpoint.as_str().as_bytes());
+                }
             }
         }
         ApplicationFence::new(encoded)
@@ -201,22 +247,40 @@ impl CanonFence {
             return Err(CanonFenceError::BadMagic);
         }
         let version = cursor.byte()?;
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION_LEGACY && version != FORMAT_VERSION {
             return Err(CanonFenceError::UnsupportedVersion { version });
         }
         let revision = u64::from_be_bytes(cursor.array()?);
         let journal_id = JournalId::from_bytes(cursor.array()?);
         let verse_id = VerseId::from_bytes(cursor.array()?);
         let owner = match cursor.byte()? {
+            // v1 and v2 Unowned carry the same payload (no epoch / sequencer tip).
             UNOWNED => CanonOwner::Unowned,
             OWNED => {
                 let owner_id = OwnerId::from_bytes(cursor.array()?);
                 let endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
                 let endpoint = std::str::from_utf8(cursor.take(endpoint_len)?)
                     .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
+                let sequencer = if version == FORMAT_VERSION {
+                    let epoch = SequencerEpoch::from_bytes(cursor.array()?);
+                    let sequencer_endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
+                    let sequencer_endpoint =
+                        std::str::from_utf8(cursor.take(sequencer_endpoint_len)?)
+                            .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
+                    Some(OwnedSequencerBinding {
+                        epoch,
+                        sequencer_endpoint: OwnerEndpoint::new(sequencer_endpoint)?,
+                    })
+                } else {
+                    if !cursor.is_at_end() {
+                        return Err(CanonFenceError::TrailingBytes);
+                    }
+                    None
+                };
                 CanonOwner::Owned {
                     owner_id,
                     endpoint: OwnerEndpoint::new(endpoint)?,
+                    sequencer,
                 }
             }
             tag => return Err(CanonFenceError::UnknownOwnerTag { tag }),

@@ -18,8 +18,8 @@ pub mod trace;
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
 pub use canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, CanonFence, CanonFenceError, CanonOwner,
-    OwnerEndpoint, OwnerId, VerseId, WitnessedCanonAuthority, observe_canon_authority,
-    observe_canon_authority_witnessed,
+    OwnedSequencerBinding, OwnerEndpoint, OwnerId, VerseId, WitnessedCanonAuthority,
+    observe_canon_authority, observe_canon_authority_witnessed,
 };
 pub use chunk::{
     Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,
@@ -38,6 +38,7 @@ pub use driver::{
     AckLevel, ChunkDriverActor, ChunkDriverHandle, ChunkPolicy, DriverError, DriverMetrics,
     PolicyError, Receipt, ReceiptFuture, Submission,
 };
+pub use holylog::remote_sequencer::SequencerEpoch;
 pub use journal::{
     AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError,
     RetentionAuthority, TrimGap, WriteError,

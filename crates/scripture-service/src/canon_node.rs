@@ -159,15 +159,15 @@ impl CanonNode {
                     canon_revision: fence.revision,
                 },
             }),
-            CanonOwner::Owned { owner_id, endpoint } if *owner_id != config.owner_id => {
-                Ok(CanonNodeStart::Standby {
-                    route: CanonStandbyRoute::NotOwner {
-                        canon_revision: fence.revision,
-                        owner_id: *owner_id,
-                        endpoint: endpoint.clone(),
-                    },
-                })
-            }
+            CanonOwner::Owned {
+                owner_id, endpoint, ..
+            } if *owner_id != config.owner_id => Ok(CanonNodeStart::Standby {
+                route: CanonStandbyRoute::NotOwner {
+                    canon_revision: fence.revision,
+                    owner_id: *owner_id,
+                    endpoint: endpoint.clone(),
+                },
+            }),
             CanonOwner::Owned { .. } => {
                 let recovered =
                     recover_canon_owner(config.owner_request(), virtual_log.clone(), clock, timer)
@@ -276,8 +276,9 @@ mod tests {
         LogletResolver, RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, OwnerEndpoint,
-        OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock, VerseId, WriterId,
+        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId,
+        OwnedSequencerBinding, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
+        SequencerEpoch, Submission, SystemClock, VerseId, WriterId,
     };
 
     use super::{
@@ -325,13 +326,18 @@ mod tests {
     }
 
     fn fence(revision: u64, owner: OwnerId) -> CanonFence {
+        let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
         CanonFence::new(
             revision,
             journal(),
             verse(),
             CanonOwner::Owned {
                 owner_id: owner,
-                endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                endpoint: endpoint.clone(),
+                sequencer: Some(OwnedSequencerBinding {
+                    epoch: SequencerEpoch::test(revision),
+                    sequencer_endpoint: endpoint,
+                }),
             },
         )
     }
@@ -574,6 +580,11 @@ mod tests {
                     CanonOwner::Owned {
                         owner_id: owner_a(),
                         endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                        sequencer: Some(OwnedSequencerBinding {
+                            epoch: SequencerEpoch::test(0),
+                            sequencer_endpoint: OwnerEndpoint::new("tcp://owner.local:9000")
+                                .expect("endpoint"),
+                        }),
                     },
                 )
                 .encode(),

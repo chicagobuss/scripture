@@ -23,12 +23,26 @@ use holylog::virtual_log::{
     ConditionalRegister, GenerationDescriptor, LogletId, LogletResolver, Reconfiguration,
     ResolveFuture, VirtualLog, VirtualLogError,
 };
-use scripture::{CanonFence, CanonFenceError, CanonOwner, Clock, OwnerEndpoint, OwnerId, Timer};
+use scripture::{
+    CanonFence, CanonFenceError, CanonOwner, Clock, OwnedSequencerBinding, OwnerEndpoint, OwnerId,
+    SequencerEpoch, Timer,
+};
 use scripture_service::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeStart, VerseHandoffRequest, VerseKey,
     VerseRuntime, VerseRuntimeConfig, VerseRuntimeStartError,
 };
 use tokio::sync::Mutex;
+
+fn owned_with_sequencer(owner_id: OwnerId, endpoint: OwnerEndpoint, revision: u64) -> CanonOwner {
+    CanonOwner::Owned {
+        owner_id,
+        endpoint: endpoint.clone(),
+        sequencer: Some(OwnedSequencerBinding {
+            epoch: SequencerEpoch::test(revision),
+            sequencer_endpoint: endpoint,
+        }),
+    }
+}
 
 /// Stable identity of one Scripture node process in the fleet lab.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -342,10 +356,7 @@ impl VerseNodeSupervisor {
             0,
             self.config.journal_id,
             self.config.verse_id,
-            CanonOwner::Owned {
-                owner_id: self.identity.owner_id,
-                endpoint: self.identity.endpoint.clone(),
-            },
+            owned_with_sequencer(self.identity.owner_id, self.identity.endpoint.clone(), 0),
         );
         self.virtual_log()
             .bootstrap_with_application_fence(loglet_id, fence.encode())
@@ -572,10 +583,11 @@ impl VerseNodeSupervisor {
             next_revision,
             self.config.journal_id,
             self.config.verse_id,
-            CanonOwner::Owned {
-                owner_id: self.identity.owner_id,
-                endpoint: self.identity.endpoint.clone(),
-            },
+            owned_with_sequencer(
+                self.identity.owner_id,
+                self.identity.endpoint.clone(),
+                next_revision,
+            ),
         );
         let outcome = self
             .virtual_log()

@@ -14,9 +14,9 @@ use holylog::virtual_log::{
 };
 use scripture::{
     AttributeValue, CanonAuthorityError, CanonFence, CanonOwner, ChunkHeader, ChunkId,
-    ChunkLogError, ChunkLogWriter, CohortId, Frame, JournalId, OwnerEndpoint, OwnerId, ProducerId,
-    Record, RecordOffset, RecoveryBound, SubmissionRef, VerseId, WriterId, observe_canon_authority,
-    seal_single_frame_chunk,
+    ChunkLogError, ChunkLogWriter, CohortId, Frame, JournalId, OwnedSequencerBinding,
+    OwnerEndpoint, OwnerId, ProducerId, Record, RecordOffset, RecoveryBound, SequencerEpoch,
+    SubmissionRef, VerseId, WriterId, observe_canon_authority, seal_single_frame_chunk,
 };
 
 fn journal() -> JournalId {
@@ -257,11 +257,16 @@ fn fence(revision: u64, owner: CanonOwner) -> CanonFence {
 }
 
 fn owned(revision: u64) -> CanonFence {
+    let endpoint = OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");
     fence(
         revision,
         CanonOwner::Owned {
             owner_id: owner_id(),
-            endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+            endpoint: endpoint.clone(),
+            sequencer: Some(OwnedSequencerBinding {
+                epoch: SequencerEpoch::test(revision),
+                sequencer_endpoint: endpoint,
+            }),
         },
     )
 }
