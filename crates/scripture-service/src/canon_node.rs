@@ -224,6 +224,19 @@ impl CanonNode {
     pub async fn flush(&self) -> Result<(), ChunkServiceError> {
         self.service.flush(self.journal_id).await
     }
+
+    /// Consumes a serving node so a Line runtime can run a fenced handoff.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (JournalId, LineId, OwnerId, VirtualLog, ChunkJournalService) {
+        (
+            self.journal_id,
+            self.line_id,
+            self.owner_id,
+            self.virtual_log,
+            self.service,
+        )
+    }
 }
 
 /// Failures that refuse to invent a serving or silent standby node.
