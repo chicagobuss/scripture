@@ -1,117 +1,117 @@
-//! Multi-Line Scripture node shell over independent [`LineRuntime`]s.
+//! Multi-Verse Scripture node shell over independent [`VerseRuntime`]s.
 //!
-//! Starts every configured Line independently and reports per-line outcomes.
+//! Starts every configured Verse independently and reports per-line outcomes.
 //! Does not invent discovery, polling, peer RPC, or a configuration store.
 
 use std::collections::BTreeMap;
 
 use holylog::virtual_log::VirtualLog;
-use scripture::{Clock, JournalId, LineId, ReceiptFuture, Submission, Timer};
+use scripture::{Clock, JournalId, ReceiptFuture, Submission, Timer, VerseId};
 
 use crate::canon_route::{CanonRoute, CanonRouteError};
 use crate::canon_transition::CanonTransitionOutcome;
-use crate::line_runtime::{
-    LineAdmitError, LineHandoffError, LineHandoffRequest, LineRuntime, LineRuntimeConfig,
-    LineRuntimeStartError,
+use crate::verse_runtime::{
+    VerseAdmitError, VerseHandoffError, VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig,
+    VerseRuntimeStartError,
 };
 
-/// Stable key for one configured Line inside a Scripture node.
+/// Stable key for one configured Verse inside a Scripture node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LineKey {
+pub struct VerseKey {
     /// Logical Scripture journal.
     pub journal_id: JournalId,
-    /// Physical Line.
-    pub line_id: LineId,
+    /// Physical Verse.
+    pub verse_id: VerseId,
 }
 
-impl LineKey {
-    /// Builds a key from journal and Line identities.
+impl VerseKey {
+    /// Builds a key from journal and Verse identities.
     #[must_use]
-    pub const fn new(journal_id: JournalId, line_id: LineId) -> Self {
+    pub const fn new(journal_id: JournalId, verse_id: VerseId) -> Self {
         Self {
             journal_id,
-            line_id,
+            verse_id,
         }
     }
 
-    pub fn from_config(config: &LineRuntimeConfig) -> Self {
-        Self::new(config.journal_id, config.line_id)
+    pub fn from_config(config: &VerseRuntimeConfig) -> Self {
+        Self::new(config.journal_id, config.verse_id)
     }
 }
 
-/// Aggregate result of starting every configured Line.
+/// Aggregate result of starting every configured Verse.
 #[derive(Debug)]
 pub struct ScriptureNodeStart {
     /// Successful runtimes keyed by journal/line.
-    pub runtimes: BTreeMap<LineKey, LineRuntime>,
+    pub runtimes: BTreeMap<VerseKey, VerseRuntime>,
     /// Per-line failures that did not produce a runtime.
-    pub failures: BTreeMap<LineKey, LineRuntimeStartError>,
+    pub failures: BTreeMap<VerseKey, VerseRuntimeStartError>,
 }
 
 impl ScriptureNodeStart {
-    /// True when every configured Line produced a runtime.
+    /// True when every configured Verse produced a runtime.
     #[must_use]
     pub fn all_started(&self) -> bool {
         self.failures.is_empty()
     }
 }
 
-/// Failures that refuse to begin any Line startup.
+/// Failures that refuse to begin any Verse startup.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScriptureNodeConfigError {
     /// Duplicate journal/line keys in the configuration list.
-    #[error("duplicate Line configuration for journal/line key")]
-    DuplicateLine {
+    #[error("duplicate Verse configuration for journal/line key")]
+    DuplicateVerse {
         /// Conflicting key.
-        key: LineKey,
+        key: VerseKey,
     },
 }
 
 /// Lookups and admission against a started Scripture node.
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptureNodeError {
-    /// Requested Line was not among the started runtimes.
-    #[error("no started Line runtime for the requested journal/line")]
-    UnknownLine {
+    /// Requested Verse was not among the started runtimes.
+    #[error("no started Verse runtime for the requested journal/line")]
+    UnknownVerse {
         /// Missing key.
-        key: LineKey,
+        key: VerseKey,
     },
     /// Route resolution failed.
     #[error(transparent)]
     Route(#[from] CanonRouteError),
     /// Admission failed.
     #[error(transparent)]
-    Admit(#[from] LineAdmitError),
+    Admit(#[from] VerseAdmitError),
 }
 
 /// Handoff failures at the node shell boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptureNodeHandoffError {
-    /// Requested Line was not among the started runtimes.
-    #[error("no started Line runtime for the requested journal/line")]
-    UnknownLine {
+    /// Requested Verse was not among the started runtimes.
+    #[error("no started Verse runtime for the requested journal/line")]
+    UnknownVerse {
         /// Missing key.
-        key: LineKey,
+        key: VerseKey,
     },
     /// Handoff failure. The runtime remains in the node unchanged for a
     /// precondition error and terminal/non-serving after ownership was taken.
     #[error(transparent)]
-    Handoff(#[from] LineHandoffError),
+    Handoff(#[from] VerseHandoffError),
 }
 
-/// Collection of independent Line runtimes owned by one Scripture process.
+/// Collection of independent Verse runtimes owned by one Scripture process.
 pub struct ScriptureNode {
-    lines: BTreeMap<LineKey, LineRuntime>,
+    verses: BTreeMap<VerseKey, VerseRuntime>,
 }
 
 impl ScriptureNode {
-    /// Starts every Line independently after rejecting duplicate keys.
+    /// Starts every Verse independently after rejecting duplicate keys.
     ///
-    /// `virtual_log_for` must return the VirtualLog bound to that Line's
-    /// ConditionalRegister. One bad Line does not invent a serving state for
+    /// `virtual_log_for` must return the VirtualLog bound to that Verse's
+    /// ConditionalRegister. One bad Verse does not invent a serving state for
     /// another; failures are reported alongside successes.
     pub async fn start<C, T, F>(
-        configs: Vec<LineRuntimeConfig>,
+        configs: Vec<VerseRuntimeConfig>,
         mut virtual_log_for: F,
         clock: C,
         timer: T,
@@ -119,22 +119,22 @@ impl ScriptureNode {
     where
         C: Clock + Clone + Send + 'static,
         T: Timer + Clone + Send + 'static,
-        F: FnMut(&LineRuntimeConfig) -> VirtualLog,
+        F: FnMut(&VerseRuntimeConfig) -> VirtualLog,
     {
-        let mut seen = BTreeMap::<LineKey, ()>::new();
+        let mut seen = BTreeMap::<VerseKey, ()>::new();
         for config in &configs {
-            let key = LineKey::from_config(config);
+            let key = VerseKey::from_config(config);
             if seen.insert(key, ()).is_some() {
-                return Err(ScriptureNodeConfigError::DuplicateLine { key });
+                return Err(ScriptureNodeConfigError::DuplicateVerse { key });
             }
         }
 
         let mut runtimes = BTreeMap::new();
         let mut failures = BTreeMap::new();
         for config in configs {
-            let key = LineKey::from_config(&config);
+            let key = VerseKey::from_config(&config);
             let virtual_log = virtual_log_for(&config);
-            match LineRuntime::start(config, virtual_log, clock.clone(), timer.clone()).await {
+            match VerseRuntime::start(config, virtual_log, clock.clone(), timer.clone()).await {
                 Ok(runtime) => {
                     runtimes.insert(key, runtime);
                 }
@@ -148,70 +148,71 @@ impl ScriptureNode {
 
     /// Builds a node from an already-partitioned start report's successes.
     #[must_use]
-    pub fn from_started(runtimes: BTreeMap<LineKey, LineRuntime>) -> Self {
-        Self { lines: runtimes }
+    pub fn from_started(runtimes: BTreeMap<VerseKey, VerseRuntime>) -> Self {
+        Self { verses: runtimes }
     }
 
-    /// Number of started Line runtimes.
+    /// Number of started Verse runtimes.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lines.len()
+        self.verses.len()
     }
 
-    /// True when no Line runtimes are present.
+    /// True when no Verse runtimes are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.verses.is_empty()
     }
 
-    /// Borrow one started Line runtime.
-    pub fn line(&self, key: LineKey) -> Result<&LineRuntime, ScriptureNodeError> {
-        self.lines
+    /// Borrow one started Verse runtime.
+    pub fn verse(&self, key: VerseKey) -> Result<&VerseRuntime, ScriptureNodeError> {
+        self.verses
             .get(&key)
-            .ok_or(ScriptureNodeError::UnknownLine { key })
+            .ok_or(ScriptureNodeError::UnknownVerse { key })
     }
 
-    /// Fresh route resolution for one configured Line.
-    pub async fn resolve_route(&self, key: LineKey) -> Result<CanonRoute, ScriptureNodeError> {
-        Ok(self.line(key)?.resolve_route().await?)
+    /// Fresh route resolution for one configured Verse.
+    pub async fn resolve_route(&self, key: VerseKey) -> Result<CanonRoute, ScriptureNodeError> {
+        Ok(self.verse(key)?.resolve_route().await?)
     }
 
-    /// Admit work only to a locally serving Line.
+    /// Admit work only to a locally serving Verse.
     pub async fn submit(
         &self,
-        key: LineKey,
+        key: VerseKey,
         submission: Submission,
     ) -> Result<ReceiptFuture, ScriptureNodeError> {
-        Ok(self.line(key)?.submit(submission).await?)
+        Ok(self.verse(key)?.submit(submission).await?)
     }
 
-    /// Flush one locally serving Line.
-    pub async fn flush(&self, key: LineKey) -> Result<(), ScriptureNodeError> {
-        Ok(self.line(key)?.flush().await?)
+    /// Flush one locally serving Verse.
+    pub async fn flush(&self, key: VerseKey) -> Result<(), ScriptureNodeError> {
+        Ok(self.verse(key)?.flush().await?)
     }
 
-    /// Consuming handoff for one serving Line.
+    /// Consuming handoff for one serving Verse.
     ///
-    /// On success or post-take failure the Line remains in the node as a
+    /// On success or post-take failure the Verse remains in the node as a
     /// terminal runtime. Pre-drain rejects restore the prior runtime and
     /// return [`ScriptureNodeHandoffError::Handoff`].
     pub async fn drain_seal_publish(
         &mut self,
-        key: LineKey,
-        request: LineHandoffRequest,
+        key: VerseKey,
+        request: VerseHandoffRequest,
     ) -> Result<CanonTransitionOutcome, ScriptureNodeHandoffError> {
         let runtime = self
-            .lines
+            .verses
             .remove(&key)
-            .ok_or(ScriptureNodeHandoffError::UnknownLine { key })?;
+            .ok_or(ScriptureNodeHandoffError::UnknownVerse { key })?;
         match runtime.drain_seal_publish(request).await {
             Ok((runtime, outcome)) => {
-                self.lines.insert(key, runtime);
+                self.verses.insert(key, runtime);
                 Ok(outcome)
             }
             Err(reject) => {
-                let restored = LineKey::new(reject.runtime.journal_id(), reject.runtime.line_id());
-                self.lines.insert(restored, reject.runtime);
+                let restored =
+                    VerseKey::new(reject.runtime.journal_id(), reject.runtime.verse_id());
+                self.verses.insert(restored, reject.runtime);
                 Err(ScriptureNodeHandoffError::Handoff(reject.error))
             }
         }
@@ -222,7 +223,7 @@ impl std::fmt::Debug for ScriptureNode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ScriptureNode")
-            .field("lines", &self.lines.len())
+            .field("verses", &self.verses.len())
             .finish_non_exhaustive()
     }
 }
@@ -240,13 +241,13 @@ mod tests {
         VirtualLog,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint, OwnerId,
-        RecoveryBound, SystemClock, WriterId,
+        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
+        RecoveryBound, SystemClock, VerseId, WriterId,
     };
 
-    use super::{LineKey, ScriptureNode, ScriptureNodeConfigError};
+    use super::{ScriptureNode, ScriptureNodeConfigError, VerseKey};
     use crate::canon_route::CanonRoute;
-    use crate::line_runtime::LineRuntimeConfig;
+    use crate::verse_runtime::VerseRuntimeConfig;
 
     fn journal_a() -> JournalId {
         JournalId::from_bytes(*b"node-journal-a!!")
@@ -256,12 +257,12 @@ mod tests {
         JournalId::from_bytes(*b"node-journal-b!!")
     }
 
-    fn line_a() -> LineId {
-        LineId::from_bytes(*b"node-line-a!!!!!")
+    fn verse_a() -> VerseId {
+        VerseId::from_bytes(*b"node-line-a!!!!!")
     }
 
-    fn line_b() -> LineId {
-        LineId::from_bytes(*b"node-line-b!!!!!")
+    fn verse_b() -> VerseId {
+        VerseId::from_bytes(*b"node-line-b!!!!!")
     }
 
     fn owner() -> OwnerId {
@@ -272,10 +273,10 @@ mod tests {
         OwnerId::from_bytes(*b"node-shell-othr!")
     }
 
-    fn config(journal: JournalId, line: LineId, owner: OwnerId) -> LineRuntimeConfig {
-        LineRuntimeConfig {
+    fn config(journal: JournalId, verse: VerseId, owner: OwnerId) -> VerseRuntimeConfig {
+        VerseRuntimeConfig {
             journal_id: journal,
-            line_id: line,
+            verse_id: verse,
             owner_id: owner,
             cohort_id: CohortId::from_bytes(*b"node-shell-cohr!"),
             writer_id: WriterId::from_bytes(*b"node-shell-wrtr!"),
@@ -294,7 +295,7 @@ mod tests {
         }
     }
 
-    fn fence(journal: JournalId, line: LineId, revision: u64, owner: OwnerId) -> CanonFence {
+    fn fence(journal: JournalId, line: VerseId, revision: u64, owner: OwnerId) -> CanonFence {
         CanonFence::new(
             revision,
             journal,
@@ -358,14 +359,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serving_and_standby_lines_are_independent() {
+    async fn serving_and_standby_verses_are_independent() {
         let serve = LineHarness::memory("shell-serve");
         let standby = LineHarness::memory("shell-standby");
         serve
             .virtual_log()
             .bootstrap_with_application_fence(
                 serve.first.clone(),
-                fence(journal_a(), line_a(), 0, owner()).encode(),
+                fence(journal_a(), verse_a(), 0, owner()).encode(),
             )
             .await
             .expect("bootstrap serve");
@@ -373,21 +374,21 @@ mod tests {
             .virtual_log()
             .bootstrap_with_application_fence(
                 standby.first.clone(),
-                fence(journal_b(), line_b(), 0, other()).encode(),
+                fence(journal_b(), verse_b(), 0, other()).encode(),
             )
             .await
             .expect("bootstrap standby");
 
         let logs = BTreeMap::from([
-            (LineKey::new(journal_a(), line_a()), serve.virtual_log()),
-            (LineKey::new(journal_b(), line_b()), standby.virtual_log()),
+            (VerseKey::new(journal_a(), verse_a()), serve.virtual_log()),
+            (VerseKey::new(journal_b(), verse_b()), standby.virtual_log()),
         ]);
         let started = ScriptureNode::start(
             vec![
-                config(journal_a(), line_a(), owner()),
-                config(journal_b(), line_b(), owner()),
+                config(journal_a(), verse_a(), owner()),
+                config(journal_b(), verse_b(), owner()),
             ],
-            |cfg| logs.get(&LineKey::from_config(cfg)).expect("log").clone(),
+            |cfg| logs.get(&VerseKey::from_config(cfg)).expect("log").clone(),
             SystemClock::new(),
             scripture::SystemTimer::new(),
         )
@@ -395,10 +396,10 @@ mod tests {
         .expect("start");
         assert!(started.all_started());
         let node = ScriptureNode::from_started(started.runtimes);
-        let serve_key = LineKey::new(journal_a(), line_a());
-        let standby_key = LineKey::new(journal_b(), line_b());
-        assert!(node.line(serve_key).expect("serve").is_serving());
-        assert!(node.line(standby_key).expect("standby").is_standby());
+        let serve_key = VerseKey::new(journal_a(), verse_a());
+        let standby_key = VerseKey::new(journal_b(), verse_b());
+        assert!(node.verse(serve_key).expect("serve").is_serving());
+        assert!(node.verse(standby_key).expect("standby").is_standby());
         assert!(matches!(
             node.resolve_route(standby_key).await.expect("route"),
             CanonRoute::NotOwner { .. }
@@ -409,8 +410,8 @@ mod tests {
     async fn duplicate_config_rejects_before_any_start() {
         let err = ScriptureNode::start(
             vec![
-                config(journal_a(), line_a(), owner()),
-                config(journal_a(), line_a(), owner()),
+                config(journal_a(), verse_a(), owner()),
+                config(journal_a(), verse_a(), owner()),
             ],
             |_| panic!("virtual_log_for must not run on duplicate config"),
             SystemClock::new(),
@@ -420,33 +421,33 @@ mod tests {
         .expect_err("duplicate");
         assert!(matches!(
             err,
-            ScriptureNodeConfigError::DuplicateLine { key }
-            if key == LineKey::new(journal_a(), line_a())
+            ScriptureNodeConfigError::DuplicateVerse { key }
+            if key == VerseKey::new(journal_a(), verse_a())
         ));
     }
 
     #[tokio::test]
-    async fn bad_line_reports_failure_while_valid_line_starts() {
+    async fn bad_verse_reports_failure_while_valid_verse_starts() {
         let good = LineHarness::memory("shell-good");
         good.virtual_log()
             .bootstrap_with_application_fence(
                 good.first.clone(),
-                fence(journal_a(), line_a(), 0, owner()).encode(),
+                fence(journal_a(), verse_a(), 0, owner()).encode(),
             )
             .await
             .expect("bootstrap");
         let bad = LineHarness::memory("shell-bad");
         // Uninitialized register ⇒ typed startup error.
         let logs = BTreeMap::from([
-            (LineKey::new(journal_a(), line_a()), good.virtual_log()),
-            (LineKey::new(journal_b(), line_b()), bad.virtual_log()),
+            (VerseKey::new(journal_a(), verse_a()), good.virtual_log()),
+            (VerseKey::new(journal_b(), verse_b()), bad.virtual_log()),
         ]);
         let started = ScriptureNode::start(
             vec![
-                config(journal_a(), line_a(), owner()),
-                config(journal_b(), line_b(), owner()),
+                config(journal_a(), verse_a(), owner()),
+                config(journal_b(), verse_b(), owner()),
             ],
-            |cfg| logs.get(&LineKey::from_config(cfg)).expect("log").clone(),
+            |cfg| logs.get(&VerseKey::from_config(cfg)).expect("log").clone(),
             SystemClock::new(),
             scripture::SystemTimer::new(),
         )
@@ -457,14 +458,14 @@ mod tests {
         assert!(
             started
                 .runtimes
-                .get(&LineKey::new(journal_a(), line_a()))
+                .get(&VerseKey::new(journal_a(), verse_a()))
                 .expect("good")
                 .is_serving()
         );
         assert!(
             started
                 .failures
-                .contains_key(&LineKey::new(journal_b(), line_b()))
+                .contains_key(&VerseKey::new(journal_b(), verse_b()))
         );
     }
 }

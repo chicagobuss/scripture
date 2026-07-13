@@ -10,7 +10,7 @@ use holylog::atomic::{AtomicLog, AtomicLogError, SealStatus};
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 
 use crate::canon::{
-    CanonAuthorityError, CanonAuthoritySnapshot, LineId, OwnerId, observe_canon_authority,
+    CanonAuthorityError, CanonAuthoritySnapshot, OwnerId, VerseId, observe_canon_authority,
 };
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
 use crate::model::{JournalId, RecordOffset};
@@ -44,7 +44,7 @@ impl RecoveryBound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkAppendAck {
     /// Holylog position that contains the chunk: a local AtomicLog address for
-    /// Phase 1, or a global VirtualLog position for a fenced Canon Line.
+    /// Phase 1, or a global VirtualLog position for a fenced Canon Verse.
     pub slot: u64,
     /// Stable identifier of the committed immutable bytes.
     pub chunk_id: ChunkId,
@@ -213,7 +213,7 @@ pub struct ChunkLogWriter {
 ///
 /// The Atomic variant is retained for the Phase 1 local-owner laboratory. The
 /// Virtual variant routes through the Conflux generation chain and receives a
-/// seal fence whenever a Canon cutover has replaced its Line.
+/// seal fence whenever a Canon cutover has replaced its Verse.
 #[derive(Debug)]
 enum ChunkLog {
     Atomic(AtomicLog),
@@ -406,13 +406,13 @@ impl ChunkLogWriter {
     pub async fn recover_virtual(
         journal_id: JournalId,
         cohort_id: CohortId,
-        expected_line_id: LineId,
+        expected_verse_id: VerseId,
         expected_owner_id: OwnerId,
         log: VirtualLog,
         bound: RecoveryBound,
     ) -> Result<VirtualChunkLogRecovery, ChunkLogError> {
         let authority =
-            observe_canon_authority(&log, journal_id, expected_line_id, expected_owner_id).await?;
+            observe_canon_authority(&log, journal_id, expected_verse_id, expected_owner_id).await?;
         let active_revision = authority.revision();
 
         let (writer, chunks) = Self::recover_from_log(

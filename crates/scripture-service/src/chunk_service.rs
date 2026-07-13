@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use scripture::{
     CanonAuthorityError, CanonFence, CanonOwner, ChunkDriverActor, ChunkDriverHandle, Clock,
-    DriverError, JournalId, LineId, OwnerId, ReceiptFuture, Submission, Timer,
+    DriverError, JournalId, OwnerId, ReceiptFuture, Submission, Timer, VerseId,
     WitnessedCanonAuthority,
 };
 use tokio::sync::Mutex;
@@ -141,7 +141,7 @@ pub enum DrainError {
 #[derive(Debug)]
 pub struct DrainedOwner {
     journal_id: JournalId,
-    line_id: LineId,
+    verse_id: VerseId,
     owner_id: OwnerId,
     revision: u64,
 }
@@ -153,10 +153,10 @@ impl DrainedOwner {
         self.journal_id
     }
 
-    /// Physical Line bound at Canon registration.
+    /// Physical Verse bound at Canon registration.
     #[must_use]
-    pub const fn line_id(&self) -> LineId {
-        self.line_id
+    pub const fn verse_id(&self) -> VerseId {
+        self.verse_id
     }
 
     /// Owner identity from the local Canon binding.
@@ -175,13 +175,13 @@ impl DrainedOwner {
     #[cfg(test)]
     pub(crate) const fn for_test(
         journal_id: JournalId,
-        line_id: LineId,
+        verse_id: VerseId,
         owner_id: OwnerId,
         revision: u64,
     ) -> Self {
         Self {
             journal_id,
-            line_id,
+            verse_id,
             owner_id,
             revision,
         }
@@ -210,7 +210,7 @@ impl LocalLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonOwnerBinding {
     journal_id: JournalId,
-    line_id: LineId,
+    verse_id: VerseId,
     owner_id: OwnerId,
     revision: u64,
     fence: CanonFence,
@@ -221,11 +221,11 @@ impl CanonOwnerBinding {
         match &fence.owner {
             CanonOwner::Unowned => Err(CanonAuthorityError::Unowned {
                 revision: fence.revision,
-                line_id: fence.line_id,
+                verse_id: fence.verse_id,
             }),
             CanonOwner::Owned { owner_id, .. } => Ok(Self {
                 journal_id: fence.journal_id,
-                line_id: fence.line_id,
+                verse_id: fence.verse_id,
                 owner_id: *owner_id,
                 revision: fence.revision,
                 fence: fence.clone(),
@@ -437,7 +437,7 @@ impl ChunkJournalService {
 
         if binding.journal_id != journal_id
             || authority.fence().journal_id != journal_id
-            || authority.fence().line_id != binding.line_id
+            || authority.fence().verse_id != binding.verse_id
             || authority.revision() != binding.revision
             || authority.fence() != &binding.fence
         {
@@ -466,14 +466,14 @@ impl ChunkJournalService {
             CanonOwner::Unowned => {
                 return Err(DrainError::Authority(CanonAuthorityError::Unowned {
                     revision: authority.revision(),
-                    line_id: authority.fence().line_id,
+                    verse_id: authority.fence().verse_id,
                 }));
             }
         }
 
         let drained = DrainedOwner {
             journal_id: binding.journal_id,
-            line_id: binding.line_id,
+            verse_id: binding.verse_id,
             owner_id: binding.owner_id,
             revision: binding.revision,
         };
@@ -614,13 +614,13 @@ impl ChunkJournalService {
     /// Read-only check used by Canon route resolution.
     ///
     /// Reports whether a Canon-bound local owner exactly matches the supplied
-    /// journal / Line / owner / revision identity and whether it is Running.
+    /// journal / Verse / owner / revision identity and whether it is Running.
     /// Lab registrations and identity mismatches are [`LocalCanonOwnerMatch::Unavailable`].
     #[must_use]
     pub fn local_canon_owner_match(
         &self,
         journal_id: JournalId,
-        line_id: LineId,
+        verse_id: VerseId,
         owner_id: OwnerId,
         revision: u64,
     ) -> LocalCanonOwnerMatch {
@@ -631,7 +631,7 @@ impl ChunkJournalService {
             return LocalCanonOwnerMatch::Unavailable;
         };
         if binding.journal_id != journal_id
-            || binding.line_id != line_id
+            || binding.verse_id != verse_id
             || binding.owner_id != owner_id
             || binding.revision != revision
         {

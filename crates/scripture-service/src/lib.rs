@@ -5,11 +5,11 @@
 //! which routes Phase 1 [`scripture::ChunkDriverHandle`] owners without
 //! duplicating admission or durability logic.
 //!
-//! Canon-authorized startup uses [`CanonNode::start`] / [`LineRuntime::start`]
+//! Canon-authorized startup uses [`CanonNode::start`] / [`VerseRuntime::start`]
 //! (or [`recover_canon_owner`] then [`ChunkJournalService::register_canon_owner`]).
-//! Operator-directed A→B handoff uses [`LineRuntime::drain_seal_publish`] (or
+//! Operator-directed A→B handoff uses [`VerseRuntime::drain_seal_publish`] (or
 //! [`ChunkJournalService::drain_owner`] then [`publish_canon_transition`]).
-//! Clients discover who may serve a Line via [`resolve_canon_route`].
+//! Clients discover who may serve a Verse via [`resolve_canon_route`].
 //! [`ChunkJournalService::register_owner`] remains a local lab registry only and
 //! cannot drain for Canon publish.
 
@@ -18,9 +18,9 @@ mod canon_owner;
 mod canon_route;
 mod canon_transition;
 mod chunk_service;
-mod line_runtime;
 pub mod reconcile;
 mod scripture_node;
+mod verse_runtime;
 
 pub use canon_node::{
     CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
@@ -37,17 +37,17 @@ pub use chunk_service::{
     ChunkJournalService, ChunkServiceError, DrainError, DrainedOwner, LocalCanonOwnerMatch,
     OwnerHealth, OwnerStatus,
 };
-pub use line_runtime::{
-    LineAdmitError, LineHandoffError, LineHandoffFailure, LineHandoffRequest, LineRuntime,
-    LineRuntimeConfig, LineRuntimeStartError, LineTerminal, LineUnavailable,
-};
 pub use reconcile::{
     OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,
     RecoveryFacts, RecoveryFinding, RecoveryMode, RecoveryPlan, plan as plan_recovery,
 };
 pub use scripture_node::{
-    LineKey, ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError,
-    ScriptureNodeHandoffError, ScriptureNodeStart,
+    ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError, ScriptureNodeHandoffError,
+    ScriptureNodeStart, VerseKey,
+};
+pub use verse_runtime::{
+    VerseAdmitError, VerseHandoffError, VerseHandoffFailure, VerseHandoffRequest, VerseRuntime,
+    VerseRuntimeConfig, VerseRuntimeStartError, VerseTerminal, VerseUnavailable,
 };
 
 use std::future::Future;

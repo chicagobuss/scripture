@@ -14,9 +14,9 @@ use holylog::virtual_log::{
 };
 use scripture::{
     AttributeValue, CanonAuthorityError, CanonFence, CanonOwner, ChunkHeader, ChunkId,
-    ChunkLogError, ChunkLogWriter, CohortId, Frame, JournalId, LineId, OwnerEndpoint, OwnerId,
-    ProducerId, Record, RecordOffset, RecoveryBound, SubmissionRef, WriterId,
-    observe_canon_authority, seal_single_frame_chunk,
+    ChunkLogError, ChunkLogWriter, CohortId, Frame, JournalId, OwnerEndpoint, OwnerId, ProducerId,
+    Record, RecordOffset, RecoveryBound, SubmissionRef, VerseId, WriterId, observe_canon_authority,
+    seal_single_frame_chunk,
 };
 
 fn journal() -> JournalId {
@@ -237,8 +237,8 @@ fn real_atomic_log_append_and_bounded_recovery_preserve_offsets() {
     });
 }
 
-fn line() -> LineId {
-    LineId::from_bytes(*b"canon-line-id!!!")
+fn verse() -> VerseId {
+    VerseId::from_bytes(*b"canon-line-id!!!")
 }
 
 fn owner_id() -> OwnerId {
@@ -246,7 +246,7 @@ fn owner_id() -> OwnerId {
 }
 
 fn fence(revision: u64, owner: CanonOwner) -> CanonFence {
-    CanonFence::new(revision, journal(), line(), owner)
+    CanonFence::new(revision, journal(), verse(), owner)
 }
 
 fn owned(revision: u64) -> CanonFence {
@@ -374,7 +374,7 @@ fn virtual_recovery_rebuilds_suffix_across_canon_cutover() {
         let mut recovery = ChunkLogWriter::recover_virtual(
             journal(),
             cohort(),
-            line(),
+            verse(),
             owner_id(),
             harness.virtual_log(),
             RecoveryBound::new(8).expect("bound"),
@@ -431,7 +431,7 @@ fn virtual_recovery_preserves_mixed_generation_suffix_order() {
         let recovery = ChunkLogWriter::recover_virtual(
             journal(),
             cohort(),
-            line(),
+            verse(),
             owner_id(),
             harness.virtual_log(),
             RecoveryBound::new(8).expect("bound"),
@@ -487,7 +487,7 @@ fn virtual_recovery_rejects_future_chunk_generation() {
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                line(),
+                verse(),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),
@@ -546,7 +546,7 @@ fn virtual_recovery_rejects_generation_regression_in_logical_order() {
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                line(),
+                verse(),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),
@@ -574,7 +574,7 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
             ChunkLogWriter::recover_virtual(
                 JournalId::from_bytes(*b"other-journal-id"),
                 cohort(),
-                line(),
+                verse(),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
@@ -588,21 +588,21 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                LineId::from_bytes(*b"other-line-id!!!"),
+                VerseId::from_bytes(*b"other-line-id!!!"),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
             )
             .await,
             Err(ChunkLogError::Authority(
-                CanonAuthorityError::LineMismatch { .. }
+                CanonAuthorityError::VerseMismatch { .. }
             ))
         ));
         assert!(matches!(
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                line(),
+                verse(),
                 OwnerId::from_bytes(*b"other-owner-id!!"),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
@@ -634,14 +634,14 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
             .await
             .expect("unowned cutover");
         assert!(matches!(
-            observe_canon_authority(&harness.virtual_log(), journal(), line(), owner_id()).await,
+            observe_canon_authority(&harness.virtual_log(), journal(), verse(), owner_id()).await,
             Err(CanonAuthorityError::Unowned { .. })
         ));
         assert!(matches!(
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                line(),
+                verse(),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
@@ -685,7 +685,7 @@ fn virtual_recovery_fails_closed_when_canon_advances_mid_recovery() {
             ChunkLogWriter::recover_virtual(
                 journal(),
                 cohort(),
-                line(),
+                verse(),
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),

@@ -1,14 +1,14 @@
 use holylog::virtual_log::{ApplicationFence, GenerationDescriptor, LogletId, VirtualLogState};
 use scripture::{
-    CanonFence, CanonFenceError, CanonOwner, JournalId, LineId, OwnerEndpoint, OwnerId,
+    CanonFence, CanonFenceError, CanonOwner, JournalId, OwnerEndpoint, OwnerId, VerseId,
 };
 
 fn journal() -> JournalId {
     JournalId::from_bytes(*b"canon-journal-id")
 }
 
-fn line() -> LineId {
-    LineId::from_bytes(*b"canon-line-id!!!")
+fn verse() -> VerseId {
+    VerseId::from_bytes(*b"canon-line-id!!!")
 }
 
 fn owner() -> CanonOwner {
@@ -20,21 +20,48 @@ fn owner() -> CanonOwner {
 
 #[test]
 fn canon_fence_round_trips_to_deterministic_opaque_bytes() {
-    let fence = CanonFence::new(7, journal(), line(), owner());
+    let fence = CanonFence::new(7, journal(), verse(), owner());
     let encoded = fence.encode();
     assert_eq!(encoded, fence.encode());
     assert_eq!(CanonFence::decode(&encoded).expect("decode"), fence);
 }
 
 #[test]
+fn canon_fence_known_bytes_remain_stable_across_verse_rename() {
+    // Golden vector pinned before the Line→Verse source rename. Field order is
+    // positional: magic, version, revision, journal_id, verse_id (former
+    // line_id slot), owner tag, owner_id, endpoint length, endpoint bytes.
+    let fence = CanonFence::new(7, journal(), verse(), owner());
+    let encoded = fence.encode();
+    let bytes = encoded.as_bytes();
+    assert_eq!(&bytes[0..4], b"SCNF");
+    assert_eq!(bytes[4], 1);
+    assert_eq!(&bytes[5..13], &7u64.to_be_bytes());
+    assert_eq!(&bytes[13..29], journal().as_bytes());
+    assert_eq!(&bytes[29..45], verse().as_bytes());
+    assert_eq!(bytes[45], 1); // Owned
+    assert_eq!(
+        &bytes[46..62],
+        OwnerId::from_bytes(*b"canon-owner-id!!").as_bytes()
+    );
+    let endpoint = b"tcp://scripture-a.internal:9000";
+    assert_eq!(
+        u16::from_be_bytes([bytes[62], bytes[63]]) as usize,
+        endpoint.len()
+    );
+    assert_eq!(&bytes[64..64 + endpoint.len()], endpoint);
+    assert_eq!(CanonFence::decode(&encoded).expect("decode"), fence);
+}
+
+#[test]
 fn unowned_is_an_explicit_recovery_or_drain_state() {
-    let fence = CanonFence::new(9, journal(), line(), CanonOwner::Unowned);
+    let fence = CanonFence::new(9, journal(), verse(), CanonOwner::Unowned);
     assert_eq!(CanonFence::decode(&fence.encode()).expect("decode"), fence);
 }
 
 #[test]
 fn canonical_decoder_rejects_bad_magic_truncation_and_trailing_bytes() {
-    let encoded = CanonFence::new(1, journal(), line(), owner()).encode();
+    let encoded = CanonFence::new(1, journal(), verse(), owner()).encode();
 
     let mut bad_magic = encoded.as_bytes().to_vec();
     bad_magic[0] ^= 1;
@@ -64,7 +91,7 @@ fn fence_must_name_the_enclosing_virtual_log_revision() {
             loglet_id: LogletId::new("canon-state-loglet").expect("loglet"),
             start: 0,
         }],
-        application_fence: CanonFence::new(3, journal(), line(), owner()).encode(),
+        application_fence: CanonFence::new(3, journal(), verse(), owner()).encode(),
     };
     assert_eq!(
         CanonFence::from_virtual_log_state(&state),
@@ -139,7 +166,7 @@ fn observe_rejects_malformed_application_fence_bytes() {
             observe_canon_authority(
                 &log,
                 journal(),
-                line(),
+                verse(),
                 OwnerId::from_bytes(*b"canon-owner-id!!")
             )
             .await,
@@ -153,11 +180,11 @@ fn witnessed_authority_rejects_mismatched_fence_and_observation() {
     use holylog::virtual_log::{CompareToken, VersionedState};
     use scripture::{CanonAuthorityError, WitnessedCanonAuthority};
 
-    let observed_fence = CanonFence::new(1, journal(), line(), owner());
+    let observed_fence = CanonFence::new(1, journal(), verse(), owner());
     let claimed_fence = CanonFence::new(
         1,
         journal(),
-        line(),
+        verse(),
         CanonOwner::Owned {
             owner_id: OwnerId::from_bytes(*b"other-owner-id!!"),
             endpoint: OwnerEndpoint::new("tcp://other.internal:9000").expect("endpoint"),

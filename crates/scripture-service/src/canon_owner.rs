@@ -1,6 +1,6 @@
 //! Construct a fenced Canon owner from durable VirtualLog recovery.
 //!
-//! This is the transport-neutral startup primitive for a Scripture Line after a
+//! This is the transport-neutral startup primitive for a Scripture Verse after a
 //! fenced handoff: observe Canon authority, recover a bounded cross-generation
 //! suffix once, then build an unstarted [`ChunkDriverActor`] at the active
 //! Canon revision.
@@ -13,8 +13,8 @@
 use holylog::virtual_log::VirtualLog;
 use scripture::{
     CanonAuthoritySnapshot, ChunkDriverActor, ChunkDriverHandle, ChunkLogError, ChunkLogWriter,
-    ChunkPolicy, Clock, CohortId, DriverError, JournalId, LineId, OwnerId, RecoveredChunk,
-    RecoveryBound, Timer, WriterId,
+    ChunkPolicy, Clock, CohortId, DriverError, JournalId, OwnerId, RecoveredChunk, RecoveryBound,
+    Timer, VerseId, WriterId,
 };
 
 /// Inputs for one Canon-authorized owner construction attempt.
@@ -22,8 +22,8 @@ use scripture::{
 pub struct CanonOwnerRequest {
     /// Logical Scripture journal.
     pub journal_id: JournalId,
-    /// Physical Line being recovered.
-    pub line_id: LineId,
+    /// Physical Verse being recovered.
+    pub verse_id: VerseId,
     /// Owner identity that must match the fresh Canon fence.
     pub owner_id: OwnerId,
     /// Cohort encoded into new chunk headers.
@@ -131,7 +131,7 @@ where
     let recovery = ChunkLogWriter::recover_virtual(
         request.journal_id,
         request.cohort_id,
-        request.line_id,
+        request.verse_id,
         request.owner_id,
         virtual_log,
         request.recovery_bound,
@@ -168,9 +168,9 @@ mod tests {
         RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, LineId,
-        ManualClock, ManualTimer, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
-        Submission, SystemClock, WriterId,
+        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, ManualClock,
+        ManualTimer, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission,
+        SystemClock, VerseId, WriterId,
     };
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -182,8 +182,8 @@ mod tests {
         JournalId::from_bytes(*b"factory-journal!")
     }
 
-    fn line() -> LineId {
-        LineId::from_bytes(*b"factory-line-id!")
+    fn verse() -> VerseId {
+        VerseId::from_bytes(*b"factory-line-id!")
     }
 
     fn owner_a() -> OwnerId {
@@ -218,7 +218,7 @@ mod tests {
     fn request(owner: OwnerId) -> CanonOwnerRequest {
         CanonOwnerRequest {
             journal_id: journal(),
-            line_id: line(),
+            verse_id: verse(),
             owner_id: owner,
             cohort_id: cohort(),
             writer_id: writer_id(),
@@ -232,7 +232,7 @@ mod tests {
         CanonFence::new(
             revision,
             journal(),
-            line(),
+            verse(),
             CanonOwner::Owned {
                 owner_id: owner,
                 endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
@@ -512,7 +512,7 @@ mod tests {
             .virtual_log()
             .bootstrap_with_application_fence(
                 harness.first.clone(),
-                CanonFence::new(0, journal(), line(), CanonOwner::Unowned).encode(),
+                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
             )
             .await
             .expect("bootstrap");

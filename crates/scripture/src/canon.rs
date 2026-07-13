@@ -22,15 +22,15 @@ const MAX_ENDPOINT_BYTES: usize = 1024;
 const FIXED_PREFIX_BYTES: usize = 4 + 1 + 8 + 16 + 16 + 1;
 const OWNED_FIXED_BYTES: usize = 16 + 2;
 
-/// Stable identity of a physical ordered Scripture append lane.
+/// Stable identity of a physical ordered Scripture Verse (append lane).
 ///
-/// A Line is replaceable physical realization of a logical Scripture. It is
+/// A Verse is a replaceable physical realization of a logical Scripture. It is
 /// deliberately distinct from [`JournalId`], which names the logical journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LineId([u8; 16]);
+pub struct VerseId([u8; 16]);
 
-impl LineId {
-    /// Constructs a Line identity from its durable 128-bit representation.
+impl VerseId {
+    /// Constructs a Verse identity from its durable 128-bit representation.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
@@ -43,7 +43,7 @@ impl LineId {
     }
 }
 
-impl fmt::Display for LineId {
+impl fmt::Display for VerseId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(formatter, "{byte:02x}")?;
@@ -52,7 +52,7 @@ impl fmt::Display for LineId {
     }
 }
 
-/// Stable identity of a Scripture process allowed to own a Line.
+/// Stable identity of a Scripture process allowed to own a Verse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OwnerId([u8; 16]);
 
@@ -116,7 +116,7 @@ impl OwnerEndpoint {
 /// Owner state encoded inside a Canon fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonOwner {
-    /// No node may accept new appends while the Line is recovering or draining.
+    /// No node may accept new appends while the Verse is recovering or draining.
     Unowned,
     /// The named process is the owner designated by this Canon revision.
     Owned {
@@ -135,9 +135,9 @@ pub struct CanonFence {
     pub revision: u64,
     /// Logical Scripture journal.
     pub journal_id: JournalId,
-    /// Physical ordered Line being fenced.
-    pub line_id: LineId,
-    /// Owner allowed to serve the Line, or explicit recovery/drain state.
+    /// Physical ordered Verse being fenced.
+    pub verse_id: VerseId,
+    /// Owner allowed to serve the Verse, or explicit recovery/drain state.
     pub owner: CanonOwner,
 }
 
@@ -148,13 +148,13 @@ impl CanonFence {
     pub const fn new(
         revision: u64,
         journal_id: JournalId,
-        line_id: LineId,
+        verse_id: VerseId,
         owner: CanonOwner,
     ) -> Self {
         Self {
             revision,
             journal_id,
-            line_id,
+            verse_id,
             owner,
         }
     }
@@ -178,7 +178,7 @@ impl CanonFence {
         encoded.push(FORMAT_VERSION);
         encoded.extend_from_slice(&self.revision.to_be_bytes());
         encoded.extend_from_slice(&self.journal_id.as_bytes());
-        encoded.extend_from_slice(&self.line_id.as_bytes());
+        encoded.extend_from_slice(&self.verse_id.as_bytes());
         match &self.owner {
             CanonOwner::Unowned => encoded.push(UNOWNED),
             CanonOwner::Owned { owner_id, endpoint } => {
@@ -206,7 +206,7 @@ impl CanonFence {
         }
         let revision = u64::from_be_bytes(cursor.array()?);
         let journal_id = JournalId::from_bytes(cursor.array()?);
-        let line_id = LineId::from_bytes(cursor.array()?);
+        let verse_id = VerseId::from_bytes(cursor.array()?);
         let owner = match cursor.byte()? {
             UNOWNED => CanonOwner::Unowned,
             OWNED => {
@@ -227,7 +227,7 @@ impl CanonFence {
         Ok(Self {
             revision,
             journal_id,
-            line_id,
+            verse_id,
             owner,
         })
     }
@@ -442,21 +442,21 @@ pub enum CanonAuthorityError {
         /// Journal named by the fence.
         actual: JournalId,
     },
-    /// The Canon fence names a different physical Line.
-    #[error("Canon Line {actual} does not match expected {expected}")]
-    LineMismatch {
-        /// Expected Line.
-        expected: LineId,
-        /// Line named by the fence.
-        actual: LineId,
+    /// The Canon fence names a different physical Verse.
+    #[error("Canon Verse {actual} does not match expected {expected}")]
+    VerseMismatch {
+        /// Expected Verse.
+        expected: VerseId,
+        /// Verse named by the fence.
+        actual: VerseId,
     },
-    /// The Line is explicitly unowned / recovering.
-    #[error("Canon revision {revision} leaves Line {line_id} unowned")]
+    /// The Verse is explicitly unowned / recovering.
+    #[error("Canon revision {revision} leaves Verse {verse_id} unowned")]
     Unowned {
         /// Observed revision.
         revision: u64,
-        /// Line that is unowned.
-        line_id: LineId,
+        /// Verse that is unowned.
+        verse_id: VerseId,
     },
     /// The fence names a different owner identity.
     #[error("Canon owner {actual} does not match expected {expected} at revision {revision}")]
@@ -480,13 +480,13 @@ pub enum CanonAuthorityError {
 pub async fn observe_canon_authority(
     virtual_log: &VirtualLog,
     expected_journal_id: JournalId,
-    expected_line_id: LineId,
+    expected_verse_id: VerseId,
     expected_owner_id: OwnerId,
 ) -> Result<CanonAuthoritySnapshot, CanonAuthorityError> {
     Ok(observe_canon_authority_witnessed(
         virtual_log,
         expected_journal_id,
-        expected_line_id,
+        expected_verse_id,
         expected_owner_id,
     )
     .await?
@@ -501,7 +501,7 @@ pub async fn observe_canon_authority(
 pub async fn observe_canon_authority_witnessed(
     virtual_log: &VirtualLog,
     expected_journal_id: JournalId,
-    expected_line_id: LineId,
+    expected_verse_id: VerseId,
     expected_owner_id: OwnerId,
 ) -> Result<WitnessedCanonAuthority, CanonAuthorityError> {
     let observed = virtual_log.observe_membership().await?;
@@ -512,16 +512,16 @@ pub async fn observe_canon_authority_witnessed(
             actual: fence.journal_id,
         });
     }
-    if fence.line_id != expected_line_id {
-        return Err(CanonAuthorityError::LineMismatch {
-            expected: expected_line_id,
-            actual: fence.line_id,
+    if fence.verse_id != expected_verse_id {
+        return Err(CanonAuthorityError::VerseMismatch {
+            expected: expected_verse_id,
+            actual: fence.verse_id,
         });
     }
     match &fence.owner {
         CanonOwner::Unowned => Err(CanonAuthorityError::Unowned {
             revision: fence.revision,
-            line_id: fence.line_id,
+            verse_id: fence.verse_id,
         }),
         CanonOwner::Owned { owner_id, .. } if *owner_id != expected_owner_id => {
             Err(CanonAuthorityError::NotOwner {
