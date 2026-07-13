@@ -147,3 +147,38 @@ fn observe_rejects_malformed_application_fence_bytes() {
         ));
     });
 }
+
+#[test]
+fn witnessed_authority_rejects_mismatched_fence_and_observation() {
+    use holylog::virtual_log::{CompareToken, VersionedState};
+    use scripture::{CanonAuthorityError, WitnessedCanonAuthority};
+
+    let observed_fence = CanonFence::new(1, journal(), line(), owner());
+    let claimed_fence = CanonFence::new(
+        1,
+        journal(),
+        line(),
+        CanonOwner::Owned {
+            owner_id: OwnerId::from_bytes(*b"other-owner-id!!"),
+            endpoint: OwnerEndpoint::new("tcp://other.internal:9000").expect("endpoint"),
+        },
+    );
+    let authority = WitnessedCanonAuthority::from_parts_for_test(
+        VersionedState {
+            token: CompareToken::from_revision(1),
+            state: VirtualLogState {
+                revision: 1,
+                generations: vec![GenerationDescriptor {
+                    loglet_id: LogletId::new("witness-check").expect("id"),
+                    start: 0,
+                }],
+                application_fence: observed_fence.encode(),
+            },
+        },
+        claimed_fence,
+    );
+    assert!(matches!(
+        authority.validate(),
+        Err(CanonAuthorityError::InconsistentWitness)
+    ));
+}

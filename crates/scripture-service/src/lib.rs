@@ -5,11 +5,10 @@
 //! which routes Phase 1 [`scripture::ChunkDriverHandle`] owners without
 //! duplicating admission or durability logic.
 //!
-//! Canon-authorized startup after a fenced handoff uses
-//! [`recover_canon_owner`]. Operator-directed A→B handoff uses
-//! [`ChunkJournalService::drain_owner`] then [`publish_canon_transition`].
-//! [`ChunkJournalService::register_owner`] is a local lab registry only and does
-//! not grant distributed fencing.
+//! [`recover_canon_owner`] then [`ChunkJournalService::register_canon_owner`].
+//! Operator-directed A→B handoff uses [`ChunkJournalService::drain_owner`] then
+//! [`publish_canon_transition`]. [`ChunkJournalService::register_owner`] remains
+//! a local lab registry only and cannot drain for Canon publish.
 
 mod canon_owner;
 mod canon_transition;
