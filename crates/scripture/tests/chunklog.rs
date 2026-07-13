@@ -502,6 +502,65 @@ fn virtual_recovery_rejects_future_chunk_generation() {
 }
 
 #[test]
+fn virtual_recovery_rejects_generation_regression_in_logical_order() {
+    block_on(async {
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
+        let bootstrap = harness.virtual_log();
+        bootstrap
+            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
+            .await
+            .expect("bootstrap");
+        let mut gen0 =
+            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        gen0.append(&chunk_at_generation(20, 0, 1, 0))
+            .await
+            .expect("gen0 append");
+
+        let cutter = harness.virtual_log();
+        cutter
+            .reconfigure_with_application_fence(harness.second.clone(), owned(1).encode())
+            .await
+            .expect("cutover");
+        let mut gen1 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            1,
+            harness.virtual_log(),
+            RecordOffset::new(1),
+        );
+        gen1.append(&chunk_at_generation(21, 1, 1, 1))
+            .await
+            .expect("gen1 append");
+
+        // A generation-0 chunk after a visible generation-1 chunk cannot be
+        // correct fenced history. Plant it directly to model stale/corrupt
+        // object-store evidence that recovery must not normalize.
+        let regressed = chunk_at_generation(22, 2, 1, 0);
+        harness
+            .second_log
+            .append(regressed.bytes.clone())
+            .await
+            .expect("plant regressed chunk");
+
+        assert!(matches!(
+            ChunkLogWriter::recover_virtual(
+                journal(),
+                cohort(),
+                line(),
+                owner_id(),
+                harness.virtual_log(),
+                RecoveryBound::new(8).expect("bound"),
+            )
+            .await,
+            Err(ChunkLogError::RecoveredGenerationRegression {
+                previous: 1,
+                actual: 0
+            })
+        ));
+    });
+}
+
+#[test]
 fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
     block_on(async {
         let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
