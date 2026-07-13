@@ -7,13 +7,17 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use scripture::{
-    CanonAuthorityError, CanonAuthoritySnapshot, CanonOwner, ChunkDriverActor, ChunkDriverHandle,
-    Clock, DriverError, JournalId, OwnerId, ReceiptFuture, Submission, Timer,
+    CanonAuthorityError, CanonFence, CanonOwner, ChunkDriverActor, ChunkDriverHandle, Clock,
+    DriverError, JournalId, LineId, OwnerId, ReceiptFuture, Submission, Timer,
+    WitnessedCanonAuthority,
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+use crate::canon_owner::RecoveredCanonOwner;
 
 /// Observable status of one registered local owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +41,8 @@ pub struct OwnerHealth {
     pub journal_id: JournalId,
     /// Local registration diagnostic only.
     ///
-    /// This is the value supplied to [`ChunkJournalService::register_owner`].
+    /// This is the value supplied to [`ChunkJournalService::register_owner`] or
+    /// the Canon revision from [`ChunkJournalService::register_canon_owner`].
     /// It is **not** a Holylog / ConditionalRegister fencing token and must not
     /// appear in fleet-facing protocol messages as an ownership generation.
     pub registered_owner_generation: u64,
@@ -77,6 +82,9 @@ pub enum ChunkServiceError {
         /// Conflicting journal.
         journal_id: JournalId,
     },
+    /// Recovered Canon authority cannot bind a local owner (unowned / mismatch).
+    #[error(transparent)]
+    Authority(#[from] CanonAuthorityError),
 }
 
 /// Failures entering the local draining gate.
@@ -88,6 +96,28 @@ pub enum DrainError {
     /// Canon authority refused the drain.
     #[error(transparent)]
     Authority(#[from] CanonAuthorityError),
+    /// The journal was registered without a Canon binding (lab path).
+    #[error("journal {journal_id:?} has no Canon owner binding and cannot drain for publish")]
+    NotCanonBound {
+        /// Journal lacking a Canon binding.
+        journal_id: JournalId,
+    },
+    /// Witnessed authority does not match the locally registered Canon owner.
+    #[error(
+        "Canon binding mismatch for journal {journal_id:?}: registered owner {registered_owner} revision {registered_revision}, authority owner {authority_owner:?} revision {authority_revision}"
+    )]
+    BindingMismatch {
+        /// Journal being drained.
+        journal_id: JournalId,
+        /// Owner identity stored at Canon registration.
+        registered_owner: OwnerId,
+        /// Canon revision stored at registration.
+        registered_revision: u64,
+        /// Owner claimed by the witnessed authority, if owned.
+        authority_owner: Option<OwnerId>,
+        /// Revision claimed by the witnessed authority.
+        authority_revision: u64,
+    },
     /// The owner is not in a serving state that can drain.
     #[error("owner for journal {journal_id:?} cannot drain from status {status:?}")]
     NotServing {
@@ -104,13 +134,14 @@ pub enum DrainError {
     },
 }
 
-/// Proof that a local owner drained and may be passed to Canon publish.
+/// Proof that a local Canon-bound owner drained and may be passed to publish.
 ///
-/// Constructed only by [`ChunkJournalService::drain_owner`]. It is not a
-/// distributed lease and does not authorize serving.
+/// Constructed only by [`ChunkJournalService::drain_owner`] from the stored
+/// Canon binding. It is not a distributed lease and does not authorize serving.
 #[derive(Debug)]
 pub struct DrainedOwner {
     journal_id: JournalId,
+    line_id: LineId,
     owner_id: OwnerId,
     revision: u64,
 }
@@ -122,13 +153,19 @@ impl DrainedOwner {
         self.journal_id
     }
 
-    /// Owner identity validated against Canon at drain time.
+    /// Physical Line bound at Canon registration.
+    #[must_use]
+    pub const fn line_id(&self) -> LineId {
+        self.line_id
+    }
+
+    /// Owner identity from the local Canon binding.
     #[must_use]
     pub const fn owner_id(&self) -> OwnerId {
         self.owner_id
     }
 
-    /// Canon revision observed when drain was authorized.
+    /// Canon revision from the local Canon binding.
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -136,9 +173,15 @@ impl DrainedOwner {
 
     /// Test-only constructor for fail-closed publish validation paths.
     #[cfg(test)]
-    pub(crate) const fn for_test(journal_id: JournalId, owner_id: OwnerId, revision: u64) -> Self {
+    pub(crate) const fn for_test(
+        journal_id: JournalId,
+        line_id: LineId,
+        owner_id: OwnerId,
+        revision: u64,
+    ) -> Self {
         Self {
             journal_id,
+            line_id,
             owner_id,
             revision,
         }
@@ -146,28 +189,75 @@ impl DrainedOwner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum LocalLifecycle {
-    Serving,
-    Draining,
-    Stopped,
+    Serving = 0,
+    Draining = 1,
+    Stopped = 2,
+}
+
+impl LocalLifecycle {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Serving,
+            1 => Self::Draining,
+            _ => Self::Stopped,
+        }
+    }
+}
+
+/// Identity of the Canon owner that was registered into a slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonOwnerBinding {
+    journal_id: JournalId,
+    line_id: LineId,
+    owner_id: OwnerId,
+    revision: u64,
+    fence: CanonFence,
+}
+
+impl CanonOwnerBinding {
+    fn from_fence(fence: &CanonFence) -> Result<Self, CanonAuthorityError> {
+        match &fence.owner {
+            CanonOwner::Unowned => Err(CanonAuthorityError::Unowned {
+                revision: fence.revision,
+                line_id: fence.line_id,
+            }),
+            CanonOwner::Owned { owner_id, .. } => Ok(Self {
+                journal_id: fence.journal_id,
+                line_id: fence.line_id,
+                owner_id: *owner_id,
+                revision: fence.revision,
+                fence: fence.clone(),
+            }),
+        }
+    }
 }
 
 struct OwnerSlot {
     journal_id: JournalId,
     registered_owner_generation: u64,
+    canon: Option<CanonOwnerBinding>,
     handle: Option<ChunkDriverHandle>,
-    lifecycle: Arc<Mutex<LocalLifecycle>>,
+    /// Exclusion for Serving → Draining → Stopped transitions and admissions.
+    lifecycle: Arc<Mutex<()>>,
+    /// Lock-free snapshot for [`OwnerSlot::health`].
+    lifecycle_view: Arc<AtomicU8>,
     /// Held so the actor task is not detached without observation.
     task: JoinHandle<()>,
 }
 
 impl OwnerSlot {
+    fn lifecycle(&self) -> LocalLifecycle {
+        LocalLifecycle::from_u8(self.lifecycle_view.load(Ordering::Acquire))
+    }
+
+    fn set_lifecycle(&self, next: LocalLifecycle) {
+        self.lifecycle_view.store(next as u8, Ordering::Release);
+    }
+
     fn health(&self) -> OwnerHealth {
-        let lifecycle = self
-            .lifecycle
-            .try_lock()
-            .map(|guard| *guard)
-            .unwrap_or(LocalLifecycle::Stopped);
+        let lifecycle = self.lifecycle();
         let status = if self.task.is_finished() || lifecycle == LocalLifecycle::Stopped {
             OwnerStatus::TaskFinished
         } else if self
@@ -221,9 +311,8 @@ impl ChunkJournalService {
     ///
     /// This is a **local lab composition** primitive: it does not observe Canon
     /// authority, recover a VirtualLog suffix, or grant a distributed fence.
-    /// Prefer [`crate::recover_canon_owner`] when constructing a Canon-authorized
-    /// owner from durable evidence, then register the returned handle/actor here
-    /// only if a process-local registry is desired.
+    /// Lab owners cannot be drained for Canon publish; use
+    /// [`Self::register_canon_owner`] for handoff-capable registration.
     ///
     /// The service observes task completion and surfaces it in
     /// [`Self::health`]. It does not recover or replace the owner.
@@ -238,22 +327,65 @@ impl ChunkJournalService {
         C: Clock + Send + 'static,
         T: Timer + Send + 'static,
     {
+        self.insert_owner(journal_id, registered_owner_generation, handle, actor, None)
+    }
+
+    /// Registers a recovered Canon owner, storing its fence identity for drain.
+    ///
+    /// The binding is taken from [`RecoveredCanonOwner::authority`]. Only this
+    /// path can later produce a [`DrainedOwner`] suitable for
+    /// [`crate::publish_canon_transition`].
+    pub fn register_canon_owner<C, T>(
+        &mut self,
+        recovered: RecoveredCanonOwner<C, T>,
+    ) -> Result<(), ChunkServiceError>
+    where
+        C: Clock + Send + 'static,
+        T: Timer + Send + 'static,
+    {
+        let binding = CanonOwnerBinding::from_fence(&recovered.authority.fence)?;
+        let journal_id = binding.journal_id;
+        let revision = binding.revision;
+        self.insert_owner(
+            journal_id,
+            revision,
+            recovered.handle,
+            recovered.actor,
+            Some(binding),
+        )
+    }
+
+    fn insert_owner<C, T>(
+        &mut self,
+        journal_id: JournalId,
+        registered_owner_generation: u64,
+        handle: ChunkDriverHandle,
+        actor: ChunkDriverActor<C, T>,
+        canon: Option<CanonOwnerBinding>,
+    ) -> Result<(), ChunkServiceError>
+    where
+        C: Clock + Send + 'static,
+        T: Timer + Send + 'static,
+    {
         if self.owners.contains_key(&journal_id) {
             return Err(ChunkServiceError::AlreadyRegistered { journal_id });
         }
-        let lifecycle = Arc::new(Mutex::new(LocalLifecycle::Serving));
-        let task_lifecycle = Arc::clone(&lifecycle);
+        let lifecycle = Arc::new(Mutex::new(()));
+        let lifecycle_view = Arc::new(AtomicU8::new(LocalLifecycle::Serving as u8));
+        let task_view = Arc::clone(&lifecycle_view);
         let task = tokio::spawn(async move {
             let _ = actor.run().await;
-            *task_lifecycle.lock().await = LocalLifecycle::Stopped;
+            task_view.store(LocalLifecycle::Stopped as u8, Ordering::Release);
         });
         self.owners.insert(
             journal_id,
             OwnerSlot {
                 journal_id,
                 registered_owner_generation,
+                canon,
                 handle: Some(handle),
                 lifecycle,
+                lifecycle_view,
                 task,
             },
         );
@@ -270,66 +402,92 @@ impl ChunkJournalService {
             .get_mut(&journal_id)
             .ok_or(ChunkServiceError::UnknownJournal { journal_id })?;
         {
-            let mut life = owner.lifecycle.lock().await;
-            *life = LocalLifecycle::Stopped;
+            let _guard = owner.lifecycle.lock().await;
+            owner.set_lifecycle(LocalLifecycle::Stopped);
         }
         drop(owner.handle.take());
         // Replace the join handle with a finished noop so we can await the old one.
         let task = std::mem::replace(&mut owner.task, tokio::spawn(async {}));
-        let lifecycle = Arc::clone(&owner.lifecycle);
+        let lifecycle_view = Arc::clone(&owner.lifecycle_view);
         let _ = owner;
         let _ = task.await;
-        *lifecycle.lock().await = LocalLifecycle::Stopped;
+        lifecycle_view.store(LocalLifecycle::Stopped as u8, Ordering::Release);
         Ok(())
     }
 
     /// Stops new admissions, flushes open work, and returns a drained token.
     ///
-    /// Requires `authority` to name this journal and `expected_owner_id` as the
-    /// current Canon owner. On success the owner stays locally
-    /// [`OwnerStatus::Draining`] until publish stops it or an operator inspects.
+    /// Requires a Canon-bound registration and a self-consistent
+    /// [`WitnessedCanonAuthority`] that matches the stored binding. On success
+    /// the owner stays locally [`OwnerStatus::Draining`] until publish stops it
+    /// or an operator inspects. Binding failures leave the owner Serving.
     /// Poison or uncertain flush yields [`DrainError::DrainFailed`] and must not
     /// publish a successor.
     pub async fn drain_owner(
         &mut self,
         journal_id: JournalId,
-        authority: &CanonAuthoritySnapshot,
-        expected_owner_id: OwnerId,
+        authority: &WitnessedCanonAuthority,
     ) -> Result<DrainedOwner, DrainError> {
-        if authority.fence.journal_id != journal_id {
-            return Err(DrainError::Authority(
-                CanonAuthorityError::JournalMismatch {
-                    expected: journal_id,
-                    actual: authority.fence.journal_id,
-                },
-            ));
-        }
-        match &authority.fence.owner {
-            CanonOwner::Unowned => {
-                return Err(DrainError::Authority(CanonAuthorityError::Unowned {
-                    revision: authority.revision(),
-                    line_id: authority.fence.line_id,
-                }));
-            }
-            CanonOwner::Owned { owner_id, .. } if *owner_id != expected_owner_id => {
-                return Err(DrainError::Authority(CanonAuthorityError::NotOwner {
-                    revision: authority.revision(),
-                    expected: expected_owner_id,
-                    actual: *owner_id,
-                }));
-            }
-            CanonOwner::Owned { .. } => {}
-        }
+        authority.validate()?;
 
         let owner = self
             .owners
             .get_mut(&journal_id)
             .ok_or(ChunkServiceError::UnknownJournal { journal_id })?;
 
+        let binding = owner
+            .canon
+            .as_ref()
+            .ok_or(DrainError::NotCanonBound { journal_id })?;
+
+        if binding.journal_id != journal_id
+            || authority.fence().journal_id != journal_id
+            || authority.fence().line_id != binding.line_id
+            || authority.revision() != binding.revision
+            || authority.fence() != &binding.fence
+        {
+            return Err(DrainError::BindingMismatch {
+                journal_id,
+                registered_owner: binding.owner_id,
+                registered_revision: binding.revision,
+                authority_owner: match &authority.fence().owner {
+                    CanonOwner::Owned { owner_id, .. } => Some(*owner_id),
+                    CanonOwner::Unowned => None,
+                },
+                authority_revision: authority.revision(),
+            });
+        }
+        match &authority.fence().owner {
+            CanonOwner::Owned { owner_id, .. } if *owner_id == binding.owner_id => {}
+            CanonOwner::Owned { owner_id, .. } => {
+                return Err(DrainError::BindingMismatch {
+                    journal_id,
+                    registered_owner: binding.owner_id,
+                    registered_revision: binding.revision,
+                    authority_owner: Some(*owner_id),
+                    authority_revision: authority.revision(),
+                });
+            }
+            CanonOwner::Unowned => {
+                return Err(DrainError::Authority(CanonAuthorityError::Unowned {
+                    revision: authority.revision(),
+                    line_id: authority.fence().line_id,
+                }));
+            }
+        }
+
+        let drained = DrainedOwner {
+            journal_id: binding.journal_id,
+            line_id: binding.line_id,
+            owner_id: binding.owner_id,
+            revision: binding.revision,
+        };
+
         let handle = {
-            let mut life = owner.lifecycle.lock().await;
-            if *life != LocalLifecycle::Serving {
-                let status = match *life {
+            let _guard = owner.lifecycle.lock().await;
+            let life = owner.lifecycle();
+            if life != LocalLifecycle::Serving {
+                let status = match life {
                     LocalLifecycle::Draining => OwnerStatus::Draining,
                     LocalLifecycle::Stopped => OwnerStatus::TaskFinished,
                     LocalLifecycle::Serving => OwnerStatus::Running,
@@ -349,7 +507,7 @@ impl ChunkJournalService {
                     status: OwnerStatus::Poisoned,
                 });
             }
-            *life = LocalLifecycle::Draining;
+            owner.set_lifecycle(LocalLifecycle::Draining);
             handle.clone()
         };
 
@@ -360,11 +518,7 @@ impl ChunkJournalService {
                 if handle.metrics().poisoned {
                     return Err(DrainError::DrainFailed { journal_id });
                 }
-                Ok(DrainedOwner {
-                    journal_id,
-                    owner_id: expected_owner_id,
-                    revision: authority.revision(),
-                })
+                Ok(drained)
             }
             Err(DriverError::Poisoned)
             | Err(DriverError::Uncertain { .. })
@@ -382,8 +536,8 @@ impl ChunkJournalService {
         let owner = self.owner(journal_id)?;
         // Hold the lifecycle lock across admission so drain cannot interleave
         // between the Serving check and ChunkDriverHandle::submit.
-        let _life = owner.lifecycle.lock().await;
-        match *_life {
+        let _guard = owner.lifecycle.lock().await;
+        match owner.lifecycle() {
             LocalLifecycle::Draining => {
                 return Err(ChunkServiceError::OwnerDraining { journal_id });
             }
@@ -421,8 +575,8 @@ impl ChunkJournalService {
     /// Flushes the registered owner's open chunk.
     pub async fn flush(&self, journal_id: JournalId) -> Result<(), ChunkServiceError> {
         let owner = self.owner(journal_id)?;
-        let _life = owner.lifecycle.lock().await;
-        match *_life {
+        let _guard = owner.lifecycle.lock().await;
+        match owner.lifecycle() {
             LocalLifecycle::Draining => {
                 return Err(ChunkServiceError::OwnerDraining { journal_id });
             }

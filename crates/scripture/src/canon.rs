@@ -360,12 +360,16 @@ impl CanonAuthoritySnapshot {
 /// Use this for operator-directed seal-and-publish transitions that must CAS
 /// only against the validated observation. Startup recovery that does not need
 /// the witness may keep using [`CanonAuthoritySnapshot`].
+///
+/// Fields are private so callers cannot assemble a fence that disagrees with
+/// the observed register value. Construct via
+/// [`observe_canon_authority_witnessed`] (or tests via
+/// [`Self::from_parts_for_test`]) and call [`Self::validate`] before any
+/// side-effecting transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WitnessedCanonAuthority {
-    /// Linearizable membership plus adapter-private compare token.
-    pub observed: VersionedState,
-    /// Fence decoded from [`VersionedState::state`] and revision-bound.
-    pub fence: CanonFence,
+    observed: VersionedState,
+    fence: CanonFence,
 }
 
 impl WitnessedCanonAuthority {
@@ -375,6 +379,18 @@ impl WitnessedCanonAuthority {
         self.fence.revision
     }
 
+    /// Borrowed membership observation plus storage witness.
+    #[must_use]
+    pub const fn observed(&self) -> &VersionedState {
+        &self.observed
+    }
+
+    /// Borrowed fence claimed for this observation.
+    #[must_use]
+    pub const fn fence(&self) -> &CanonFence {
+        &self.fence
+    }
+
     /// Drops the storage witness, retaining membership and fence.
     #[must_use]
     pub fn snapshot(&self) -> CanonAuthoritySnapshot {
@@ -382,6 +398,30 @@ impl WitnessedCanonAuthority {
             state: self.observed.state.clone(),
             fence: self.fence.clone(),
         }
+    }
+
+    /// Re-decodes the fence from [`Self::observed`] and requires exact equality.
+    ///
+    /// Call before every side-effecting transition that trusts this value.
+    pub fn validate(&self) -> Result<(), CanonAuthorityError> {
+        let decoded = CanonFence::from_virtual_log_state(&self.observed.state)?;
+        if decoded != self.fence {
+            return Err(CanonAuthorityError::InconsistentWitness);
+        }
+        Ok(())
+    }
+
+    /// Constructs a value that may be internally inconsistent.
+    ///
+    /// Prefer [`observe_canon_authority_witnessed`]. Hidden for regression tests
+    /// that deliberately mismatch fence and observation.
+    #[doc(hidden)]
+    pub fn from_parts_for_test(observed: VersionedState, fence: CanonFence) -> Self {
+        Self { observed, fence }
+    }
+
+    pub(crate) fn from_validated(observed: VersionedState, fence: CanonFence) -> Self {
+        Self { observed, fence }
     }
 }
 
@@ -428,6 +468,9 @@ pub enum CanonAuthorityError {
         /// Owner named by the fence.
         actual: OwnerId,
     },
+    /// Claimed fence bytes do not match the fence decoded from the observation.
+    #[error("claimed Canon fence is inconsistent with the observed VirtualLog state")]
+    InconsistentWitness,
 }
 
 /// Reads a fresh VirtualLog register state and validates Canon identity/owner.
@@ -487,6 +530,6 @@ pub async fn observe_canon_authority_witnessed(
                 actual: *owner_id,
             })
         }
-        CanonOwner::Owned { .. } => Ok(WitnessedCanonAuthority { observed, fence }),
+        CanonOwner::Owned { .. } => Ok(WitnessedCanonAuthority::from_validated(observed, fence)),
     }
 }

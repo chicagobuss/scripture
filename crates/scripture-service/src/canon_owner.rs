@@ -6,8 +6,9 @@
 //! Canon revision.
 //!
 //! It is not election, discovery, owner replacement, or a restart loop.
-//! [`crate::ChunkJournalService::register_owner`] remains a local lab registry
-//! and does not grant distributed fencing.
+//! [`crate::ChunkJournalService::register_canon_owner`] after recovery; the lab
+//! [`crate::ChunkJournalService::register_owner`] path does not grant a Canon
+//! binding for publish.
 
 use holylog::virtual_log::VirtualLog;
 use scripture::{
@@ -332,14 +333,7 @@ mod tests {
         assert!(recovered.recovered_chunks.is_empty());
 
         let mut service = crate::ChunkJournalService::new();
-        service
-            .register_owner(
-                journal(),
-                recovered.authority.revision(),
-                recovered.handle,
-                recovered.actor,
-            )
-            .expect("register");
+        service.register_canon_owner(recovered).expect("register");
         let pending = service
             .submit(
                 journal(),
@@ -377,12 +371,7 @@ mod tests {
         .expect("owner a");
         let mut service = crate::ChunkJournalService::new();
         service
-            .register_owner(
-                journal(),
-                recovered_a.authority.revision(),
-                recovered_a.handle,
-                recovered_a.actor,
-            )
+            .register_canon_owner(recovered_a)
             .expect("register a");
         let pending_a = service
             .submit(
@@ -435,12 +424,7 @@ mod tests {
         // A separate process-local registry — not an in-place owner replacement.
         let mut service_b = crate::ChunkJournalService::new();
         service_b
-            .register_owner(
-                journal(),
-                recovered_b.authority.revision(),
-                recovered_b.handle,
-                recovered_b.actor,
-            )
+            .register_canon_owner(recovered_b)
             .expect("register b");
         let pending_b = service_b
             .submit(
