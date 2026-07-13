@@ -155,6 +155,12 @@ impl ChunkJournalService {
 
     /// Registers a pre-built owner and spawns its `run` future on Tokio.
     ///
+    /// This is a **local lab composition** primitive: it does not observe Canon
+    /// authority, recover a VirtualLog suffix, or grant a distributed fence.
+    /// Prefer [`crate::recover_canon_owner`] when constructing a Canon-authorized
+    /// owner from durable evidence, then register the returned handle/actor here
+    /// only if a process-local registry is desired.
+    ///
     /// The service observes task completion and surfaces it in
     /// [`Self::health`]. It does not recover or replace the owner.
     pub fn register_owner<C, T>(
