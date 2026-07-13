@@ -137,7 +137,7 @@ pub async fn serve_chunk_raw_lines_connection(
 /// Canon-gated raw-lines admission over a started [`CanonNode`].
 ///
 /// Performs one fresh [`CanonNode::resolve_route`] before accepting any payload:
-/// - [`CanonRoute::Serve`] delegates to the chunk raw-lines path;
+/// - [`CanonRoute::Serve`] admits through [`CanonNode::submit`] / [`CanonNode::flush`];
 /// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
 /// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
 /// - resolver failure writes `ERR unavailable`.
@@ -154,19 +154,7 @@ pub async fn serve_canon_raw_lines_connection(
     let (reader, mut writer) = stream.into_split();
     match node.resolve_route().await {
         Ok(CanonRoute::Serve { .. }) => {
-            // Reassemble a TcpStream is not possible from split halves; run the
-            // lab serve path via a joined stream substitute. Instead, reopen is
-            // unnecessary — delegate using the still-connected halves by
-            // forwarding through an internal helper.
-            serve_chunk_raw_lines_from_split(
-                reader,
-                writer,
-                node.service(),
-                node.journal_id(),
-                config,
-                0,
-            )
-            .await
+            serve_canon_raw_lines_from_split(reader, writer, node, config, 0).await
         }
         Ok(CanonRoute::NotOwner {
             canon_revision,
@@ -251,6 +239,81 @@ where
                     }
                 };
                 if let Err(error) = service.flush(journal_id).await {
+                    write_error(&mut writer, &error.to_string()).await?;
+                    return Ok(());
+                }
+                match receipt.await {
+                    Ok(receipt) => {
+                        writer
+                            .write_all(
+                                format!(
+                                    "OK {} {}\n",
+                                    receipt.first_offset.get(),
+                                    receipt.next_offset.get()
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                        writer.flush().await?;
+                    }
+                    Err(error) => {
+                        write_error(&mut writer, &error.to_string()).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                write_error(&mut writer, &error.to_string()).await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn serve_canon_raw_lines_from_split<R, W>(
+    reader: R,
+    mut writer: W,
+    node: Arc<CanonNode>,
+    config: RawLinesConfig,
+    mut sequence: u64,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let producer_id = allocate_connection_producer();
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut exhausted = false;
+    loop {
+        match read_line(&mut reader, config.max_line_bytes).await {
+            Ok(Some(line)) => {
+                if exhausted {
+                    write_error(&mut writer, "producer sequence space exhausted").await?;
+                    return Ok(());
+                }
+                let submission = Submission {
+                    producer_id,
+                    producer_epoch: 0,
+                    sequence,
+                    records: vec![Record {
+                        attributes: config.attributes.clone(),
+                        payload: Bytes::from(line),
+                    }],
+                };
+                match next_producer_sequence(sequence) {
+                    Some(next) => sequence = next,
+                    None => exhausted = true,
+                }
+                let receipt = match node.submit(submission).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        write_error(&mut writer, &error.to_string()).await?;
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = node.flush().await {
                     write_error(&mut writer, &error.to_string()).await?;
                     return Ok(());
                 }
@@ -859,7 +922,7 @@ mod tests {
             );
             harness
                 .virtual_log()
-                .reconfigure_with_application_fence(second, fence(1, owner_b()).encode())
+                .reconfigure_with_application_fence(second.clone(), fence(1, owner_b()).encode())
                 .await
                 .expect("cutover to B");
             let response = exchange(Arc::new(node), b"should-not-append\n").await;
@@ -867,6 +930,9 @@ mod tests {
                 response,
                 "ERR not-owner canon=1 endpoint=tcp://owner.local:9000\n"
             );
+            let tail = harness.virtual_log().check_tail().await.expect("tail");
+            assert_eq!(tail.tail, 0);
+            assert_eq!(tail.loglet_id, second);
         }
 
         #[tokio::test]
@@ -902,13 +968,16 @@ mod tests {
             harness
                 .virtual_log()
                 .reconfigure_with_application_fence(
-                    second,
+                    second.clone(),
                     CanonFence::new(1, journal(), line(), CanonOwner::Unowned).encode(),
                 )
                 .await
                 .expect("unowned");
             let response = exchange(Arc::new(node), b"nope\n").await;
             assert_eq!(response, "ERR recovering canon=1\n");
+            let tail = harness.virtual_log().check_tail().await.expect("tail");
+            assert_eq!(tail.tail, 0);
+            assert_eq!(tail.loglet_id, second);
         }
 
         #[tokio::test]
