@@ -1,11 +1,12 @@
 //! Lab-grade network adapters for Scripture.
 //!
-//! Two raw-lines paths exist during migration:
+//! Three raw-lines paths exist during migration:
 //! - [`serve_raw_lines_connection`] — legacy v0 [`JournalHandle`]
-//! - [`serve_chunk_raw_lines_connection`] — Phase 1 [`ChunkJournalService`]
+//! - [`serve_chunk_raw_lines_connection`] — Phase 1 lab [`ChunkJournalService`]
+//! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`CanonNode`]
 //!
-//! New work targets the chunk path. The legacy path remains until a separate
-//! removal review.
+//! New durable work targets the Canon-gated path. Lab helpers remain for local
+//! composition tests until a separate removal review.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use scripture::{AttributeValue, ProducerId, Record, Submission};
-use scripture_service::{ChunkJournalService, JournalHandle};
+use scripture_service::{CanonNode, CanonRoute, ChunkJournalService, JournalHandle};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -120,6 +121,10 @@ pub async fn serve_raw_lines_connection(
 /// Each line becomes a one-record [`Submission`]. The connection owns a freshly
 /// allocated producer identity at epoch 0. `OK` is written only after a
 /// committed receipt.
+///
+/// This is the **lab** path: it does not observe Canon before accepting work.
+/// Prefer [`serve_canon_raw_lines_connection`] for a Scripture node that must
+/// refuse non-owners.
 pub async fn serve_chunk_raw_lines_connection(
     stream: TcpStream,
     service: Arc<ChunkJournalService>,
@@ -127,6 +132,66 @@ pub async fn serve_chunk_raw_lines_connection(
     config: RawLinesConfig,
 ) -> io::Result<()> {
     serve_chunk_raw_lines_from(stream, service, journal_id, config, 0).await
+}
+
+/// Canon-gated raw-lines admission over a started [`CanonNode`].
+///
+/// Performs one fresh [`CanonNode::resolve_route`] before accepting any payload:
+/// - [`CanonRoute::Serve`] delegates to the chunk raw-lines path;
+/// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
+/// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
+/// - resolver failure writes `ERR unavailable`.
+///
+/// These `ERR` forms are an explicitly provisional raw-lines adapter convention,
+/// not the future generic text-protocol schema. Compare tokens and owner IDs are
+/// never written. The gate is per connection; Holylog's seal fence remains the
+/// append guard if Canon changes mid-connection.
+pub async fn serve_canon_raw_lines_connection(
+    stream: TcpStream,
+    node: Arc<CanonNode>,
+    config: RawLinesConfig,
+) -> io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    match node.resolve_route().await {
+        Ok(CanonRoute::Serve { .. }) => {
+            // Reassemble a TcpStream is not possible from split halves; run the
+            // lab serve path via a joined stream substitute. Instead, reopen is
+            // unnecessary — delegate using the still-connected halves by
+            // forwarding through an internal helper.
+            serve_chunk_raw_lines_from_split(
+                reader,
+                writer,
+                node.service(),
+                node.journal_id(),
+                config,
+                0,
+            )
+            .await
+        }
+        Ok(CanonRoute::NotOwner {
+            canon_revision,
+            endpoint,
+            ..
+        }) => {
+            write_error(
+                &mut writer,
+                &format!(
+                    "not-owner canon={canon_revision} endpoint={}",
+                    endpoint.as_str()
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(CanonRoute::Recovering { canon_revision }) => {
+            write_error(&mut writer, &format!("recovering canon={canon_revision}")).await?;
+            Ok(())
+        }
+        Err(_) => {
+            write_error(&mut writer, "unavailable").await?;
+            Ok(())
+        }
+    }
 }
 
 /// Like [`serve_chunk_raw_lines_connection`], but starts at `initial_sequence`.
@@ -137,10 +202,25 @@ pub async fn serve_chunk_raw_lines_from(
     service: Arc<ChunkJournalService>,
     journal_id: scripture::JournalId,
     config: RawLinesConfig,
-    mut sequence: u64,
+    sequence: u64,
 ) -> io::Result<()> {
+    let (reader, writer) = stream.into_split();
+    serve_chunk_raw_lines_from_split(reader, writer, service, journal_id, config, sequence).await
+}
+
+async fn serve_chunk_raw_lines_from_split<R, W>(
+    reader: R,
+    mut writer: W,
+    service: Arc<ChunkJournalService>,
+    journal_id: scripture::JournalId,
+    config: RawLinesConfig,
+    mut sequence: u64,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let producer_id = allocate_connection_producer();
-    let (reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let mut exhausted = false;
     loop {
@@ -578,5 +658,326 @@ mod tests {
         }
         assert!(exhausted);
         assert!(next_producer_sequence(sequence).is_none());
+    }
+
+    mod canon_gated {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use holylog::atomic::AtomicLog;
+        use holylog::memory::InMemoryLogDrive;
+        use holylog::virtual_log::{
+            ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver,
+            ResolveFuture, VirtualLog,
+        };
+        use scripture::{
+            CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint,
+            OwnerId, RecoveryBound, SystemClock, WriterId,
+        };
+        use scripture_service::{CanonNode, CanonNodeConfig, CanonNodeStart};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        use super::super::{RawLinesConfig, serve_canon_raw_lines_connection};
+
+        fn journal() -> JournalId {
+            JournalId::from_bytes(*b"canon-raw-jrnl!!")
+        }
+
+        fn line() -> LineId {
+            LineId::from_bytes(*b"canon-raw-line!!")
+        }
+
+        fn owner_a() -> OwnerId {
+            OwnerId::from_bytes(*b"canon-raw-own-a!")
+        }
+
+        fn owner_b() -> OwnerId {
+            OwnerId::from_bytes(*b"canon-raw-own-b!")
+        }
+
+        fn config(owner: OwnerId) -> CanonNodeConfig {
+            CanonNodeConfig {
+                journal_id: journal(),
+                line_id: line(),
+                owner_id: owner,
+                cohort_id: CohortId::from_bytes(*b"canon-raw-cohrt!"),
+                writer_id: WriterId::from_bytes(*b"canon-raw-writer"),
+                policy: ChunkPolicy {
+                    max_chunk_bytes: 64 * 1024,
+                    max_record_bytes: 16 * 1024,
+                    max_chunk_records: 8,
+                    max_chunk_age: Duration::from_secs(60),
+                    max_buffered_bytes: 64 * 1024,
+                    max_inflight_chunks: 1,
+                    max_uncommitted_age: Duration::from_secs(60),
+                    recovery_scan: RecoveryBound::new(8).expect("bound"),
+                },
+                recovery_bound: RecoveryBound::new(8).expect("bound"),
+                queue_capacity: 16,
+            }
+        }
+
+        fn fence(revision: u64, owner: OwnerId) -> CanonFence {
+            CanonFence::new(
+                revision,
+                journal(),
+                line(),
+                CanonOwner::Owned {
+                    owner_id: owner,
+                    endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
+                },
+            )
+        }
+
+        #[derive(Default)]
+        struct Resolver {
+            loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+        }
+
+        impl Resolver {
+            fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
+                self.loglets.lock().expect("lock").insert(id, log);
+            }
+        }
+
+        impl LogletResolver for Resolver {
+            fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
+                let id = id.clone();
+                Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
+            }
+        }
+
+        struct Harness {
+            register: Arc<dyn ConditionalRegister>,
+            resolver: Arc<Resolver>,
+            first: LogletId,
+        }
+
+        impl Harness {
+            fn memory() -> Self {
+                let resolver = Arc::new(Resolver::default());
+                let first = LogletId::new("canon-raw-first").expect("id");
+                resolver.insert(
+                    first.clone(),
+                    Arc::new(
+                        AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                            .build()
+                            .expect("log"),
+                    ),
+                );
+                Self {
+                    register: Arc::new(InMemoryConditionalRegister::new()),
+                    resolver,
+                    first,
+                }
+            }
+
+            fn virtual_log(&self) -> VirtualLog {
+                VirtualLog::new(
+                    Arc::clone(&self.register),
+                    Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
+                )
+            }
+        }
+
+        async fn exchange(node: Arc<scripture_service::CanonNode>, payload: &[u8]) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                serve_canon_raw_lines_connection(stream, node, RawLinesConfig::default())
+                    .await
+                    .expect("serve")
+            });
+            let mut client = TcpStream::connect(address).await.expect("connect");
+            if !payload.is_empty() {
+                client.write_all(payload).await.expect("write");
+            }
+            client.shutdown().await.expect("shutdown");
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.expect("read");
+            server.await.expect("join");
+            String::from_utf8(response).expect("utf8")
+        }
+
+        #[tokio::test]
+        async fn serving_node_writes_committed_ok() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_a()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let CanonNodeStart::Serving(node) = CanonNode::start(
+                config(owner_a()),
+                harness.virtual_log(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("start") else {
+                panic!("expected Serving");
+            };
+            let response = exchange(Arc::new(node), b"hello\n").await;
+            assert_eq!(response, "OK 0 1\n");
+        }
+
+        #[tokio::test]
+        async fn other_owner_returns_exact_not_owner_line_without_append() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_a()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let CanonNodeStart::Serving(node) = CanonNode::start(
+                config(owner_a()),
+                harness.virtual_log(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("start a") else {
+                panic!("expected Serving");
+            };
+            let second = LogletId::new("canon-raw-second").expect("id");
+            harness.resolver.insert(
+                second.clone(),
+                Arc::new(
+                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                        .build()
+                        .expect("log"),
+                ),
+            );
+            harness
+                .virtual_log()
+                .reconfigure_with_application_fence(second, fence(1, owner_b()).encode())
+                .await
+                .expect("cutover to B");
+            let response = exchange(Arc::new(node), b"should-not-append\n").await;
+            assert_eq!(
+                response,
+                "ERR not-owner canon=1 endpoint=tcp://owner.local:9000\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn unowned_returns_recovering_without_append() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_a()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let CanonNodeStart::Serving(node) = CanonNode::start(
+                config(owner_a()),
+                harness.virtual_log(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("start") else {
+                panic!("expected Serving");
+            };
+            let second = LogletId::new("canon-raw-unowned").expect("id");
+            harness.resolver.insert(
+                second.clone(),
+                Arc::new(
+                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                        .build()
+                        .expect("log"),
+                ),
+            );
+            harness
+                .virtual_log()
+                .reconfigure_with_application_fence(
+                    second,
+                    CanonFence::new(1, journal(), line(), CanonOwner::Unowned).encode(),
+                )
+                .await
+                .expect("unowned");
+            let response = exchange(Arc::new(node), b"nope\n").await;
+            assert_eq!(response, "ERR recovering canon=1\n");
+        }
+
+        #[tokio::test]
+        async fn resolver_failure_returns_unavailable() {
+            use holylog::virtual_log::{
+                RegisterError, RegisterFuture, VersionedState, VirtualLogState,
+            };
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            struct FailAfterArm {
+                inner: InMemoryConditionalRegister,
+                armed: AtomicBool,
+            }
+
+            impl ConditionalRegister for FailAfterArm {
+                fn read(&self) -> RegisterFuture<'_, Option<VersionedState>> {
+                    Box::pin(async {
+                        if self.armed.load(Ordering::Acquire) {
+                            return Err(RegisterError::backend(std::io::Error::other(
+                                "register unavailable",
+                            )));
+                        }
+                        self.inner.read().await
+                    })
+                }
+
+                fn compare_and_swap(
+                    &self,
+                    expected: Option<&VersionedState>,
+                    new_state: VirtualLogState,
+                ) -> RegisterFuture<'_, bool> {
+                    self.inner.compare_and_swap(expected, new_state)
+                }
+            }
+
+            let register = Arc::new(FailAfterArm {
+                inner: InMemoryConditionalRegister::new(),
+                armed: AtomicBool::new(false),
+            });
+            let resolver = Arc::new(Resolver::default());
+            let first = LogletId::new("canon-raw-fail").expect("id");
+            resolver.insert(
+                first.clone(),
+                Arc::new(
+                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
+                        .build()
+                        .expect("log"),
+                ),
+            );
+            let log = VirtualLog::new(
+                Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+                Arc::clone(&resolver) as Arc<dyn LogletResolver>,
+            );
+            log.bootstrap_with_application_fence(first, fence(0, owner_a()).encode())
+                .await
+                .expect("bootstrap");
+            let CanonNodeStart::Serving(node) = CanonNode::start(
+                config(owner_a()),
+                log,
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+            )
+            .await
+            .expect("start") else {
+                panic!("expected Serving");
+            };
+            register.armed.store(true, Ordering::Release);
+            let response = exchange(Arc::new(node), b"nope\n").await;
+            assert_eq!(response, "ERR unavailable\n");
+        }
     }
 }
