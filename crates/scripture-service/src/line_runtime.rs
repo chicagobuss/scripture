@@ -78,9 +78,13 @@ pub enum LineUnavailable {
     Terminal,
 }
 
-/// Pre-drain rejection that restores the caller's runtime unchanged.
+/// A failed handoff attempt that returns ownership of the runtime to the caller.
+///
+/// Precondition failures leave the returned runtime unchanged. Once the
+/// operation has taken the serving owner, any failure returns a terminal,
+/// non-serving runtime; it must not be resumed automatically.
 #[derive(Debug)]
-pub struct LineHandoffReject {
+pub struct LineHandoffFailure {
     /// Runtime still in its prior phase (Serving or non-serving).
     pub runtime: LineRuntime,
     /// Why the handoff did not begin.
@@ -261,17 +265,17 @@ impl LineRuntime {
 
     /// Consuming fenced A→B (or Unowned) handoff.
     ///
-    /// Pre-drain identity / phase checks return [`LineHandoffReject`] with the
-    /// runtime unchanged. Once exclusive ownership of the serving actor is taken,
-    /// the runtime becomes irreversibly non-serving and the result is always a
-    /// terminal runtime plus [`CanonTransitionOutcome`] (including conflict when
-    /// ownership was already lost before drain).
+    /// Precondition failures return [`LineHandoffFailure`] with the runtime
+    /// unchanged. Once exclusive ownership of the serving actor is taken, the
+    /// runtime becomes irreversibly non-serving; a later failure returns that
+    /// terminal runtime in [`LineHandoffFailure`]. A lost ownership observation
+    /// returns terminal [`CanonTransitionOutcome::ConflictNeedsInspect`].
     pub async fn drain_seal_publish(
         mut self,
         request: LineHandoffRequest,
-    ) -> Result<(Self, CanonTransitionOutcome), LineHandoffReject> {
+    ) -> Result<(Self, CanonTransitionOutcome), LineHandoffFailure> {
         if request.journal_id != self.journal_id || request.line_id != self.line_id {
-            return Err(LineHandoffReject {
+            return Err(LineHandoffFailure {
                 error: LineHandoffError::IdentityMismatch {
                     runtime_journal: self.journal_id,
                     runtime_line: self.line_id,
@@ -282,7 +286,7 @@ impl LineRuntime {
             });
         }
         if !matches!(self.phase, LinePhase::Serving(_)) {
-            return Err(LineHandoffReject {
+            return Err(LineHandoffFailure {
                 error: LineHandoffError::NotServing,
                 runtime: self,
             });
@@ -292,7 +296,7 @@ impl LineRuntime {
             LinePhase::Serving(service) => service,
             other => {
                 self.phase = other;
-                return Err(LineHandoffReject {
+                return Err(LineHandoffFailure {
                     error: LineHandoffError::NotServing,
                     runtime: self,
                 });
@@ -313,7 +317,7 @@ impl LineRuntime {
             Err(error) => {
                 self.phase = LinePhase::Terminal(LineTerminal::FailedNeedsReconcile);
                 drop(service);
-                return Err(LineHandoffReject {
+                return Err(LineHandoffFailure {
                     runtime: self,
                     error,
                 });
