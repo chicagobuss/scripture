@@ -7,9 +7,22 @@ description = "Lab-grade Scripture daemon transport adapters"
 license = "MIT"
 publish = false
 
+[features]
+default = []
+fleet-lab = [
+    "dep:holylog-object-store",
+    "dep:holylog-object-store-register",
+    "dep:object_store",
+    "holylog-object-store/s3",
+    "holylog-object-store-register/aws",
+]
+
 [dependencies]
 bytes.workspace = true
 holylog.workspace = true
+holylog-object-store = { workspace = true, optional = true }
+holylog-object-store-register = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true, default-features = false }
 scripture = { path = "../scripture" }
 scripture-service = { path = "../scripture-service" }
 thiserror.workspace = true
@@ -17,6 +30,11 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bin]]
+name = "fleet-lab-node"
+path = "src/bin/fleet_lab_node.rs"
+required-features = ["fleet-lab"]
 
 [lints]
 workspace = true

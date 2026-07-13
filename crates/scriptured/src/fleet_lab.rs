@@ -39,21 +39,65 @@ pub struct NodeIdentity {
     pub endpoint: OwnerEndpoint,
 }
 
-/// In-memory durable components for one Loglet generation (fleet-lab only).
+/// Durable Loglet components for one generation (fleet-lab).
 #[derive(Clone)]
-struct DurableLogletParts {
-    drive: Arc<InMemoryLogDrive>,
-    seal: Arc<InMemorySeal>,
-    trim: Arc<InMemoryTrimPoint>,
+pub struct DurableLogletParts {
+    drive: Arc<dyn LogDrive>,
+    seal: Arc<dyn Seal>,
+    trim: Arc<dyn TrimPoint>,
 }
 
 impl DurableLogletParts {
-    fn fresh() -> Self {
-        Self {
-            drive: Arc::new(InMemoryLogDrive::new()),
-            seal: Arc::new(InMemorySeal::new()),
-            trim: Arc::new(InMemoryTrimPoint::new()),
-        }
+    /// Assembles already-namespaced drive/seal/trim handles.
+    #[must_use]
+    pub fn from_components(
+        drive: Arc<dyn LogDrive>,
+        seal: Arc<dyn Seal>,
+        trim: Arc<dyn TrimPoint>,
+    ) -> Self {
+        Self { drive, seal, trim }
+    }
+
+    fn fresh_memory() -> Self {
+        Self::from_components(
+            Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>,
+            Arc::new(InMemorySeal::new()) as Arc<dyn Seal>,
+            Arc::new(InMemoryTrimPoint::new()) as Arc<dyn TrimPoint>,
+        )
+    }
+}
+
+/// Allocates durable data/seal/trim namespaces for a Loglet id.
+pub trait PartsFactory: Send + Sync {
+    /// Empty namespaces suitable for [`provision_fresh_writable`].
+    fn fresh(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError>;
+    /// Re-open existing durable namespaces (process restart / refuse path).
+    fn open(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError>;
+}
+
+/// Failures while allocating durable Loglet parts.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PartsFactoryError(String);
+
+impl PartsFactoryError {
+    /// Builds a parts-factory failure from a displayable cause.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+/// Process-local in-memory parts. Cross-process reopen is not durable.
+#[derive(Debug, Default)]
+pub struct InMemoryPartsFactory;
+
+impl PartsFactory for InMemoryPartsFactory {
+    fn fresh(&self, _loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError> {
+        Ok(DurableLogletParts::fresh_memory())
+    }
+
+    fn open(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError> {
+        self.fresh(loglet_id)
     }
 }
 
@@ -122,6 +166,7 @@ pub struct VerseNodeSupervisor {
     identity: NodeIdentity,
     register: Arc<dyn ConditionalRegister>,
     resolver: Arc<FleetLabResolver>,
+    parts: Arc<dyn PartsFactory>,
     configs: BTreeMap<VerseKey, VerseRuntimeConfig>,
     stores: Mutex<BTreeMap<VerseKey, VerseStore>>,
     node: Mutex<Option<ScriptureNode>>,
@@ -136,6 +181,23 @@ impl VerseNodeSupervisor {
         resolver: Arc<FleetLabResolver>,
         configs: Vec<VerseRuntimeConfig>,
     ) -> Result<Self, ScriptureNodeConfigError> {
+        Self::with_parts_factory(
+            identity,
+            register,
+            resolver,
+            Arc::new(InMemoryPartsFactory),
+            configs,
+        )
+    }
+
+    /// Builds a supervisor with an explicit durable parts factory (object-store lab).
+    pub fn with_parts_factory(
+        identity: NodeIdentity,
+        register: Arc<dyn ConditionalRegister>,
+        resolver: Arc<FleetLabResolver>,
+        parts: Arc<dyn PartsFactory>,
+        configs: Vec<VerseRuntimeConfig>,
+    ) -> Result<Self, ScriptureNodeConfigError> {
         let mut map = BTreeMap::new();
         for config in configs {
             let key = VerseKey::from_config(&config);
@@ -147,6 +209,7 @@ impl VerseNodeSupervisor {
             identity,
             register,
             resolver,
+            parts,
             configs: map,
             stores: Mutex::new(BTreeMap::new()),
             node: Mutex::new(None),
@@ -196,15 +259,15 @@ impl VerseNodeSupervisor {
             });
         }
 
-        let parts = DurableLogletParts::fresh();
+        let parts = self.parts.fresh(&loglet_id)?;
         let fresh = provision_fresh_writable(
             GenerationDescriptor {
                 loglet_id: loglet_id.clone(),
                 start: 0,
             },
-            Arc::clone(&parts.drive) as Arc<dyn LogDrive>,
-            Arc::clone(&parts.seal) as Arc<dyn Seal>,
-            Arc::clone(&parts.trim) as Arc<dyn TrimPoint>,
+            Arc::clone(&parts.drive),
+            Arc::clone(&parts.seal),
+            Arc::clone(&parts.trim),
             k,
         )
         .await?;
@@ -287,9 +350,9 @@ impl VerseNodeSupervisor {
 
         match refuse_open_writable_reattach(
             active,
-            Arc::clone(&parts.drive) as Arc<dyn LogDrive>,
-            Arc::clone(&parts.seal) as Arc<dyn Seal>,
-            Arc::clone(&parts.trim) as Arc<dyn TrimPoint>,
+            Arc::clone(&parts.drive),
+            Arc::clone(&parts.seal),
+            Arc::clone(&parts.trim),
             k,
         )
         .await
@@ -336,9 +399,9 @@ impl VerseNodeSupervisor {
         };
 
         let historical = resolve_read_seal(
-            Arc::clone(&parts.drive) as Arc<dyn LogDrive>,
-            Arc::clone(&parts.seal) as Arc<dyn Seal>,
-            Arc::clone(&parts.trim) as Arc<dyn TrimPoint>,
+            Arc::clone(&parts.drive),
+            Arc::clone(&parts.seal),
+            Arc::clone(&parts.trim),
             k,
         )
         .await?;
@@ -350,22 +413,22 @@ impl VerseNodeSupervisor {
         }
         let sealed_tail = historical.check_tail().await?.tail;
         let sealed_view = Arc::new(
-            AtomicLog::builder(Arc::clone(&parts.drive) as Arc<dyn LogDrive>, k)
-                .seal(Arc::clone(&parts.seal) as Arc<dyn Seal>)
-                .trim(Arc::clone(&parts.trim) as Arc<dyn TrimPoint>)
+            AtomicLog::builder(Arc::clone(&parts.drive), k)
+                .seal(Arc::clone(&parts.seal))
+                .trim(Arc::clone(&parts.trim))
                 .build()?,
         );
         self.resolver.insert(active, sealed_view);
 
-        let next_parts = DurableLogletParts::fresh();
+        let next_parts = self.parts.fresh(&successor)?;
         let fresh = provision_fresh_writable(
             GenerationDescriptor {
                 loglet_id: successor.clone(),
                 start: sealed_tail,
             },
-            Arc::clone(&next_parts.drive) as Arc<dyn LogDrive>,
-            Arc::clone(&next_parts.seal) as Arc<dyn Seal>,
-            Arc::clone(&next_parts.trim) as Arc<dyn TrimPoint>,
+            Arc::clone(&next_parts.drive),
+            Arc::clone(&next_parts.seal),
+            Arc::clone(&next_parts.trim),
             k,
         )
         .await?;
@@ -539,6 +602,9 @@ pub enum SupervisorError {
     /// Holylog provision failure.
     #[error(transparent)]
     Provision(#[from] ProvisionError),
+    /// Durable parts allocation failure.
+    #[error(transparent)]
+    Parts(#[from] PartsFactoryError),
     /// Holylog AtomicLog construction failure.
     #[error(transparent)]
     AtomicLog(#[from] holylog::atomic::AtomicLogError),
