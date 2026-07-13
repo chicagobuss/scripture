@@ -611,9 +611,57 @@ impl ChunkJournalService {
         Ok(self.owner(journal_id)?.health())
     }
 
+    /// Read-only check used by Canon route resolution.
+    ///
+    /// Reports whether a Canon-bound local owner exactly matches the supplied
+    /// journal / Line / owner / revision identity and whether it is Running.
+    /// Lab registrations and identity mismatches are [`LocalCanonOwnerMatch::Unavailable`].
+    #[must_use]
+    pub fn local_canon_owner_match(
+        &self,
+        journal_id: JournalId,
+        line_id: LineId,
+        owner_id: OwnerId,
+        revision: u64,
+    ) -> LocalCanonOwnerMatch {
+        let Some(owner) = self.owners.get(&journal_id) else {
+            return LocalCanonOwnerMatch::Unavailable;
+        };
+        let Some(binding) = owner.canon.as_ref() else {
+            return LocalCanonOwnerMatch::Unavailable;
+        };
+        if binding.journal_id != journal_id
+            || binding.line_id != line_id
+            || binding.owner_id != owner_id
+            || binding.revision != revision
+        {
+            return LocalCanonOwnerMatch::Unavailable;
+        }
+        let status = owner.health().status;
+        if status == OwnerStatus::Running {
+            LocalCanonOwnerMatch::ServeReady
+        } else {
+            LocalCanonOwnerMatch::BoundNotRunning { status }
+        }
+    }
+
     fn owner(&self, journal_id: JournalId) -> Result<&OwnerSlot, ChunkServiceError> {
         self.owners
             .get(&journal_id)
             .ok_or(ChunkServiceError::UnknownJournal { journal_id })
     }
+}
+
+/// Outcome of [`ChunkJournalService::local_canon_owner_match`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalCanonOwnerMatch {
+    /// Exact Canon binding is present and [`OwnerStatus::Running`].
+    ServeReady,
+    /// Exact Canon binding is present but not serving.
+    BoundNotRunning {
+        /// Observed local status.
+        status: OwnerStatus,
+    },
+    /// Missing journal, lab-only registration, or identity mismatch.
+    Unavailable,
 }
