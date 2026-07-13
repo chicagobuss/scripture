@@ -6,9 +6,12 @@
 //! same log can permanently wedge later completion.  The future driver owns
 //! this writer and poisons on every non-OK append outcome.
 
-use holylog::atomic::{AtomicLog, AtomicLogError};
+use holylog::atomic::{AtomicLog, AtomicLogError, SealStatus};
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 
+use crate::canon::{
+    CanonAuthorityError, CanonAuthoritySnapshot, LineId, OwnerId, observe_canon_authority,
+};
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
 use crate::model::{JournalId, RecordOffset};
 
@@ -82,6 +85,20 @@ pub struct ChunkLogRecovery {
     pub chunks: Vec<RecoveredChunk>,
 }
 
+/// VirtualLog recovery result for one fenced Canon observation.
+///
+/// [`Self::authority`] is the observation used to start this attempt, not a
+/// forever lease. A later register advance or seal fence invalidates it.
+#[derive(Debug)]
+pub struct VirtualChunkLogRecovery {
+    /// Writer bound to the active Canon revision.
+    pub writer: ChunkLogWriter,
+    /// Bounded durable suffix in global logical order.
+    pub chunks: Vec<RecoveredChunk>,
+    /// Fresh authority observation that authorized this recovery attempt.
+    pub authority: CanonAuthoritySnapshot,
+}
+
 /// Errors at the chunk-to-Holylog boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkLogError {
@@ -91,6 +108,9 @@ pub enum ChunkLogError {
     /// A VirtualLog-backed Holylog failed or fenced this owner at a seal.
     #[error(transparent)]
     VirtualLog(#[from] VirtualLogError),
+    /// Fresh Canon authority observation refused this owner.
+    #[error(transparent)]
+    Authority(#[from] CanonAuthorityError),
     /// The cached VirtualLog membership no longer names this writer generation.
     #[error("VirtualLog generation changed: expected {expected}, observed {actual}")]
     VirtualGenerationChanged {
@@ -98,6 +118,16 @@ pub enum ChunkLogError {
         expected: u64,
         /// Membership revision currently cached by VirtualLog.
         actual: u64,
+    },
+    /// Canon/VirtualLog revision changed while recovery was reading.
+    #[error(
+        "Canon recovery invalidated: started at revision {expected}, observed {observed} before returning a writer"
+    )]
+    StaleCanonRecovery {
+        /// Revision that authorized the attempt.
+        expected: u64,
+        /// Revision observed at the end of the attempt.
+        observed: u64,
     },
     /// Chunk bytes are malformed.
     #[error(transparent)]
@@ -111,6 +141,16 @@ pub enum ChunkLogError {
         /// Writer generation.
         expected: u64,
         /// Chunk generation.
+        actual: u64,
+    },
+    /// A recovered VirtualLog chunk claims a generation after the inspected Canon.
+    #[error(
+        "recovered chunk generation {actual} is after active Canon revision {active}; authority is inconsistent"
+    )]
+    FutureChunkGeneration {
+        /// Active Canon revision from the recovery observation.
+        active: u64,
+        /// Generation encoded in the chunk header.
         actual: u64,
     },
     /// Phase 1 requires exactly one frame for this writer's journal.
@@ -325,14 +365,73 @@ impl ChunkLogWriter {
         log: AtomicLog,
         bound: RecoveryBound,
     ) -> Result<ChunkLogRecovery, ChunkLogError> {
-        Self::recover_from_log(
+        let (writer, chunks) = Self::recover_from_log(
             journal_id,
             cohort_id,
             generation,
             ChunkLog::Atomic(log),
             bound,
+            GenerationPolicy::Exact(generation),
         )
-        .await
+        .await?;
+        Ok(ChunkLogRecovery { writer, chunks })
+    }
+
+    /// Rebuilds a VirtualLog-backed writer after a fenced Canon cutover.
+    ///
+    /// Starts from a fresh linearizable VirtualLog state and validates the
+    /// Canon fence identity/owner before reading a bounded suffix. Historical
+    /// chunk headers with generation `<=` the active Canon revision are
+    /// accepted; a future generation fails closed. The returned writer always
+    /// encodes the **active** Canon revision for new appends.
+    ///
+    /// If the register advances or the active generation is observed sealed
+    /// while recovery reads, the attempt returns
+    /// [`ChunkLogError::StaleCanonRecovery`] and never a writer.
+    pub async fn recover_virtual(
+        journal_id: JournalId,
+        cohort_id: CohortId,
+        expected_line_id: LineId,
+        expected_owner_id: OwnerId,
+        log: VirtualLog,
+        bound: RecoveryBound,
+    ) -> Result<VirtualChunkLogRecovery, ChunkLogError> {
+        let authority =
+            observe_canon_authority(&log, journal_id, expected_line_id, expected_owner_id).await?;
+        let active_revision = authority.revision();
+
+        let (writer, chunks) = Self::recover_from_log(
+            journal_id,
+            cohort_id,
+            active_revision,
+            ChunkLog::Virtual(log.clone()),
+            bound,
+            GenerationPolicy::AtMost(active_revision),
+        )
+        .await?;
+
+        // Re-inspect before returning: never merge observations across revisions.
+        let closing = log.state().await?;
+        if closing.revision != active_revision {
+            return Err(ChunkLogError::StaleCanonRecovery {
+                expected: active_revision,
+                observed: closing.revision,
+            });
+        }
+        let closing_fence = crate::canon::CanonFence::from_virtual_log_state(&closing)
+            .map_err(CanonAuthorityError::from)?;
+        if closing_fence != authority.fence {
+            return Err(ChunkLogError::StaleCanonRecovery {
+                expected: active_revision,
+                observed: closing.revision,
+            });
+        }
+
+        Ok(VirtualChunkLogRecovery {
+            writer,
+            chunks,
+            authority,
+        })
     }
 
     async fn recover_from_log(
@@ -341,21 +440,69 @@ impl ChunkLogWriter {
         generation: u64,
         log: ChunkLog,
         bound: RecoveryBound,
-    ) -> Result<ChunkLogRecovery, ChunkLogError> {
-        let tail = log.checked_tail().await?;
+        generation_policy: GenerationPolicy,
+    ) -> Result<(Self, Vec<RecoveredChunk>), ChunkLogError> {
+        let tail = match &log {
+            ChunkLog::Atomic(_) => log.checked_tail().await?,
+            ChunkLog::Virtual(virtual_log) => {
+                let check = virtual_log.check_tail().await?;
+                if check.seal_status == SealStatus::Sealed {
+                    return Err(ChunkLogError::StaleCanonRecovery {
+                        expected: generation,
+                        observed: check.revision,
+                    });
+                }
+                if check.revision != generation {
+                    return Err(ChunkLogError::StaleCanonRecovery {
+                        expected: generation,
+                        observed: check.revision,
+                    });
+                }
+                check.tail
+            }
+        };
         let start = tail.saturating_sub(bound.max_chunks() as u64);
         let mut chunks = Vec::new();
         for slot in start..tail {
-            let payload = log.read_payload(slot, tail).await?;
+            let payload = match log.read_payload(slot, tail).await {
+                Ok(payload) => payload,
+                Err(ChunkLogError::VirtualLog(VirtualLogError::StaleGeneration { .. })) => {
+                    let observed = match &log {
+                        ChunkLog::Virtual(virtual_log) => virtual_log
+                            .state()
+                            .await
+                            .map(|state| state.revision)
+                            .unwrap_or_else(|_| generation.saturating_add(1)),
+                        ChunkLog::Atomic(_) => generation.saturating_add(1),
+                    };
+                    return Err(ChunkLogError::StaleCanonRecovery {
+                        expected: generation,
+                        observed,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             let index = decode_index(&payload)?;
             if index.header.cohort_id != cohort_id {
                 return Err(ChunkLogError::CohortMismatch);
             }
-            if index.header.generation != generation {
-                return Err(ChunkLogError::GenerationMismatch {
-                    expected: generation,
-                    actual: index.header.generation,
-                });
+            match generation_policy {
+                GenerationPolicy::Exact(expected) => {
+                    if index.header.generation != expected {
+                        return Err(ChunkLogError::GenerationMismatch {
+                            expected,
+                            actual: index.header.generation,
+                        });
+                    }
+                }
+                GenerationPolicy::AtMost(active) => {
+                    if index.header.generation > active {
+                        return Err(ChunkLogError::FutureChunkGeneration {
+                            active,
+                            actual: index.header.generation,
+                        });
+                    }
+                }
             }
             let [frame] = index.frames.as_slice() else {
                 return Err(ChunkLogError::JournalFrameMismatch {
@@ -399,6 +546,12 @@ impl ChunkLogWriter {
             next_offset,
             poisoned: false,
         };
-        Ok(ChunkLogRecovery { writer, chunks })
+        Ok((writer, chunks))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenerationPolicy {
+    Exact(u64),
+    AtMost(u64),
 }

@@ -27,6 +27,7 @@ pub use chunk::{
 };
 pub use chunklog::{
     ChunkAppendAck, ChunkLogError, ChunkLogRecovery, ChunkLogWriter, RecoveredChunk, RecoveryBound,
+    VirtualChunkLogRecovery,
 };
 pub use clock::{
     BatchAccumulator, BatchPolicy, Clock, ManualClock, ManualTimer, PushResult, SystemClock,
