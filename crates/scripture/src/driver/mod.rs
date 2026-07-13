@@ -76,6 +76,15 @@ pub struct Receipt {
     pub chunk_id: ChunkId,
     /// Holylog slot of that chunk.
     pub slot: u64,
+    /// Canon / chunk generation encoded in the chunk that satisfied this receipt.
+    ///
+    /// This is the generation that **accepted** the append, not the latest
+    /// VirtualLog register revision at the wall-clock moment a caller inspects
+    /// the receipt. After a cutover publishes a successor, an older receipt must
+    /// still name the predecessor generation. On AtomicLog/lab paths this is the
+    /// writer generation supplied at construction — a chunk-generation field,
+    /// not a claim of fleet fencing.
+    pub canon_revision: u64,
     /// True when this receipt was replayed from the dedup window.
     pub deduplicated: bool,
 }
@@ -317,7 +326,13 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
                 entry.0 = entry.0.max(submission.sequence);
                 entry.1.insert(
                     submission.sequence,
-                    (first, submission.record_count, chunk.chunk_id, chunk.slot),
+                    (
+                        first,
+                        submission.record_count,
+                        chunk.chunk_id,
+                        chunk.slot,
+                        chunk.generation,
+                    ),
                 );
                 self.admitted_seq.insert(key, entry.0);
                 self.known_producers

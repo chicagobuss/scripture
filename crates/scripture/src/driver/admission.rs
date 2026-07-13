@@ -169,7 +169,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         if let Some((highest, window)) = self.dedup.get(&key)
             && submission.sequence <= *highest
         {
-            if let Some((first_offset, records, chunk_id, slot)) =
+            if let Some((first_offset, records, chunk_id, slot, canon_revision)) =
                 window.get(&submission.sequence).copied()
             {
                 let next_offset = first_offset
@@ -199,6 +199,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                     next_offset,
                     chunk_id,
                     slot,
+                    canon_revision,
                     deduplicated: true,
                 }));
                 let _ = admission.send(Ok(rx));

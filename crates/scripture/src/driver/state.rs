@@ -47,5 +47,7 @@ pub(super) struct SealedWork {
     pub(super) sealed_at: Duration,
 }
 
-pub(super) type DedupEntry = (u64, BTreeMap<u64, (RecordOffset, u32, ChunkId, u64)>);
+/// Dedup window value: highest committed sequence, then per-sequence
+/// `(first_offset, record_count, chunk_id, slot, canon_revision)`.
+pub(super) type DedupEntry = (u64, BTreeMap<u64, (RecordOffset, u32, ChunkId, u64, u64)>);
 pub(super) type DedupWindow = BTreeMap<(ProducerId, u32), DedupEntry>;
