@@ -1,13 +1,12 @@
 //! Fleet-lab Verse node supervisor.
 //!
-//! Composes stable node identity, Verse configurations, Holylog provision
-//! boundaries, and [`ScriptureNode`] lifecycle. Ordinary startup never
-//! bootstraps, elects, or auto-replaces a wedged Verse — those are explicit
-//! operator/test commands.
+//! Explicitly **single-Verse**: one ConditionalRegister, one config, one key.
+//! Ordinary startup never bootstraps, elects, or auto-replaces. Control methods
+//! serialize on an internal mutex. Listener paths hold only [`Arc<VerseRuntime>`].
 //!
-//! Administrative handoff uses [`VerseRuntime::drain_seal_publish`] (consuming).
-//! The listener path holds only [`Arc<VerseRuntime>`] for route/admit; it cannot
-//! unwrap a mutable [`scripture_service::ChunkJournalService`].
+//! Process restart materializes Canon-referenced Loglets via [`PartsFactory::open`]
+//! before any owner recovery attempt. A locally owned open active generation
+//! yields [`VerseControlOutcome::RecoveryRequired`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,9 +20,10 @@ use holylog::provision::{
     resolve_read_seal,
 };
 use holylog::virtual_log::{
-    ConditionalRegister, GenerationDescriptor, LogletId, LogletResolver, ResolveFuture, VirtualLog,
+    ConditionalRegister, GenerationDescriptor, LogletId, LogletResolver, Reconfiguration,
+    ResolveFuture, VirtualLog, VirtualLogError,
 };
-use scripture::{CanonFence, CanonOwner, Clock, OwnerEndpoint, OwnerId, Timer};
+use scripture::{CanonFence, CanonFenceError, CanonOwner, Clock, OwnerEndpoint, OwnerId, Timer};
 use scripture_service::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeStart, VerseHandoffRequest, VerseKey,
     VerseRuntime, VerseRuntimeConfig, VerseRuntimeStartError,
@@ -87,7 +87,9 @@ impl PartsFactoryError {
     }
 }
 
-/// Process-local in-memory parts. Cross-process reopen is not durable.
+/// Process-local in-memory parts. [`PartsFactory::open`] invents empty drives and
+/// is not valid across process boundaries — use [`SharedMemoryPartsFactory`] or
+/// an object-store factory for durable reopen.
 #[derive(Debug, Default)]
 pub struct InMemoryPartsFactory;
 
@@ -97,7 +99,52 @@ impl PartsFactory for InMemoryPartsFactory {
     }
 
     fn open(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError> {
-        self.fresh(loglet_id)
+        Err(PartsFactoryError::new(format!(
+            "InMemoryPartsFactory cannot reopen {loglet_id}; use SharedMemoryPartsFactory or object-store"
+        )))
+    }
+}
+
+/// In-memory parts that survive across independently constructed supervisors
+/// when the factory Arc is shared (lab stand-in for object-store prefixes).
+#[derive(Default)]
+pub struct SharedMemoryPartsFactory {
+    parts: std::sync::Mutex<BTreeMap<LogletId, DurableLogletParts>>,
+}
+
+impl std::fmt::Debug for SharedMemoryPartsFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedMemoryPartsFactory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartsFactory for SharedMemoryPartsFactory {
+    fn fresh(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError> {
+        let parts = DurableLogletParts::fresh_memory();
+        let mut map = self
+            .parts
+            .lock()
+            .map_err(|_| PartsFactoryError::new("SharedMemoryPartsFactory lock poisoned"))?;
+        if map.contains_key(loglet_id) {
+            return Err(PartsFactoryError::new(format!(
+                "Loglet {loglet_id} already has durable parts"
+            )));
+        }
+        map.insert(loglet_id.clone(), parts.clone());
+        Ok(parts)
+    }
+
+    fn open(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, PartsFactoryError> {
+        self.parts
+            .lock()
+            .map_err(|_| PartsFactoryError::new("SharedMemoryPartsFactory lock poisoned"))?
+            .get(loglet_id)
+            .cloned()
+            .ok_or_else(|| {
+                PartsFactoryError::new(format!("no durable parts for Loglet {loglet_id}"))
+            })
     }
 }
 
@@ -117,6 +164,12 @@ impl FleetLabResolver {
     pub fn remove(&self, id: &LogletId) -> Option<Arc<AtomicLog>> {
         self.loglets.lock().expect("lock").remove(id)
     }
+
+    /// Whether `id` is currently installed.
+    #[must_use]
+    pub fn contains(&self, id: &LogletId) -> bool {
+        self.loglets.lock().expect("lock").contains_key(id)
+    }
 }
 
 impl LogletResolver for FleetLabResolver {
@@ -126,7 +179,7 @@ impl LogletResolver for FleetLabResolver {
     }
 }
 
-/// Per-Verse durable bookkeeping for the in-memory fleet lab.
+/// Local bookkeeping for the configured Verse.
 struct VerseStore {
     parts: BTreeMap<LogletId, DurableLogletParts>,
     active: Option<LogletId>,
@@ -141,7 +194,7 @@ impl VerseStore {
     }
 }
 
-/// Startup / control outcome for one Verse under the supervisor.
+/// Startup / control outcome for the supervised Verse.
 #[derive(Debug)]
 pub enum VerseControlOutcome {
     /// [`VerseRuntime`] is serving.
@@ -153,68 +206,69 @@ pub enum VerseControlOutcome {
         /// Typed Holylog refusal.
         error: OpenReattachError,
     },
+    /// Replacement CAS lost; local active was not promoted.
+    ConflictNeedsInspect,
     /// Runtime startup failed for another typed reason.
     StartFailed(VerseRuntimeStartError),
 }
 
-/// Fleet-lab supervisor for one Scripture node process.
+/// Fleet-lab supervisor for one Scripture Verse in one process.
 ///
-/// Control methods take `&self` and serialize through an internal mutex so a
+/// Control methods take `&self` and serialize through [`Self::control`] so a
 /// raw-lines listener may hold [`Arc<VerseRuntime>`] clones while the operator
-/// thread runs consuming handoff/replace on the selected Verse.
+/// thread runs consuming handoff/replace.
 pub struct VerseNodeSupervisor {
     identity: NodeIdentity,
     register: Arc<dyn ConditionalRegister>,
     resolver: Arc<FleetLabResolver>,
     parts: Arc<dyn PartsFactory>,
-    configs: BTreeMap<VerseKey, VerseRuntimeConfig>,
-    stores: Mutex<BTreeMap<VerseKey, VerseStore>>,
+    config: VerseRuntimeConfig,
+    key: VerseKey,
+    store: Mutex<VerseStore>,
     node: Mutex<Option<ScriptureNode>>,
-    runtimes: Mutex<BTreeMap<VerseKey, Arc<VerseRuntime>>>,
+    runtime: Mutex<Option<Arc<VerseRuntime>>>,
+    /// Serializes bootstrap / start / replace / crash / handoff.
+    control: Mutex<()>,
 }
 
 impl VerseNodeSupervisor {
-    /// Builds a supervisor over a shared register/resolver. Does not start Verses.
+    /// Builds a single-Verse supervisor with process-local in-memory parts.
     pub fn new(
         identity: NodeIdentity,
         register: Arc<dyn ConditionalRegister>,
         resolver: Arc<FleetLabResolver>,
-        configs: Vec<VerseRuntimeConfig>,
-    ) -> Result<Self, ScriptureNodeConfigError> {
+        config: VerseRuntimeConfig,
+    ) -> Self {
         Self::with_parts_factory(
             identity,
             register,
             resolver,
             Arc::new(InMemoryPartsFactory),
-            configs,
+            config,
         )
     }
 
-    /// Builds a supervisor with an explicit durable parts factory (object-store lab).
+    /// Builds a single-Verse supervisor with an explicit durable parts factory.
     pub fn with_parts_factory(
         identity: NodeIdentity,
         register: Arc<dyn ConditionalRegister>,
         resolver: Arc<FleetLabResolver>,
         parts: Arc<dyn PartsFactory>,
-        configs: Vec<VerseRuntimeConfig>,
-    ) -> Result<Self, ScriptureNodeConfigError> {
-        let mut map = BTreeMap::new();
-        for config in configs {
-            let key = VerseKey::from_config(&config);
-            if map.insert(key, config).is_some() {
-                return Err(ScriptureNodeConfigError::DuplicateVerse { key });
-            }
-        }
-        Ok(Self {
+        config: VerseRuntimeConfig,
+    ) -> Self {
+        let key = VerseKey::from_config(&config);
+        Self {
             identity,
             register,
             resolver,
             parts,
-            configs: map,
-            stores: Mutex::new(BTreeMap::new()),
+            config,
+            key,
+            store: Mutex::new(VerseStore::new()),
             node: Mutex::new(None),
-            runtimes: Mutex::new(BTreeMap::new()),
-        })
+            runtime: Mutex::new(None),
+            control: Mutex::new(()),
+        }
     }
 
     /// Configured node identity.
@@ -223,8 +277,18 @@ impl VerseNodeSupervisor {
         &self.identity
     }
 
-    /// Shared VirtualLog for one Verse key (same register/resolver for all Verses
-    /// in this lab composition).
+    /// Sole Verse key for this supervisor.
+    #[must_use]
+    pub fn verse_key(&self) -> VerseKey {
+        self.key
+    }
+
+    /// Locally remembered active Loglet after bootstrap/replace materialization.
+    pub async fn active_loglet(&self) -> Option<LogletId> {
+        self.store.lock().await.active.clone()
+    }
+
+    /// VirtualLog bound to this Verse's sole register/resolver.
     #[must_use]
     pub fn virtual_log(&self) -> VirtualLog {
         VirtualLog::new(
@@ -237,7 +301,6 @@ impl VerseNodeSupervisor {
     /// Canon naming this node, then start the runtime.
     pub async fn bootstrap_verse<C, T>(
         &self,
-        key: VerseKey,
         loglet_id: LogletId,
         clock: C,
         timer: T,
@@ -247,14 +310,10 @@ impl VerseNodeSupervisor {
         C: Clock + Clone + Send + 'static,
         T: Timer + Clone + Send + 'static,
     {
-        let config = self
-            .configs
-            .get(&key)
-            .ok_or(SupervisorError::UnknownVerse { key })?
-            .clone();
-        if config.owner_id != self.identity.owner_id {
+        let _control = self.control.lock().await;
+        if self.config.owner_id != self.identity.owner_id {
             return Err(SupervisorError::OwnerMismatch {
-                configured: config.owner_id,
+                configured: self.config.owner_id,
                 node: self.identity.owner_id,
             });
         }
@@ -274,16 +333,15 @@ impl VerseNodeSupervisor {
         self.resolver
             .insert(loglet_id.clone(), Arc::new(fresh.into_atomic_log()));
         {
-            let mut stores = self.stores.lock().await;
-            let store = stores.entry(key).or_insert_with(VerseStore::new);
+            let mut store = self.store.lock().await;
             store.parts.insert(loglet_id.clone(), parts);
             store.active = Some(loglet_id.clone());
         }
 
         let fence = CanonFence::new(
             0,
-            config.journal_id,
-            config.verse_id,
+            self.config.journal_id,
+            self.config.verse_id,
             CanonOwner::Owned {
                 owner_id: self.identity.owner_id,
                 endpoint: self.identity.endpoint.clone(),
@@ -293,37 +351,17 @@ impl VerseNodeSupervisor {
             .bootstrap_with_application_fence(loglet_id, fence.encode())
             .await?;
 
-        self.start_verse(key, clock, timer).await
+        self.start_verse_locked(clock, timer).await
     }
 
-    /// Starts configured Verses from existing durable Canon evidence.
+    /// Starts from existing durable Canon evidence.
     ///
-    /// Does not provision or replace. Open active generations that this process
-    /// cannot write are reported as [`VerseControlOutcome::RecoveryRequired`].
+    /// Does not provision or replace. Materializes every Canon-referenced
+    /// generation through [`PartsFactory::open`]. A locally owned open active
+    /// generation returns [`VerseControlOutcome::RecoveryRequired`] before any
+    /// owner-recovery attempt.
     pub async fn start_configured<C, T>(
         &self,
-        clock: C,
-        timer: T,
-        k: u64,
-    ) -> Result<BTreeMap<VerseKey, VerseControlOutcome>, SupervisorError>
-    where
-        C: Clock + Clone + Send + 'static,
-        T: Timer + Clone + Send + 'static,
-    {
-        let mut outcomes = BTreeMap::new();
-        for key in self.configs.keys().copied() {
-            outcomes.insert(
-                key,
-                self.start_or_require_recovery(key, clock.clone(), timer.clone(), k)
-                    .await?,
-            );
-        }
-        Ok(outcomes)
-    }
-
-    async fn start_or_require_recovery<C, T>(
-        &self,
-        key: VerseKey,
         clock: C,
         timer: T,
         k: u64,
@@ -332,22 +370,110 @@ impl VerseNodeSupervisor {
         C: Clock + Clone + Send + 'static,
         T: Timer + Clone + Send + 'static,
     {
-        let (active, parts) = {
-            let stores = self.stores.lock().await;
-            let Some(store) = stores.get(&key) else {
-                // No local durable parts yet — attempt runtime start from register alone
-                // (standby / error paths). Serving requires prior bootstrap/replace.
-                return self.start_verse(key, clock, timer).await;
-            };
-            let Some(active) = store.active.clone() else {
-                return self.start_verse(key, clock, timer).await;
-            };
-            let Some(parts) = store.parts.get(&active).cloned() else {
-                return self.start_verse(key, clock, timer).await;
-            };
-            (active, parts)
-        };
+        let _control = self.control.lock().await;
+        self.start_or_require_recovery_locked(clock, timer, k).await
+    }
 
+    async fn start_or_require_recovery_locked<C, T>(
+        &self,
+        clock: C,
+        timer: T,
+        k: u64,
+    ) -> Result<VerseControlOutcome, SupervisorError>
+    where
+        C: Clock + Clone + Send + 'static,
+        T: Timer + Clone + Send + 'static,
+    {
+        // Same-process crash path: VerseStore still holds durable parts.
+        let local = {
+            let store = self.store.lock().await;
+            match (
+                &store.active,
+                store.active.as_ref().and_then(|id| store.parts.get(id)),
+            ) {
+                (Some(active), Some(parts)) => Some((active.clone(), parts.clone())),
+                _ => None,
+            }
+        };
+        if let Some((active, parts)) = local {
+            return self.refuse_writable(active, &parts, k).await;
+        }
+
+        match self.virtual_log().observe_membership().await {
+            Err(VirtualLogError::Uninitialized) => self.start_verse_locked(clock, timer).await,
+            Err(error) => Err(SupervisorError::VirtualLog(error)),
+            Ok(observed) => {
+                let fence = CanonFence::from_virtual_log_state(&observed.state)?;
+                if fence.journal_id != self.config.journal_id
+                    || fence.verse_id != self.config.verse_id
+                {
+                    return Err(SupervisorError::CanonIdentityMismatch {
+                        fence_journal: fence.journal_id,
+                        fence_verse: fence.verse_id,
+                        config_journal: self.config.journal_id,
+                        config_verse: self.config.verse_id,
+                    });
+                }
+
+                let generations = &observed.state.generations;
+                if generations.is_empty() {
+                    return Err(SupervisorError::VirtualLog(
+                        VirtualLogError::EmptyMembership,
+                    ));
+                }
+
+                let mut store = VerseStore::new();
+                let last = generations.len() - 1;
+                for (index, generation) in generations.iter().enumerate() {
+                    let parts = self.parts.open(&generation.loglet_id)?;
+                    let view = resolve_read_seal(
+                        Arc::clone(&parts.drive),
+                        Arc::clone(&parts.seal),
+                        Arc::clone(&parts.trim),
+                        k,
+                    )
+                    .await?;
+                    self.resolver.insert(
+                        generation.loglet_id.clone(),
+                        Arc::new(view.into_atomic_log()),
+                    );
+                    store.parts.insert(generation.loglet_id.clone(), parts);
+                    if index == last {
+                        store.active = Some(generation.loglet_id.clone());
+                    }
+                }
+                *self.store.lock().await = store;
+
+                let active = generations[last].loglet_id.clone();
+                let parts = self
+                    .store
+                    .lock()
+                    .await
+                    .parts
+                    .get(&active)
+                    .cloned()
+                    .ok_or(SupervisorError::NoActiveLoglet { key: self.key })?;
+
+                let locally_owned = matches!(
+                    &fence.owner,
+                    CanonOwner::Owned { owner_id, .. } if *owner_id == self.identity.owner_id
+                );
+                if locally_owned {
+                    // Read/seal views are installed; refuse writable recovery.
+                    return self.refuse_writable(active, &parts, k).await;
+                }
+
+                self.start_verse_locked(clock, timer).await
+            }
+        }
+    }
+
+    async fn refuse_writable(
+        &self,
+        active: LogletId,
+        parts: &DurableLogletParts,
+        k: u64,
+    ) -> Result<VerseControlOutcome, SupervisorError> {
         match refuse_open_writable_reattach(
             active,
             Arc::clone(&parts.drive),
@@ -363,10 +489,9 @@ impl VerseNodeSupervisor {
     }
 
     /// Seals a lost-sequencer active Verse and provisions a fresh successor owned
-    /// by this node. Explicit operator action only.
+    /// by this node. Commits local active state only on [`Reconfiguration::Applied`].
     pub async fn replace_after_lost_sequencer<C, T>(
         &self,
-        key: VerseKey,
         successor: LogletId,
         clock: C,
         timer: T,
@@ -376,27 +501,33 @@ impl VerseNodeSupervisor {
         C: Clock + Clone + Send + 'static,
         T: Timer + Clone + Send + 'static,
     {
-        let config = self
-            .configs
-            .get(&key)
-            .ok_or(SupervisorError::UnknownVerse { key })?
-            .clone();
+        let _control = self.control.lock().await;
         let (active, parts) = {
-            let stores = self.stores.lock().await;
-            let store = stores
-                .get(&key)
-                .ok_or(SupervisorError::UnknownVerse { key })?;
+            let store = self.store.lock().await;
             let active = store
                 .active
                 .clone()
-                .ok_or(SupervisorError::NoActiveLoglet { key })?;
+                .ok_or(SupervisorError::NoActiveLoglet { key: self.key })?;
             let parts = store
                 .parts
                 .get(&active)
                 .cloned()
-                .ok_or(SupervisorError::NoActiveLoglet { key })?;
+                .ok_or(SupervisorError::NoActiveLoglet { key: self.key })?;
             (active, parts)
         };
+
+        // Observe before mutating. If another reconfigurer already moved the
+        // active generation, do not seal/provision against a stale local active.
+        let observed = self.virtual_log().observe_membership().await?;
+        let observed_active = observed
+            .state
+            .active()
+            .ok_or(VirtualLogError::EmptyMembership)?
+            .loglet_id
+            .clone();
+        if observed_active != active {
+            return Ok(VerseControlOutcome::ConflictNeedsInspect);
+        }
 
         let historical = resolve_read_seal(
             Arc::clone(&parts.drive),
@@ -411,20 +542,14 @@ impl VerseNodeSupervisor {
         ) {
             historical.seal().await?;
         }
-        let sealed_tail = historical.check_tail().await?.tail;
-        let sealed_view = Arc::new(
-            AtomicLog::builder(Arc::clone(&parts.drive), k)
-                .seal(Arc::clone(&parts.seal))
-                .trim(Arc::clone(&parts.trim))
-                .build()?,
-        );
-        self.resolver.insert(active, sealed_view);
+        let sealed_view = Arc::new(historical.into_atomic_log());
+        self.resolver.insert(active.clone(), sealed_view);
 
         let next_parts = self.parts.fresh(&successor)?;
         let fresh = provision_fresh_writable(
             GenerationDescriptor {
                 loglet_id: successor.clone(),
-                start: sealed_tail,
+                start: 0,
             },
             Arc::clone(&next_parts.drive),
             Arc::clone(&next_parts.seal),
@@ -434,14 +559,7 @@ impl VerseNodeSupervisor {
         .await?;
         self.resolver
             .insert(successor.clone(), Arc::new(fresh.into_atomic_log()));
-        {
-            let mut stores = self.stores.lock().await;
-            let store = stores.entry(key).or_insert_with(VerseStore::new);
-            store.parts.insert(successor.clone(), next_parts);
-            store.active = Some(successor.clone());
-        }
 
-        let observed = self.virtual_log().observe_membership().await?;
         let next_revision =
             observed
                 .state
@@ -452,73 +570,100 @@ impl VerseNodeSupervisor {
                 })?;
         let fence = CanonFence::new(
             next_revision,
-            config.journal_id,
-            config.verse_id,
+            self.config.journal_id,
+            self.config.verse_id,
             CanonOwner::Owned {
                 owner_id: self.identity.owner_id,
                 endpoint: self.identity.endpoint.clone(),
             },
         );
-        self.virtual_log()
-            .reconfigure_from_observation(&observed, successor, fence.encode())
+        let outcome = self
+            .virtual_log()
+            .reconfigure_from_observation(&observed, successor.clone(), fence.encode())
             .await?;
 
-        self.start_verse(key, clock, timer).await
+        match outcome {
+            Reconfiguration::Applied { .. } => {
+                let mut store = self.store.lock().await;
+                store.parts.insert(successor.clone(), next_parts);
+                store.active = Some(successor);
+                self.start_verse_locked(clock, timer).await
+            }
+            Reconfiguration::Conflict => {
+                self.resolver.remove(&successor);
+                Ok(VerseControlOutcome::ConflictNeedsInspect)
+            }
+        }
     }
 
     /// Simulates losing in-process writer handles for the active Loglet.
-    pub async fn crash_active_writer(&self, key: VerseKey) -> Result<(), SupervisorError> {
-        let active = {
-            let stores = self.stores.lock().await;
-            stores
-                .get(&key)
-                .and_then(|store| store.active.clone())
-                .ok_or(SupervisorError::NoActiveLoglet { key })?
-        };
+    pub async fn crash_active_writer(&self) -> Result<(), SupervisorError> {
+        let _control = self.control.lock().await;
+        let active = self
+            .store
+            .lock()
+            .await
+            .active
+            .clone()
+            .ok_or(SupervisorError::NoActiveLoglet { key: self.key })?;
         self.resolver.remove(&active);
-        let mut runtimes = self.runtimes.lock().await;
-        runtimes.remove(&key);
-        let mut node = self.node.lock().await;
-        *node = None;
+        *self.runtime.lock().await = None;
+        *self.node.lock().await = None;
+        Ok(())
+    }
+
+    /// Drops local VerseStore and runtime while retaining shared durable parts
+    /// (process-boundary simulation when using [`SharedMemoryPartsFactory`]).
+    pub async fn drop_process_local_state(&self) -> Result<(), SupervisorError> {
+        let _control = self.control.lock().await;
+        if let Some(active) = self.store.lock().await.active.clone() {
+            self.resolver.remove(&active);
+        }
+        // Clear all resolver entries this process knew.
+        // Historical gens may remain if shared resolver — clear known parts keys.
+        let ids: Vec<LogletId> = self.store.lock().await.parts.keys().cloned().collect();
+        for id in ids {
+            self.resolver.remove(&id);
+        }
+        *self.store.lock().await = VerseStore::new();
+        *self.runtime.lock().await = None;
+        *self.node.lock().await = None;
         Ok(())
     }
 
     /// Borrow the started runtime for listener admission (cloneable Arc).
-    pub async fn runtime(&self, key: VerseKey) -> Option<Arc<VerseRuntime>> {
-        self.runtimes.lock().await.get(&key).cloned()
+    pub async fn runtime(&self) -> Option<Arc<VerseRuntime>> {
+        self.runtime.lock().await.clone()
     }
 
     /// Consuming fenced handoff for a serving Verse.
     pub async fn drain_seal_publish(
         &self,
-        key: VerseKey,
         request: VerseHandoffRequest,
     ) -> Result<scripture_service::CanonTransitionOutcome, SupervisorError> {
-        let mut runtimes = self.runtimes.lock().await;
-        let runtime = runtimes
-            .remove(&key)
-            .ok_or(SupervisorError::UnknownVerse { key })?;
-        // Exclusive consume: drop Arc so into_inner can succeed.
-        let runtime =
-            Arc::try_unwrap(runtime).map_err(|_| SupervisorError::RuntimeInUse { key })?;
+        let _control = self.control.lock().await;
+        let runtime = self
+            .runtime
+            .lock()
+            .await
+            .take()
+            .ok_or(SupervisorError::UnknownVerse { key: self.key })?;
+        let runtime = Arc::try_unwrap(runtime)
+            .map_err(|_| SupervisorError::RuntimeInUse { key: self.key })?;
         match runtime.drain_seal_publish(request).await {
             Ok((runtime, outcome)) => {
-                runtimes.insert(key, Arc::new(runtime));
+                *self.runtime.lock().await = Some(Arc::new(runtime));
                 Ok(outcome)
             }
             Err(failure) => {
-                runtimes.insert(
-                    VerseKey::new(failure.runtime.journal_id(), failure.runtime.verse_id()),
-                    Arc::new(failure.runtime),
-                );
+                *self.runtime.lock().await = Some(Arc::new(failure.runtime));
                 Err(SupervisorError::Handoff(failure.error))
             }
         }
     }
 
-    async fn start_verse<C, T>(
+    async fn start_verse_locked<C, T>(
         &self,
-        key: VerseKey,
         clock: C,
         timer: T,
     ) -> Result<VerseControlOutcome, SupervisorError>
@@ -526,33 +671,30 @@ impl VerseNodeSupervisor {
         C: Clock + Clone + Send + 'static,
         T: Timer + Clone + Send + 'static,
     {
-        let config = self
-            .configs
-            .get(&key)
-            .ok_or(SupervisorError::UnknownVerse { key })?
-            .clone();
-        let started =
-            ScriptureNode::start(vec![config], |_| self.virtual_log(), clock, timer).await?;
-        self.install_start(key, started).await
+        let started = ScriptureNode::start(
+            vec![self.config.clone()],
+            |_| self.virtual_log(),
+            clock,
+            timer,
+        )
+        .await?;
+        self.install_start(started).await
     }
 
     async fn install_start(
         &self,
-        key: VerseKey,
         started: ScriptureNodeStart,
     ) -> Result<VerseControlOutcome, SupervisorError> {
         if let Some(error) = started.failures.into_values().next() {
             return Ok(VerseControlOutcome::StartFailed(error));
         }
         let mut runtimes_map = started.runtimes;
-        let Some(runtime) = runtimes_map.remove(&key) else {
-            return Err(SupervisorError::UnknownVerse { key });
+        let Some(runtime) = runtimes_map.remove(&self.key) else {
+            return Err(SupervisorError::UnknownVerse { key: self.key });
         };
         let serving = runtime.is_serving();
-        let standby = runtime.is_standby();
-        self.runtimes.lock().await.insert(key, Arc::new(runtime));
+        *self.runtime.lock().await = Some(Arc::new(runtime));
         *self.node.lock().await = Some(ScriptureNode::from_started(runtimes_map));
-        let _ = standby;
         Ok(if serving {
             VerseControlOutcome::Serving
         } else {
@@ -578,6 +720,18 @@ pub enum SupervisorError {
         /// Node owner.
         node: OwnerId,
     },
+    /// Canon fence journal/Verse disagree with the supervisor config.
+    #[error("Canon fence identity disagrees with supervisor config")]
+    CanonIdentityMismatch {
+        /// Fence journal.
+        fence_journal: scripture::JournalId,
+        /// Fence Verse.
+        fence_verse: scripture::VerseId,
+        /// Config journal.
+        config_journal: scripture::JournalId,
+        /// Config Verse.
+        config_verse: scripture::VerseId,
+    },
     /// No active Loglet recorded for replace/crash.
     #[error("Verse has no active Loglet in the supervisor store")]
     NoActiveLoglet {
@@ -599,6 +753,9 @@ pub enum SupervisorError {
     /// Duplicate / config errors from [`ScriptureNode::start`].
     #[error(transparent)]
     Config(#[from] ScriptureNodeConfigError),
+    /// Canon fence decode / binding failure.
+    #[error(transparent)]
+    Canon(#[from] CanonFenceError),
     /// Holylog provision failure.
     #[error(transparent)]
     Provision(#[from] ProvisionError),
@@ -610,7 +767,7 @@ pub enum SupervisorError {
     AtomicLog(#[from] holylog::atomic::AtomicLogError),
     /// VirtualLog / register failure.
     #[error(transparent)]
-    VirtualLog(#[from] holylog::virtual_log::VirtualLogError),
+    VirtualLog(#[from] VirtualLogError),
     /// Handoff rejection.
     #[error(transparent)]
     Handoff(#[from] scripture_service::VerseHandoffError),
@@ -628,9 +785,8 @@ mod tests {
     };
     use scripture_service::VerseRuntimeConfig;
 
-    use super::{NodeIdentity, VerseControlOutcome, VerseNodeSupervisor};
+    use super::{NodeIdentity, SharedMemoryPartsFactory, VerseControlOutcome, VerseNodeSupervisor};
     use crate::FleetLabResolver;
-    use scripture_service::VerseKey;
 
     fn journal() -> JournalId {
         JournalId::from_bytes(*b"fleet-lab-jrnl!!")
@@ -680,19 +836,18 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_serving_and_peer_standby_share_backend() {
         let register = Arc::new(InMemoryConditionalRegister::new());
-        let resolver = Arc::new(FleetLabResolver::default());
-        let key = VerseKey::new(journal(), verse());
+        let parts = Arc::new(SharedMemoryPartsFactory::default());
+        let key_resolver = Arc::new(FleetLabResolver::default());
 
-        let node_a = VerseNodeSupervisor::new(
+        let node_a = VerseNodeSupervisor::with_parts_factory(
             identity(owner_a()),
             Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
-            Arc::clone(&resolver),
-            vec![config(owner_a())],
-        )
-        .expect("a");
+            Arc::clone(&key_resolver),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        );
         let outcome = node_a
             .bootstrap_verse(
-                key,
                 LogletId::new("fleet-a0").expect("id"),
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
@@ -702,38 +857,33 @@ mod tests {
             .expect("bootstrap");
         assert!(matches!(outcome, VerseControlOutcome::Serving));
 
-        let node_b = VerseNodeSupervisor::new(
+        // Peer B: fresh resolver (process boundary), shared durable parts + register.
+        let node_b = VerseNodeSupervisor::with_parts_factory(
             identity(owner_b()),
             Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
-            Arc::clone(&resolver),
-            vec![config(owner_b())],
-        )
-        .expect("b");
-        let outcomes = node_b
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_b()),
+        );
+        let outcome = node_b
             .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
             .await
             .expect("start b");
-        assert!(matches!(
-            outcomes.get(&key),
-            Some(VerseControlOutcome::Standby)
-        ));
-        assert!(node_b.runtime(key).await.expect("rt").is_standby());
+        assert!(matches!(outcome, VerseControlOutcome::Standby));
+        assert!(node_b.runtime().await.expect("rt").is_standby());
     }
 
     #[tokio::test]
     async fn crash_reports_recovery_required_not_serving() {
         let register = Arc::new(InMemoryConditionalRegister::new());
         let resolver = Arc::new(FleetLabResolver::default());
-        let key = VerseKey::new(journal(), verse());
         let node = VerseNodeSupervisor::new(
             identity(owner_a()),
             Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
             Arc::clone(&resolver),
-            vec![config(owner_a())],
-        )
-        .expect("node");
+            config(owner_a()),
+        );
         node.bootstrap_verse(
-            key,
             LogletId::new("fleet-crash").expect("id"),
             SystemClock::new(),
             scripture::SystemTimer::new(),
@@ -741,14 +891,183 @@ mod tests {
         )
         .await
         .expect("bootstrap");
-        node.crash_active_writer(key).await.expect("crash");
-        let outcomes = node
+        node.crash_active_writer().await.expect("crash");
+        let outcome = node
             .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
             .await
             .expect("restart");
         assert!(matches!(
-            outcomes.get(&key),
-            Some(VerseControlOutcome::RecoveryRequired { .. })
+            outcome,
+            VerseControlOutcome::RecoveryRequired { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_boundary_fresh_owner_reports_recovery_required() {
+        let register = Arc::new(InMemoryConditionalRegister::new());
+        let parts = Arc::new(SharedMemoryPartsFactory::default());
+
+        let node_a = VerseNodeSupervisor::with_parts_factory(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        );
+        node_a
+            .bootstrap_verse(
+                LogletId::new("fleet-proc-a").expect("id"),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+                2,
+            )
+            .await
+            .expect("bootstrap");
+        // Drop process-local state; durable parts + register remain.
+        drop(node_a);
+
+        let fresh_a = VerseNodeSupervisor::with_parts_factory(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        );
+        let outcome = fresh_a
+            .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
+            .await
+            .expect("fresh a");
+        assert!(matches!(
+            outcome,
+            VerseControlOutcome::RecoveryRequired { .. }
+        ));
+
+        let fresh_b = VerseNodeSupervisor::with_parts_factory(
+            identity(owner_b()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_b()),
+        );
+        let outcome = fresh_b
+            .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
+            .await
+            .expect("fresh b");
+        assert!(matches!(outcome, VerseControlOutcome::Standby));
+    }
+
+    #[tokio::test]
+    async fn competing_replace_loser_is_conflict_and_not_active() {
+        let register = Arc::new(InMemoryConditionalRegister::new());
+        let parts = Arc::new(SharedMemoryPartsFactory::default());
+
+        let boot = VerseNodeSupervisor::with_parts_factory(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        );
+        boot.bootstrap_verse(
+            LogletId::new("fleet-race-0").expect("id"),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+            2,
+        )
+        .await
+        .expect("bootstrap");
+        drop(boot);
+
+        let left = Arc::new(VerseNodeSupervisor::with_parts_factory(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        ));
+        let right = Arc::new(VerseNodeSupervisor::with_parts_factory(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::new(FleetLabResolver::default()),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+        ));
+        assert!(matches!(
+            left.start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
+                .await
+                .expect("left rr"),
+            VerseControlOutcome::RecoveryRequired { .. }
+        ));
+        assert!(matches!(
+            right
+                .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
+                .await
+                .expect("right rr"),
+            VerseControlOutcome::RecoveryRequired { .. }
+        ));
+
+        let left_task = Arc::clone(&left);
+        let right_task = Arc::clone(&right);
+        let (left_out, right_out) = tokio::join!(
+            left_task.replace_after_lost_sequencer(
+                LogletId::new("fleet-race-l").expect("id"),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+                2,
+            ),
+            right_task.replace_after_lost_sequencer(
+                LogletId::new("fleet-race-r").expect("id"),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+                2,
+            ),
+        );
+        let left_out = left_out.expect("left replace");
+        let right_out = right_out.expect("right replace");
+        let outcomes = [&left_out, &right_out];
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, VerseControlOutcome::Serving))
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, VerseControlOutcome::ConflictNeedsInspect))
+        );
+
+        let winner = if matches!(left_out, VerseControlOutcome::Serving) {
+            &left
+        } else {
+            &right
+        };
+        let loser = if matches!(left_out, VerseControlOutcome::Serving) {
+            &right
+        } else {
+            &left
+        };
+        let published = winner
+            .virtual_log()
+            .observe_membership()
+            .await
+            .expect("observe")
+            .state
+            .active()
+            .expect("active")
+            .loglet_id
+            .clone();
+        assert_eq!(
+            winner.active_loglet().await.expect("winner active"),
+            published
+        );
+        // Loser must not have promoted an unpublished successor.
+        assert_ne!(
+            loser.active_loglet().await.expect("loser active"),
+            published
+        );
+        assert!(!matches!(
+            loser.runtime().await.map(|r| r.is_serving()),
+            Some(true)
         ));
     }
 }

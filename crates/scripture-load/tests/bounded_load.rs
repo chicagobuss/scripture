@@ -9,7 +9,7 @@ use scripture::{
     WriterId,
 };
 use scripture_load::{LoadConfig, NamedChunkPolicy, run_load};
-use scripture_service::{VerseKey, VerseRuntimeConfig};
+use scripture_service::VerseRuntimeConfig;
 use scriptured::{
     FleetLabResolver, NodeIdentity, RawLinesConfig, VerseControlOutcome, VerseNodeSupervisor,
     serve_canon_raw_lines_connection,
@@ -45,7 +45,6 @@ fn load_policy() -> ChunkPolicy {
 async fn bounded_load_receives_ok_acks() {
     let register = Arc::new(InMemoryConditionalRegister::new());
     let resolver = Arc::new(FleetLabResolver::default());
-    let key = VerseKey::new(journal(), verse());
     let config = VerseRuntimeConfig {
         journal_id: journal(),
         verse_id: verse(),
@@ -63,12 +62,10 @@ async fn bounded_load_receives_ok_acks() {
         },
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&resolver),
-        vec![config],
-    )
-    .expect("supervisor");
+        config,
+    );
     let outcome = node
         .bootstrap_verse(
-            key,
             LogletId::new("load-gen-0").expect("id"),
             SystemClock::new(),
             scripture::SystemTimer::new(),
@@ -81,7 +78,7 @@ async fn bounded_load_receives_ok_acks() {
         "{outcome:?}"
     );
 
-    let runtime = node.runtime(key).await.expect("runtime");
+    let runtime = node.runtime().await.expect("runtime");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
