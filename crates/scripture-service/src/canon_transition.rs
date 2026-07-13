@@ -6,7 +6,7 @@
 
 use holylog::virtual_log::{LogletId, Reconfiguration, VirtualLog, VirtualLogError};
 use scripture::{
-    CanonAuthorityError, CanonFence, CanonOwner, JournalId, LineId, OwnerId,
+    CanonAuthorityError, CanonFence, CanonOwner, JournalId, OwnerId, VerseId,
     WitnessedCanonAuthority,
 };
 
@@ -25,8 +25,8 @@ pub struct CanonTransitionRequest {
     pub next_owner: CanonOwner,
     /// Expected journal identity.
     pub journal_id: JournalId,
-    /// Expected physical Line identity.
-    pub line_id: LineId,
+    /// Expected physical Verse identity.
+    pub verse_id: VerseId,
 }
 
 /// Successful publication details.
@@ -73,7 +73,7 @@ pub enum CanonTransitionError {
         /// Authority revision.
         authority_revision: u64,
     },
-    /// Journal or Line identity mismatch.
+    /// Journal or Verse identity mismatch.
     #[error(transparent)]
     Authority(#[from] CanonAuthorityError),
     /// Next Canon revision would overflow.
@@ -109,7 +109,7 @@ pub async fn publish_canon_transition(
     let next_fence = CanonFence::new(
         next_revision,
         request.journal_id,
-        request.line_id,
+        request.verse_id,
         request.next_owner,
     );
     // Encode validates owner/endpoint schema before Holylog stores opaque bytes.
@@ -148,7 +148,7 @@ fn validate_transition_inputs(
     request: &CanonTransitionRequest,
 ) -> Result<(), CanonTransitionError> {
     if request.drained.journal_id() != request.journal_id
-        || request.drained.line_id() != request.line_id
+        || request.drained.verse_id() != request.verse_id
         || request.drained.owner_id()
             != match &request.authority.fence().owner {
                 CanonOwner::Owned { owner_id, .. } => *owner_id,
@@ -156,7 +156,7 @@ fn validate_transition_inputs(
                     return Err(CanonTransitionError::Authority(
                         CanonAuthorityError::Unowned {
                             revision: request.authority.revision(),
-                            line_id: request.authority.fence().line_id,
+                            verse_id: request.authority.fence().verse_id,
                         },
                     ));
                 }
@@ -178,11 +178,11 @@ fn validate_transition_inputs(
             },
         ));
     }
-    if request.authority.fence().line_id != request.line_id {
+    if request.authority.fence().verse_id != request.verse_id {
         return Err(CanonTransitionError::Authority(
-            CanonAuthorityError::LineMismatch {
-                expected: request.line_id,
-                actual: request.authority.fence().line_id,
+            CanonAuthorityError::VerseMismatch {
+                expected: request.verse_id,
+                actual: request.authority.fence().verse_id,
             },
         ));
     }
@@ -191,7 +191,7 @@ fn validate_transition_inputs(
             return Err(CanonTransitionError::Authority(
                 CanonAuthorityError::Unowned {
                     revision: request.authority.revision(),
-                    line_id: request.line_id,
+                    verse_id: request.verse_id,
                 },
             ));
         }
@@ -225,9 +225,9 @@ mod tests {
         VersionedState, VirtualLog, VirtualLogState,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, ManualClock, ManualTimer,
+        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, ManualClock, ManualTimer,
         OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
-        WitnessedCanonAuthority, WriterId, observe_canon_authority_witnessed,
+        VerseId, WitnessedCanonAuthority, WriterId, observe_canon_authority_witnessed,
     };
 
     use super::{
@@ -243,8 +243,8 @@ mod tests {
         JournalId::from_bytes(*b"transit-journal!")
     }
 
-    fn line() -> LineId {
-        LineId::from_bytes(*b"transit-line-id!")
+    fn verse() -> VerseId {
+        VerseId::from_bytes(*b"transit-line-id!")
     }
 
     fn owner_a() -> OwnerId {
@@ -279,7 +279,7 @@ mod tests {
     fn request(owner: OwnerId) -> CanonOwnerRequest {
         CanonOwnerRequest {
             journal_id: journal(),
-            line_id: line(),
+            verse_id: verse(),
             owner_id: owner,
             cohort_id: cohort(),
             writer_id: writer_id(),
@@ -293,7 +293,7 @@ mod tests {
         CanonFence::new(
             revision,
             journal(),
-            line(),
+            verse(),
             CanonOwner::Owned {
                 owner_id: owner,
                 endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
@@ -473,10 +473,14 @@ mod tests {
         service.flush(journal()).await.expect("flush");
         pending.await.expect("commit");
 
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service
             .drain_owner(journal(), &authority)
             .await
@@ -499,7 +503,7 @@ mod tests {
                 successor: harness.second.clone(),
                 next_owner: owned_owner(owner_b()),
                 journal_id: journal(),
-                line_id: line(),
+                verse_id: verse(),
             },
         )
         .await
@@ -559,10 +563,14 @@ mod tests {
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
 
-        let stale =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("stale witness");
+        let stale = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("stale witness");
         let drained = service.drain_owner(journal(), &stale).await.expect("drain");
 
         let winner_fence = owned(1, owner_b());
@@ -581,7 +589,7 @@ mod tests {
                 successor: harness.third.clone(),
                 next_owner: owned_owner(OwnerId::from_bytes(*b"transit-owner-c!")),
                 journal_id: journal(),
-                line_id: line(),
+                verse_id: verse(),
             },
         )
         .await
@@ -617,10 +625,14 @@ mod tests {
         .expect("recover");
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service
             .drain_owner(journal(), &authority)
             .await
@@ -634,7 +646,7 @@ mod tests {
                 successor: harness.second.clone(),
                 next_owner: CanonOwner::Unowned,
                 journal_id: journal(),
-                line_id: line(),
+                verse_id: verse(),
             },
         )
         .await
@@ -690,10 +702,14 @@ mod tests {
             .submit(journal(), submission(0, b"poison"))
             .await
             .expect("admit");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drain = service.drain_owner(journal(), &authority).await;
         let _ = pending.await;
         assert!(matches!(drain, Err(DrainError::DrainFailed { .. })));
@@ -723,10 +739,14 @@ mod tests {
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
 
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service
             .drain_owner(journal(), &authority)
             .await
@@ -740,14 +760,14 @@ mod tests {
                     authority: authority.clone(),
                     drained: DrainedOwner::for_test(
                         JournalId::from_bytes(*b"other-journal!!!"),
-                        line(),
+                        verse(),
                         owner_a(),
                         0,
                     ),
                     successor: harness.second.clone(),
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
-                    line_id: line(),
+                    verse_id: verse(),
                 },
             )
             .await,
@@ -760,11 +780,11 @@ mod tests {
                 &harness.virtual_log(),
                 CanonTransitionRequest {
                     authority: authority.clone(),
-                    drained: DrainedOwner::for_test(journal(), line(), owner_a(), 0),
+                    drained: DrainedOwner::for_test(journal(), verse(), owner_a(), 0),
                     successor: harness.second.clone(),
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
-                    line_id: LineId::from_bytes(*b"other-line-id!!!"),
+                    verse_id: VerseId::from_bytes(*b"other-line-id!!!"),
                 },
             )
             .await,
@@ -780,7 +800,7 @@ mod tests {
                 successor: harness.first.clone(),
                 next_owner: owned_owner(owner_b()),
                 journal_id: journal(),
-                line_id: line(),
+                verse_id: verse(),
             },
         )
         .await
@@ -813,16 +833,20 @@ mod tests {
         .expect("recover");
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let _drained = service
             .drain_owner(journal(), &authority)
             .await
             .expect("drain");
         // Replace drained revision via test-only constructor.
-        let drained = DrainedOwner::for_test(journal(), line(), owner_a(), u64::MAX);
+        let drained = DrainedOwner::for_test(journal(), verse(), owner_a(), u64::MAX);
         let authority = WitnessedCanonAuthority::from_parts_for_test(
             VersionedState {
                 token: authority.observed().token.clone(),
@@ -844,7 +868,7 @@ mod tests {
                     successor: harness.second.clone(),
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
-                    line_id: line(),
+                    verse_id: verse(),
                 },
             )
             .await,
@@ -880,10 +904,14 @@ mod tests {
                 recovered_actor,
             )
             .expect("lab register");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         assert!(matches!(
             service.drain_owner(journal(), &authority).await,
             Err(DrainError::NotCanonBound { .. })
@@ -921,10 +949,14 @@ mod tests {
             )
             .await
             .expect("publish B without draining A");
-        let authority_b =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_b())
-                .await
-                .expect("witness B");
+        let authority_b = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_b(),
+        )
+        .await
+        .expect("witness B");
         assert!(matches!(
             service.drain_owner(journal(), &authority_b).await,
             Err(DrainError::BindingMismatch { .. })
@@ -953,10 +985,14 @@ mod tests {
         .expect("recover");
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service
             .drain_owner(journal(), &authority)
             .await
@@ -975,7 +1011,7 @@ mod tests {
                     successor: harness.second.clone(),
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
-                    line_id: line(),
+                    verse_id: verse(),
                 },
             )
             .await,
@@ -1013,10 +1049,14 @@ mod tests {
             .submit(journal(), submission(0, b"open"))
             .await
             .expect("admit");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service
             .drain_owner(journal(), &authority)
             .await

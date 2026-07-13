@@ -8,7 +8,7 @@
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use scripture::{
     CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, ChunkPolicy, Clock, CohortId,
-    DriverError, JournalId, LineId, OwnerId, ReceiptFuture, RecoveryBound, Submission, Timer,
+    DriverError, JournalId, OwnerId, ReceiptFuture, RecoveryBound, Submission, Timer, VerseId,
     WriterId,
 };
 
@@ -16,7 +16,7 @@ use crate::canon_owner::{CanonOwnerError, CanonOwnerRequest, recover_canon_owner
 use crate::canon_route::{CanonRoute, CanonRouteError, resolve_canon_route};
 use crate::chunk_service::{ChunkJournalService, ChunkServiceError};
 
-/// Stable local configuration for one Line on one Scripture node.
+/// Stable local configuration for one Verse on one Scripture node.
 ///
 /// `OwnerId` must be supplied by the deployment across restarts. This type does
 /// not generate owner identities or treat endpoints as fencing grants.
@@ -24,8 +24,8 @@ use crate::chunk_service::{ChunkJournalService, ChunkServiceError};
 pub struct CanonNodeConfig {
     /// Logical Scripture journal.
     pub journal_id: JournalId,
-    /// Physical Line.
-    pub line_id: LineId,
+    /// Physical Verse.
+    pub verse_id: VerseId,
     /// This node's durable owner identity.
     pub owner_id: OwnerId,
     /// Cohort encoded into new chunk headers.
@@ -46,7 +46,7 @@ impl CanonNodeConfig {
     pub fn owner_request(&self) -> CanonOwnerRequest {
         CanonOwnerRequest {
             journal_id: self.journal_id,
-            line_id: self.line_id,
+            verse_id: self.verse_id,
             owner_id: self.owner_id,
             cohort_id: self.cohort_id,
             writer_id: self.writer_id,
@@ -95,7 +95,7 @@ impl std::fmt::Debug for CanonNodeStart {
             Self::Serving(node) => formatter
                 .debug_struct("Serving")
                 .field("journal_id", &node.journal_id)
-                .field("line_id", &node.line_id)
+                .field("verse_id", &node.verse_id)
                 .field("owner_id", &node.owner_id)
                 .finish_non_exhaustive(),
             Self::Standby { route } => formatter
@@ -106,13 +106,13 @@ impl std::fmt::Debug for CanonNodeStart {
     }
 }
 
-/// A serving Scripture node for one configured Line.
+/// A serving Scripture node for one configured Verse.
 ///
 /// Exposes only narrow admission and fresh route resolution. It does not expose
 /// mutable service registration, compare tokens, or election APIs.
 pub struct CanonNode {
     journal_id: JournalId,
-    line_id: LineId,
+    verse_id: VerseId,
     owner_id: OwnerId,
     virtual_log: VirtualLog,
     service: ChunkJournalService,
@@ -144,11 +144,11 @@ impl CanonNode {
                 },
             ));
         }
-        if fence.line_id != config.line_id {
+        if fence.verse_id != config.verse_id {
             return Err(CanonNodeStartError::Authority(
-                CanonAuthorityError::LineMismatch {
-                    expected: config.line_id,
-                    actual: fence.line_id,
+                CanonAuthorityError::VerseMismatch {
+                    expected: config.verse_id,
+                    actual: fence.verse_id,
                 },
             ));
         }
@@ -176,7 +176,7 @@ impl CanonNode {
                 service.register_canon_owner(recovered)?;
                 Ok(CanonNodeStart::Serving(CanonNode {
                     journal_id: config.journal_id,
-                    line_id: config.line_id,
+                    verse_id: config.verse_id,
                     owner_id: config.owner_id,
                     virtual_log,
                     service,
@@ -191,10 +191,10 @@ impl CanonNode {
         self.journal_id
     }
 
-    /// Configured Line identity.
+    /// Configured Verse identity.
     #[must_use]
-    pub const fn line_id(&self) -> LineId {
-        self.line_id
+    pub const fn verse_id(&self) -> VerseId {
+        self.verse_id
     }
 
     /// Configured owner identity for this node.
@@ -203,13 +203,13 @@ impl CanonNode {
         self.owner_id
     }
 
-    /// Fresh Canon route resolution for this node's configured Line.
+    /// Fresh Canon route resolution for this node's configured Verse.
     pub async fn resolve_route(&self) -> Result<CanonRoute, CanonRouteError> {
         resolve_canon_route(
             &self.virtual_log,
             &self.service,
             self.journal_id,
-            self.line_id,
+            self.verse_id,
             self.owner_id,
         )
         .await
@@ -225,13 +225,13 @@ impl CanonNode {
         self.service.flush(self.journal_id).await
     }
 
-    /// Consumes a serving node so a Line runtime can run a fenced handoff.
+    /// Consumes a serving node so a Verse runtime can run a fenced handoff.
     pub(crate) fn into_parts(
         self,
-    ) -> (JournalId, LineId, OwnerId, VirtualLog, ChunkJournalService) {
+    ) -> (JournalId, VerseId, OwnerId, VirtualLog, ChunkJournalService) {
         (
             self.journal_id,
-            self.line_id,
+            self.verse_id,
             self.owner_id,
             self.virtual_log,
             self.service,
@@ -248,7 +248,7 @@ pub enum CanonNodeStartError {
     /// Opaque fence bytes failed to decode or bind.
     #[error(transparent)]
     Fence(#[from] CanonFenceError),
-    /// Journal / Line / owner observation refused this node.
+    /// Journal / Verse / owner observation refused this node.
     #[error(transparent)]
     Authority(#[from] CanonAuthorityError),
     /// Durable recovery failed (including mid-recovery Canon advance).
@@ -276,9 +276,8 @@ mod tests {
         LogletResolver, RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, LineId,
-        OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
-        WriterId,
+        CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, OwnerEndpoint,
+        OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock, VerseId, WriterId,
     };
 
     use super::{
@@ -291,8 +290,8 @@ mod tests {
         JournalId::from_bytes(*b"node-journal-id!")
     }
 
-    fn line() -> LineId {
-        LineId::from_bytes(*b"node-line-id!!!!")
+    fn verse() -> VerseId {
+        VerseId::from_bytes(*b"node-line-id!!!!")
     }
 
     fn owner_a() -> OwnerId {
@@ -306,7 +305,7 @@ mod tests {
     fn config(owner: OwnerId) -> CanonNodeConfig {
         CanonNodeConfig {
             journal_id: journal(),
-            line_id: line(),
+            verse_id: verse(),
             owner_id: owner,
             cohort_id: CohortId::from_bytes(*b"node-cohort!!!!!"),
             writer_id: WriterId::from_bytes(*b"node-writer!!!!!"),
@@ -329,7 +328,7 @@ mod tests {
         CanonFence::new(
             revision,
             journal(),
-            line(),
+            verse(),
             CanonOwner::Owned {
                 owner_id: owner,
                 endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
@@ -511,7 +510,7 @@ mod tests {
             .virtual_log()
             .bootstrap_with_application_fence(
                 harness.first.clone(),
-                CanonFence::new(0, journal(), line(), CanonOwner::Unowned).encode(),
+                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
             )
             .await
             .expect("bootstrap");
@@ -571,7 +570,7 @@ mod tests {
                 CanonFence::new(
                     0,
                     JournalId::from_bytes(*b"other-journal!!!"),
-                    line(),
+                    verse(),
                     CanonOwner::Owned {
                         owner_id: owner_a(),
                         endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),

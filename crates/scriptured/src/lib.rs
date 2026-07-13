@@ -3,7 +3,7 @@
 //! Three raw-lines paths exist during migration:
 //! - [`serve_raw_lines_connection`] — legacy v0 [`JournalHandle`]
 //! - [`serve_chunk_raw_lines_connection`] — Phase 1 lab [`ChunkJournalService`]
-//! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`LineRuntime`]
+//! - [`serve_canon_raw_lines_connection`] — Canon-gated admission over [`VerseRuntime`]
 //!
 //! New durable work targets the Canon-gated path. Lab helpers remain for local
 //! composition tests until a separate removal review.
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use scripture::{AttributeValue, ProducerId, Record, Submission};
-use scripture_service::{CanonRoute, ChunkJournalService, JournalHandle, LineRuntime};
+use scripture_service::{CanonRoute, ChunkJournalService, JournalHandle, VerseRuntime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -134,10 +134,10 @@ pub async fn serve_chunk_raw_lines_connection(
     serve_chunk_raw_lines_from(stream, service, journal_id, config, 0).await
 }
 
-/// Canon-gated raw-lines admission over a started [`LineRuntime`].
+/// Canon-gated raw-lines admission over a started [`VerseRuntime`].
 ///
-/// Performs one fresh [`LineRuntime::resolve_route`] before accepting any payload:
-/// - [`CanonRoute::Serve`] admits through [`LineRuntime::submit`] / [`LineRuntime::flush`];
+/// Performs one fresh [`VerseRuntime::resolve_route`] before accepting any payload:
+/// - [`CanonRoute::Serve`] admits through [`VerseRuntime::submit`] / [`VerseRuntime::flush`];
 /// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
 /// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
 /// - resolver failure writes `ERR unavailable`.
@@ -149,7 +149,7 @@ pub async fn serve_chunk_raw_lines_connection(
 /// answer NotOwner/Recovering without constructing an owner.
 pub async fn serve_canon_raw_lines_connection(
     stream: TcpStream,
-    runtime: Arc<LineRuntime>,
+    runtime: Arc<VerseRuntime>,
     config: RawLinesConfig,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -276,7 +276,7 @@ where
 async fn serve_canon_raw_lines_from_split<R, W>(
     reader: R,
     mut writer: W,
-    runtime: Arc<LineRuntime>,
+    runtime: Arc<VerseRuntime>,
     config: RawLinesConfig,
     mut sequence: u64,
 ) -> io::Result<()>
@@ -736,10 +736,10 @@ mod tests {
             ResolveFuture, VirtualLog,
         };
         use scripture::{
-            CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint,
-            OwnerId, RecoveryBound, SystemClock, WriterId,
+            CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
+            RecoveryBound, SystemClock, VerseId, WriterId,
         };
-        use scripture_service::{LineHandoffRequest, LineRuntime, LineRuntimeConfig};
+        use scripture_service::{VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
@@ -749,8 +749,8 @@ mod tests {
             JournalId::from_bytes(*b"canon-raw-jrnl!!")
         }
 
-        fn line() -> LineId {
-            LineId::from_bytes(*b"canon-raw-line!!")
+        fn verse() -> VerseId {
+            VerseId::from_bytes(*b"canon-raw-line!!")
         }
 
         fn owner_a() -> OwnerId {
@@ -761,10 +761,10 @@ mod tests {
             OwnerId::from_bytes(*b"canon-raw-own-b!")
         }
 
-        fn config(owner: OwnerId) -> LineRuntimeConfig {
-            LineRuntimeConfig {
+        fn config(owner: OwnerId) -> VerseRuntimeConfig {
+            VerseRuntimeConfig {
                 journal_id: journal(),
-                line_id: line(),
+                verse_id: verse(),
                 owner_id: owner,
                 cohort_id: CohortId::from_bytes(*b"canon-raw-cohrt!"),
                 writer_id: WriterId::from_bytes(*b"canon-raw-writer"),
@@ -787,7 +787,7 @@ mod tests {
             CanonFence::new(
                 revision,
                 journal(),
-                line(),
+                verse(),
                 CanonOwner::Owned {
                     owner_id: owner,
                     endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
@@ -846,7 +846,7 @@ mod tests {
             }
         }
 
-        async fn exchange(runtime: Arc<LineRuntime>, payload: &[u8]) -> String {
+        async fn exchange(runtime: Arc<VerseRuntime>, payload: &[u8]) -> String {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let address = listener.local_addr().expect("address");
             let server = tokio::spawn(async move {
@@ -877,7 +877,7 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
@@ -891,7 +891,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn other_owner_returns_exact_not_owner_line_without_append() {
+        async fn other_owner_returns_exact_not_owner_without_append() {
             let harness = Harness::memory();
             harness
                 .virtual_log()
@@ -901,7 +901,7 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
@@ -945,7 +945,7 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
@@ -967,7 +967,7 @@ mod tests {
                 .virtual_log()
                 .reconfigure_with_application_fence(
                     second.clone(),
-                    CanonFence::new(1, journal(), line(), CanonOwner::Unowned).encode(),
+                    CanonFence::new(1, journal(), verse(), CanonOwner::Unowned).encode(),
                 )
                 .await
                 .expect("unowned");
@@ -1032,7 +1032,7 @@ mod tests {
             log.bootstrap_with_application_fence(first, fence(0, owner_a()).encode())
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 log,
                 SystemClock::new(),
@@ -1057,7 +1057,7 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
@@ -1088,7 +1088,7 @@ mod tests {
                 )
                 .await
                 .expect("bootstrap");
-            let runtime = LineRuntime::start(
+            let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
                 SystemClock::new(),
@@ -1106,14 +1106,14 @@ mod tests {
                 ),
             );
             let (runtime, outcome) = runtime
-                .drain_seal_publish(LineHandoffRequest {
+                .drain_seal_publish(VerseHandoffRequest {
                     successor: second,
                     next_owner: CanonOwner::Owned {
                         owner_id: owner_b(),
                         endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
                     },
                     journal_id: journal(),
-                    line_id: line(),
+                    verse_id: verse(),
                 })
                 .await
                 .expect("handoff");

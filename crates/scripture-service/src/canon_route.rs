@@ -6,8 +6,8 @@
 
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use scripture::{
-    CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, JournalId, LineId, OwnerEndpoint,
-    OwnerId,
+    CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, JournalId, OwnerEndpoint,
+    OwnerId, VerseId,
 };
 
 use crate::chunk_service::{ChunkJournalService, LocalCanonOwnerMatch};
@@ -33,7 +33,7 @@ pub enum CanonRoute {
         /// Advisory endpoint from the fence.
         endpoint: OwnerEndpoint,
     },
-    /// Line is Unowned, or this node is named but has no running Canon-bound owner.
+    /// Verse is Unowned, or this node is named but has no running Canon-bound owner.
     Recovering {
         /// Observed Canon / VirtualLog revision.
         canon_revision: u64,
@@ -49,12 +49,12 @@ pub enum CanonRouteError {
     /// Opaque fence bytes failed to decode or bind.
     #[error(transparent)]
     Fence(#[from] CanonFenceError),
-    /// Journal or Line identity mismatch against the expected route request.
+    /// Journal or Verse identity mismatch against the expected route request.
     #[error(transparent)]
     Authority(#[from] CanonAuthorityError),
 }
 
-/// Resolves whether `this_owner` may serve `journal_id`/`line_id` right now.
+/// Resolves whether `this_owner` may serve `journal_id`/`verse_id` right now.
 ///
 /// Always observes membership freshly. All route fields come from that one
 /// observation; [`holylog::virtual_log::CompareToken`] never appears in the
@@ -63,7 +63,7 @@ pub async fn resolve_canon_route(
     virtual_log: &VirtualLog,
     service: &ChunkJournalService,
     journal_id: JournalId,
-    line_id: LineId,
+    verse_id: VerseId,
     this_owner: OwnerId,
 ) -> Result<CanonRoute, CanonRouteError> {
     let observed = virtual_log.observe_membership().await?;
@@ -76,11 +76,11 @@ pub async fn resolve_canon_route(
             },
         ));
     }
-    if fence.line_id != line_id {
+    if fence.verse_id != verse_id {
         return Err(CanonRouteError::Authority(
-            CanonAuthorityError::LineMismatch {
-                expected: line_id,
-                actual: fence.line_id,
+            CanonAuthorityError::VerseMismatch {
+                expected: verse_id,
+                actual: fence.verse_id,
             },
         ));
     }
@@ -97,7 +97,7 @@ pub async fn resolve_canon_route(
             })
         }
         CanonOwner::Owned { owner_id, endpoint } => {
-            match service.local_canon_owner_match(journal_id, line_id, owner_id, fence.revision) {
+            match service.local_canon_owner_match(journal_id, verse_id, owner_id, fence.revision) {
                 LocalCanonOwnerMatch::ServeReady => Ok(CanonRoute::Serve {
                     canon_revision: fence.revision,
                     owner_id,
@@ -127,8 +127,8 @@ mod tests {
         LogletResolver, ResolveFuture, VirtualLog,
     };
     use scripture::{
-        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, LineId, OwnerEndpoint, OwnerId,
-        ProducerId, Record, RecoveryBound, Submission, SystemClock, WriterId,
+        CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
+        ProducerId, Record, RecoveryBound, Submission, SystemClock, VerseId, WriterId,
         observe_canon_authority_witnessed,
     };
 
@@ -143,8 +143,8 @@ mod tests {
         JournalId::from_bytes(*b"route-journal-id")
     }
 
-    fn line() -> LineId {
-        LineId::from_bytes(*b"route-line-id!!!")
+    fn verse() -> VerseId {
+        VerseId::from_bytes(*b"route-line-id!!!")
     }
 
     fn owner_a() -> OwnerId {
@@ -179,7 +179,7 @@ mod tests {
     fn request(owner: OwnerId) -> CanonOwnerRequest {
         CanonOwnerRequest {
             journal_id: journal(),
-            line_id: line(),
+            verse_id: verse(),
             owner_id: owner,
             cohort_id: cohort(),
             writer_id: writer_id(),
@@ -193,7 +193,7 @@ mod tests {
         CanonFence::new(
             revision,
             journal(),
-            line(),
+            verse(),
             CanonOwner::Owned {
                 owner_id: owner,
                 endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
@@ -349,7 +349,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -383,10 +383,14 @@ mod tests {
             .register_canon_owner(recovered)
             .expect("register a");
 
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         let drained = service_a
             .drain_owner(journal(), &authority)
             .await
@@ -401,7 +405,7 @@ mod tests {
                     successor: harness.second.clone(),
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
-                    line_id: line(),
+                    verse_id: verse(),
                 },
             )
             .await
@@ -414,7 +418,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service_a,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -432,7 +436,7 @@ mod tests {
                 &harness.virtual_log(),
                 &empty_b,
                 journal(),
-                line(),
+                verse(),
                 owner_b(),
             )
             .await
@@ -457,7 +461,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service_b,
                 journal(),
-                line(),
+                verse(),
                 owner_b(),
             )
             .await
@@ -477,7 +481,7 @@ mod tests {
             .virtual_log()
             .bootstrap_with_application_fence(
                 harness.first.clone(),
-                CanonFence::new(0, journal(), line(), CanonOwner::Unowned).encode(),
+                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
             )
             .await
             .expect("bootstrap");
@@ -487,7 +491,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -517,7 +521,7 @@ mod tests {
         lab.register_owner(journal(), authority.revision(), handle, actor)
             .expect("lab");
         assert!(matches!(
-            resolve_canon_route(&harness.virtual_log(), &lab, journal(), line(), owner_a())
+            resolve_canon_route(&harness.virtual_log(), &lab, journal(), verse(), owner_a())
                 .await
                 .expect("lab never Serve"),
             CanonRoute::Recovering { canon_revision: 0 }
@@ -542,10 +546,14 @@ mod tests {
         .expect("recover");
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
-        let authority =
-            observe_canon_authority_witnessed(&harness.virtual_log(), journal(), line(), owner_a())
-                .await
-                .expect("witness");
+        let authority = observe_canon_authority_witnessed(
+            &harness.virtual_log(),
+            journal(),
+            verse(),
+            owner_a(),
+        )
+        .await
+        .expect("witness");
         service
             .drain_owner(journal(), &authority)
             .await
@@ -559,7 +567,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -612,7 +620,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -649,7 +657,7 @@ mod tests {
                 &harness.virtual_log(),
                 &service,
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await
@@ -666,7 +674,7 @@ mod tests {
                 &harness.virtual_log(),
                 &ChunkJournalService::new(),
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await,
@@ -686,7 +694,7 @@ mod tests {
                 &harness.virtual_log(),
                 &ChunkJournalService::new(),
                 journal(),
-                line(),
+                verse(),
                 owner_a(),
             )
             .await,
