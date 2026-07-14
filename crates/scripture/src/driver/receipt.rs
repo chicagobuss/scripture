@@ -20,6 +20,13 @@ pub struct ReceiptFuture {
     pub(super) receiver: oneshot::Receiver<Result<Receipt, DriverError>>,
 }
 
+impl ReceiptFuture {
+    /// Wraps an existing oneshot receiver (spool / lab adapters).
+    pub fn from_receiver(receiver: oneshot::Receiver<Result<Receipt, DriverError>>) -> Self {
+        Self { receiver }
+    }
+}
+
 impl Future for ReceiptFuture {
     type Output = Result<Receipt, DriverError>;
 

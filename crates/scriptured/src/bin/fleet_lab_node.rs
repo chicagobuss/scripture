@@ -19,14 +19,15 @@ use holylog_object_store::{ObjectStoreMetrics, WritePolicy};
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::path::Path;
 use scripture::{
-    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, SystemClock, VerseId,
-    WriterId,
+    ChunkPolicy, CohortId, FileSpoolStorage, JournalId, OwnerEndpoint, OwnerId, RecoveryBound,
+    SpoolCell, SpoolCellHandle, SpoolConfig, SystemClock, VerseId, WriterId, classify_frames,
 };
 use scripture_service::{CanonRoute, VerseRuntime, VerseRuntimeConfig};
 use scriptured::{
     BackendProfile, FleetLabResolver, NodeIdentity, ObjectStorePartsFactory, RawLinesConfig,
     StoreEndpointConfig, VerseControlOutcome, VerseNodeSupervisor, connect_s3_compat,
     load_env_file, resolve_credentials, resolve_endpoint_config, serve_canon_raw_lines_connection,
+    serve_canon_raw_lines_connection_with_spool,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -58,6 +59,7 @@ struct Args {
     region: Option<String>,
     env_file: Option<PathBuf>,
     summary_dir: PathBuf,
+    spool_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -99,6 +101,28 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         args.region.clone(),
         &overlay,
     )?;
+
+    // Classify local spool before any object-store connection when possible.
+    if let Some(path) = &args.spool_dir {
+        let (frames, tail) = FileSpoolStorage::inspect(path)?;
+        let report = classify_frames(&frames, &tail);
+        if report.recovery_required() {
+            eprintln!(
+                "fleet-lab-node: spool RecoveryRequired dir={} valid_frames={} committed_locally={} pending_unclassified={} torn={} corrupt={} — refusing new writes (zero ingress)",
+                path.display(),
+                report.valid_frames,
+                report.committed_locally,
+                report.pending_unclassified,
+                report.torn_terminal,
+                report.corrupt_history
+            );
+            write_spool_recovery_summary(&args, &store_cfg, "pre-start", &report)?;
+            return Err(
+                "spool RecoveryRequired: local WAL present; not serving (decision 0013)".into(),
+            );
+        }
+    }
+
     let credentials = resolve_credentials(args.profile, &overlay)?;
     let store = connect_s3_compat(
         &store_cfg.endpoint,
@@ -157,6 +181,31 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
 
     let disposition = disposition_label(&outcome);
     print_startup_banner(&args, &store_cfg, disposition);
+
+    let spool: Option<Arc<SpoolCellHandle<FileSpoolStorage>>> = if let Some(path) = &args.spool_dir
+    {
+        let storage = FileSpoolStorage::open(path)?;
+        let (handle, completer) = SpoolCell::open(
+            JournalId::from_bytes(*b"fleet-lab-jrnl!!"),
+            SpoolConfig::default(),
+            storage,
+        )?;
+        if !handle.is_serving() {
+            return Err(
+                "spool opened non-serving after pre-start clean inspect (race/corruption)".into(),
+            );
+        }
+        eprintln!(
+            "fleet-lab-node: spool Serving dir={} (local WAL; not a Journaled quorum)",
+            path.display()
+        );
+        tokio::spawn(async move {
+            completer.run().await;
+        });
+        Some(Arc::new(handle))
+    } else {
+        None
+    };
 
     let runtime = node.runtime().await.ok_or("runtime missing after start")?;
     let ingress = Arc::new(IngressCounters::new());
@@ -229,9 +278,19 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         ingress.accepted.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::clone(&runtime);
         let ingress = Arc::clone(&ingress);
+        let spool = spool.clone();
         tokio::spawn(async move {
-            let result =
-                serve_canon_raw_lines_connection(stream, runtime, RawLinesConfig::default()).await;
+            let result = if let Some(spool) = spool {
+                serve_canon_raw_lines_connection_with_spool(
+                    stream,
+                    runtime,
+                    spool,
+                    RawLinesConfig::default(),
+                )
+                .await
+            } else {
+                serve_canon_raw_lines_connection(stream, runtime, RawLinesConfig::default()).await
+            };
             match result {
                 Ok(()) => {
                     ingress.closed_ok.fetch_add(1, Ordering::Relaxed);
@@ -588,6 +647,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, Box<dyn E
     let mut region = None;
     let mut env_file = None;
     let mut summary_dir = PathBuf::from(".");
+    let mut spool_dir = None;
     let mut arguments = arguments.peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -615,6 +675,9 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, Box<dyn E
             "--env-file" => env_file = Some(PathBuf::from(required(&mut arguments, "--env-file")?)),
             "--summary-dir" => {
                 summary_dir = PathBuf::from(required(&mut arguments, "--summary-dir")?);
+            }
+            "--spool-dir" => {
+                spool_dir = Some(PathBuf::from(required(&mut arguments, "--spool-dir")?));
             }
             "--access-key" | "--secret-key" => {
                 return Err(
@@ -646,6 +709,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<Args, Box<dyn E
         region,
         env_file,
         summary_dir,
+        spool_dir,
     })
 }
 
@@ -672,7 +736,54 @@ fn print_help() {
     println!(
         "usage: fleet-lab-node --run-id ID --backend rustfs|r2 [--bootstrap --loglet-id ID] [options]\n\
          secrets: --env-file PATH or RUSTFS_*/R2_* environment variables (never argv)\n\
-         optional: --status-bind 127.0.0.1:PORT  --summary-dir DIR\n\
+         optional: --status-bind 127.0.0.1:PORT  --summary-dir DIR  --spool-dir PATH\n\
+         --spool-dir enables local S1a WAL; restart with the same dir reports RecoveryRequired and refuses writes\n\
          See docs/fleet-lab-two-process-drill.md and deploy/fleet-exercise/"
     );
+}
+
+fn write_spool_recovery_summary(
+    args: &Args,
+    store_cfg: &StoreEndpointConfig,
+    disposition: &str,
+    report: &scripture::RecoveryReport,
+) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(&args.summary_dir)?;
+    let path = args
+        .summary_dir
+        .join(format!("fleet-lab-node-{}-summary.json", args.run_id));
+    let mut body = String::new();
+    body.push_str("{\n");
+    body.push_str("  \"lab\": true,\n");
+    body.push_str("  \"ha_claim\": false,\n");
+    push_str_field(&mut body, "backend", store_cfg.profile.label());
+    push_str_field(&mut body, "run_id", &args.run_id);
+    push_str_field(&mut body, "startup_disposition", disposition);
+    push_str_field(&mut body, "exit_reason", "spool-recovery-required");
+    body.push_str("  \"spool\": {\n");
+    body.push_str("    \"recovery_required\": true,\n");
+    body.push_str(&format!("    \"valid_frames\": {},\n", report.valid_frames));
+    body.push_str(&format!(
+        "    \"committed_locally\": {},\n",
+        report.committed_locally
+    ));
+    body.push_str(&format!(
+        "    \"pending_unclassified\": {},\n",
+        report.pending_unclassified
+    ));
+    body.push_str(&format!(
+        "    \"torn_terminal\": {},\n",
+        report.torn_terminal
+    ));
+    body.push_str(&format!(
+        "    \"corrupt_history\": {},\n",
+        report.corrupt_history
+    ));
+    body.push_str("    \"new_writes\": 0\n");
+    body.push_str("  },\n");
+    body.push_str("  \"ownership_routes\": false\n");
+    body.push('}');
+    std::fs::write(&path, body)?;
+    eprintln!("fleet-lab-node: wrote summary {}", path.display());
+    Ok(())
 }

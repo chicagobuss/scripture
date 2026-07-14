@@ -331,6 +331,119 @@ impl RawLinesSink for CanonSink {
     }
 }
 
+/// Canon raw-lines sink that journals through an S1a [`scripture::SpoolCellHandle`] first.
+struct SpoolCanonSink {
+    runtime: Arc<VerseRuntime>,
+    spool: Arc<scripture::SpoolCellHandle<scripture::FileSpoolStorage>>,
+}
+
+impl RawLinesSink for SpoolCanonSink {
+    async fn submit(&self, submission: Submission) -> Result<scripture::ReceiptFuture, String> {
+        let runtime = Arc::clone(&self.runtime);
+        let spool_fut = self
+            .spool
+            .submit_forwarded(submission, move |submission| {
+                let runtime = Arc::clone(&runtime);
+                async move {
+                    runtime
+                        .submit(submission)
+                        .await
+                        .map_err(|error| scripture::SpoolError::Forward(error.to_string()))
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        tokio::spawn(async move {
+            let mapped = match spool_fut.await {
+                Ok(receipt) => Ok(receipt),
+                Err(scripture::SpoolError::ProgressFailed) => {
+                    Err(scripture::DriverError::NotWritten)
+                }
+                Err(scripture::SpoolError::Poisoned { .. })
+                | Err(scripture::SpoolError::RecoveryRequired) => {
+                    Err(scripture::DriverError::Poisoned)
+                }
+                Err(_) => Err(scripture::DriverError::Unavailable),
+            };
+            let _ = tx.send(mapped);
+        });
+        Ok(scripture::ReceiptFuture::from_receiver(rx))
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.runtime
+            .flush()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Canon raw-lines with an optional local spool cell (fleet-lab `--spool-dir`).
+pub async fn serve_canon_raw_lines_connection_with_spool(
+    stream: TcpStream,
+    runtime: Arc<VerseRuntime>,
+    spool: Arc<scripture::SpoolCellHandle<scripture::FileSpoolStorage>>,
+    config: RawLinesConfig,
+) -> io::Result<()> {
+    if let Err(reason) = config.validate() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
+    let (reader, mut writer) = stream.into_split();
+    match runtime.resolve_route().await {
+        Ok(CanonRoute::Serve { .. }) => {
+            serve_raw_lines_pipeline(
+                reader,
+                writer,
+                SpoolCanonSink { runtime, spool },
+                config,
+                0,
+                None,
+            )
+            .await
+        }
+        Ok(CanonRoute::NotOwner {
+            canon_revision,
+            endpoint,
+            ..
+        }) => {
+            write_error(
+                &mut writer,
+                &format!(
+                    "not-owner canon={canon_revision} endpoint={}",
+                    endpoint.as_str()
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(CanonRoute::Fenced {
+            canon_revision,
+            endpoint,
+            sequencer_epoch,
+            ..
+        }) => {
+            write_error(
+                &mut writer,
+                &format!(
+                    "fenced canon={canon_revision} endpoint={} epoch={sequencer_epoch}",
+                    endpoint.as_str()
+                ),
+            )
+            .await?;
+            Ok(())
+        }
+        Ok(CanonRoute::Recovering { canon_revision }) => {
+            write_error(&mut writer, &format!("recovering canon={canon_revision}")).await?;
+            Ok(())
+        }
+        Err(_) => {
+            write_error(&mut writer, "unavailable").await?;
+            Ok(())
+        }
+    }
+}
+
 async fn serve_chunk_raw_lines_from_split<R, W>(
     reader: R,
     writer: W,
