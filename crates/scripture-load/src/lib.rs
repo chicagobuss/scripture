@@ -4,6 +4,7 @@
 //! `ERR` acknowledgements. Does not claim throughput targets; it produces a
 //! measured baseline against a named endpoint and run ID.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,6 +68,9 @@ pub struct LoadConfig {
     pub chunk_policy: NamedChunkPolicy,
     /// Backend label for the report (for example `in-memory` or `rustfs`).
     pub backend: String,
+    /// Max records written before reading ordered ACKs on each connection.
+    /// `1` preserves classic request/ack pacing; larger values pipeline commits.
+    pub inflight_per_connection: usize,
 }
 
 impl Default for LoadConfig {
@@ -82,6 +86,7 @@ impl Default for LoadConfig {
             ack_timeout: Duration::from_secs(5),
             chunk_policy: NamedChunkPolicy::fleet_lab_default(),
             backend: "unspecified".to_owned(),
+            inflight_per_connection: 1,
         }
     }
 }
@@ -200,6 +205,22 @@ pub async fn run_load(config: LoadConfig) -> io::Result<LoadReport> {
             "run_id must be non-empty and must not contain '|' or newlines",
         ));
     }
+    if config.inflight_per_connection == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inflight_per_connection must be >= 1",
+        ));
+    }
+    let pending_byte_cap = config
+        .record_bytes
+        .saturating_mul(config.inflight_per_connection)
+        .saturating_add(config.inflight_per_connection); // newlines
+    if pending_byte_cap > 4 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inflight_per_connection * record_bytes exceeds 4MiB pending-byte budget",
+        ));
+    }
 
     let started = Instant::now();
     let deadline = started + config.duration;
@@ -268,25 +289,41 @@ async fn run_connection(
     let mut reader = BufReader::new(reader);
     let mut ack_line = String::new();
     let mut sequence = 0_u64;
+    let mut inflight: VecDeque<(Instant, u64)> = VecDeque::new();
+    let inflight_cap = config.inflight_per_connection;
 
     loop {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let record = encode_record(&config.run_id, connection_id, sequence, config.record_bytes);
-        let record_len = record.len() as u64;
-        let prior = shared.accepted_bytes.load(Ordering::Relaxed);
-        if prior.saturating_add(record_len) > shared.max_bytes {
-            break;
-        }
-        if let Some(rate) = &shared.rate {
-            rate.wait().await;
+        while inflight.len() < inflight_cap {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let record =
+                encode_record(&config.run_id, connection_id, sequence, config.record_bytes);
+            let record_len = record.len() as u64;
+            let prior = shared.accepted_bytes.load(Ordering::Relaxed);
+            let committed_pending: u64 = inflight.iter().map(|(_, len)| *len).sum();
+            if prior
+                .saturating_add(committed_pending)
+                .saturating_add(record_len)
+                > shared.max_bytes
+            {
+                break;
+            }
+            if let Some(rate) = &shared.rate {
+                rate.wait().await;
+            }
+
+            let send_started = Instant::now();
+            writer.write_all(&record).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            inflight.push_back((send_started, record_len));
+            sequence = sequence.saturating_add(1);
         }
 
-        let send_started = Instant::now();
-        writer.write_all(&record).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if inflight.is_empty() {
+            break;
+        }
 
         ack_line.clear();
         match timeout(config.ack_timeout, reader.read_line(&mut ack_line)).await {
@@ -295,6 +332,10 @@ async fn run_connection(
                 break;
             }
             Ok(Ok(_)) => {
+                let Some((send_started, record_len)) = inflight.pop_front() else {
+                    shared.transport_failures.fetch_add(1, Ordering::Relaxed);
+                    break;
+                };
                 let latency = send_started.elapsed().as_micros() as u64;
                 if ack_line.starts_with("OK ") {
                     shared.accepted_records.fetch_add(1, Ordering::Relaxed);
@@ -302,7 +343,40 @@ async fn run_connection(
                         .accepted_bytes
                         .fetch_add(record_len, Ordering::Relaxed);
                     latencies.lock().await.push(latency);
-                    sequence = sequence.saturating_add(1);
+                } else if ack_line.starts_with("ERR ") {
+                    shared.errors.fetch_add(1, Ordering::Relaxed);
+                    break;
+                } else {
+                    shared.transport_failures.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                shared.transport_failures.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
+    while !inflight.is_empty() {
+        ack_line.clear();
+        match timeout(config.ack_timeout, reader.read_line(&mut ack_line)).await {
+            Ok(Ok(0)) => {
+                shared.transport_failures.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            Ok(Ok(_)) => {
+                let Some((send_started, record_len)) = inflight.pop_front() else {
+                    break;
+                };
+                let latency = send_started.elapsed().as_micros() as u64;
+                if ack_line.starts_with("OK ") {
+                    shared.accepted_records.fetch_add(1, Ordering::Relaxed);
+                    shared
+                        .accepted_bytes
+                        .fetch_add(record_len, Ordering::Relaxed);
+                    latencies.lock().await.push(latency);
                 } else if ack_line.starts_with("ERR ") {
                     shared.errors.fetch_add(1, Ordering::Relaxed);
                     break;

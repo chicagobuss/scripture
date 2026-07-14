@@ -15,6 +15,8 @@ pub struct DriverMetrics {
     pub admitted: u64,
     /// Submissions rejected before admission.
     pub rejected: u64,
+    /// Data chunks whose append completed successfully (Committed emission path).
+    pub committed_chunks: u64,
     /// True after the actor emits [`crate::trace::Event::OwnerPoisoned`].
     ///
     /// Survives while `run` continues in the poisoned drain loop, so a service

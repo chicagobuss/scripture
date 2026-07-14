@@ -320,6 +320,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                 self.publish_reserved();
                 if let Ok(mut metrics) = self.metrics.lock() {
                     metrics.inflight_chunks = 0;
+                    metrics.committed_chunks = metrics.committed_chunks.saturating_add(1);
                 }
                 self.drain_blocked();
                 Ok(())

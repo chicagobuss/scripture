@@ -66,6 +66,10 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<LoadConfig, Box
             "--chunk-policy-name" => {
                 config.chunk_policy.name = required(&mut arguments, "--chunk-policy-name")?;
             }
+            "--inflight-per-connection" => {
+                config.inflight_per_connection =
+                    required(&mut arguments, "--inflight-per-connection")?.parse()?;
+            }
             "--help" | "-h" => {
                 print_help();
                 process::exit(0);
@@ -98,6 +102,7 @@ fn print_help() {
          --run-id ID                   deterministic run id (required for drills)\n\
          --ack-timeout-ms N            (default 5000)\n\
          --backend LABEL               reported backend name\n\
-         --chunk-policy-name NAME      reported server policy label\n"
+         --chunk-policy-name NAME      reported server policy label\n\
+         --inflight-per-connection N   pipelined writes before ACK (default 1)\n"
     );
 }

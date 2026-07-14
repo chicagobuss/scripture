@@ -413,6 +413,10 @@ async fn status_json(
         out.push_str(&format!("    \"dedup_hits\": {},\n", metrics.dedup_hits));
         out.push_str(&format!("    \"admitted\": {},\n", metrics.admitted));
         out.push_str(&format!("    \"rejected\": {},\n", metrics.rejected));
+        out.push_str(&format!(
+            "    \"committed_chunks\": {},\n",
+            metrics.committed_chunks
+        ));
         out.push_str(&format!("    \"poisoned\": {}\n", metrics.poisoned));
         out.push_str("  },\n");
     } else {
@@ -422,6 +426,14 @@ async fn status_json(
         out.push_str(&format!("  \"owner_status\": \"{:?}\",\n", health.status));
     } else {
         out.push_str("  \"owner_status\": null,\n");
+    }
+    match driver {
+        Some(metrics) if metrics.committed_chunks > 0 => {
+            let rpc = metrics.admitted as f64 / metrics.committed_chunks as f64;
+            out.push_str(&format!("  \"records_per_chunk\": {rpc},\n"));
+        }
+        Some(_) => out.push_str("  \"records_per_chunk\": 0.0,\n"),
+        None => out.push_str("  \"records_per_chunk\": null,\n"),
     }
     out.push_str("  \"ownership_routes\": false\n");
     out.push('}');
