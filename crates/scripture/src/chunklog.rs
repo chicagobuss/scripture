@@ -14,6 +14,7 @@ use crate::canon::{
 };
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
 use crate::model::{JournalId, RecordOffset};
+use crate::sequencer_key::sequencer_request_key_for_chunk;
 
 /// A bounded number of tail chunks to inspect during owner recovery.
 ///
@@ -225,14 +226,21 @@ impl ChunkLog {
         &self,
         bytes: bytes::Bytes,
         expected_generation: u64,
+        writer_id: crate::chunk::WriterId,
+        chunk_id: ChunkId,
     ) -> Result<u64, ChunkLogError> {
         match self {
-            Self::Atomic(log) => Ok(log.append(bytes).await?.get()),
+            Self::Atomic(log) => {
+                if log.requires_stable_request_keys() {
+                    let key = sequencer_request_key_for_chunk(writer_id, chunk_id);
+                    Ok(log.append_with_request_key(bytes, key).await?.get())
+                } else {
+                    Ok(log.append(bytes).await?.get())
+                }
+            }
             Self::Virtual(log) => {
-                // This catches an in-process owner whose shared VirtualLog
-                // cache was advanced by a reconfigurer. A remote stale owner
-                // keeps its old cache and is fenced by the predecessor seal in
-                // VirtualLog::append instead.
+                // VirtualLog keyed append is deferred (Phase B1.3 follow-up). Remote
+                // sequencer drills use the AtomicLog path directly.
                 let actual = log.cached_membership().await?.revision;
                 if actual != expected_generation {
                     return Err(ChunkLogError::VirtualGenerationChanged {
@@ -359,7 +367,12 @@ impl ChunkLogWriter {
         self.poisoned = true;
         let slot = self
             .log
-            .append(chunk.bytes.clone(), self.generation)
+            .append(
+                chunk.bytes.clone(),
+                self.generation,
+                index.header.writer_id,
+                chunk.chunk_id,
+            )
             .await?;
         self.poisoned = false;
         self.next_offset = next_offset;

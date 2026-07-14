@@ -14,6 +14,7 @@ futures = "0.3"
 holylog = { path = "../holylog" }
 holylog-object-store = { path = "../holylog/crates/holylog-object-store" }
 holylog-object-store-register = { path = "../holylog/crates/holylog-object-store-register" }
+holylog-remote-sequencer-tcp = { path = "../holylog/crates/holylog-remote-sequencer-tcp" }
 object_store = { version = "0.14", default-features = false }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 crc32c = "0.6"
