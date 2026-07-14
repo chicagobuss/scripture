@@ -14,6 +14,7 @@ pub mod driver;
 pub mod journal;
 pub mod model;
 pub mod sequencer_key;
+pub mod spool;
 pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
@@ -49,4 +50,11 @@ pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
 pub use sequencer_key::{sequencer_request_key_for_chunk, sequencer_request_key_for_submission};
+pub use spool::{
+    FileSpoolStorage, FrameClassification, FrameKind, InMemorySpoolStorage, ProgressIdentity,
+    RecoveryClassification, RecoveryReport, ScanTail, SpoolCell, SpoolCellHandle, SpoolCellState,
+    SpoolConfig, SpoolError, SpoolFrame, SpoolFrameError, SpoolPoisonCause, SpoolReceiptFuture,
+    SpoolStorage, SpoolStorageFaults, ValidFrame, classify_frames, scan_and_classify,
+};
+pub use spool::{decode_frame as decode_spool_frame, encode_frame as encode_spool_frame};
 pub use trace::{CostScope, Effect, Event, Ledger, RejectReason, TerminalOutcome};

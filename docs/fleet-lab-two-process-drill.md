@@ -31,7 +31,24 @@ Expected:
 - After `crash_active_writer`, restart reports `RecoveryRequired`
 - `scripture-load` integration test accepts bounded records with `OK` ACKs
 
-## Two-process RustFS drill (opt-in)
+## Optional local spool crash classification (`--spool-dir`)
+
+S1a local WAL (decision 0013): opt-in only. A single disk is not a `Journaled`
+quorum and never auto-resubmits.
+
+```sh
+SPOOL=/tmp/scripture-spool-demo
+mkdir -p "$SPOOL"
+# owner (first start, empty dir → Serving with local WAL before forward):
+cargo run -p scriptured --features fleet-lab --bin fleet-lab-node -- \
+  --backend rustfs --run-id spool-demo --bootstrap --loglet-id lab \
+  --spool-dir "$SPOOL" --bind 127.0.0.1:9000 ...
+# crash the process (SIGKILL), then restart with the same --spool-dir:
+# expect RecoveryRequired, summary spool.new_writes=0, no raw-lines listener accepts work
+```
+
+Prefix-only cleanup of the object-store root still applies; the spool directory
+is local and must not be shared across nodes.
 
 Requires Holylog’s local S3 compose project and the `fleet-lab` feature.
 
