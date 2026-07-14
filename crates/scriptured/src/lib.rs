@@ -15,12 +15,14 @@ mod fleet_exercise_config;
 mod fleet_lab;
 #[cfg(feature = "fleet-lab")]
 mod object_store_lab;
+mod raw_lines;
 
 pub use fleet_lab::{
     DurableLogletParts, FleetLabResolver, InMemoryPartsFactory, NodeIdentity, PartsFactory,
     PartsFactoryError, SharedMemoryPartsFactory, SupervisorError, VerseControlOutcome,
     VerseNodeSupervisor,
 };
+pub use raw_lines::{BatchingSnapshot, RawLinesConnectionMetrics, RawLinesConnectionSnapshot};
 
 #[cfg(feature = "fleet-lab")]
 pub use fleet_exercise_config::{
@@ -37,12 +39,15 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use scripture::{AttributeValue, ProducerId, Record, Submission};
 use scripture_service::{CanonRoute, ChunkJournalService, JournalHandle, VerseRuntime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use raw_lines::{RawLinesSink, serve_raw_lines_pipeline};
 
 /// Fixed configuration for one raw-lines listener.
 ///
@@ -53,6 +58,14 @@ use tokio::net::TcpStream;
 pub struct RawLinesConfig {
     /// Largest accepted line in bytes, excluding the terminating newline.
     pub max_line_bytes: usize,
+    /// Max admitted-but-unacked records held for ordered emission.
+    pub max_pending_records: usize,
+    /// Max payload bytes across pending FIFO entries.
+    pub max_pending_bytes: usize,
+    /// When pending receipts exist and the peer is idle, flush after this delay so
+    /// open-chunk N=1 request/ack still progresses without waiting for chunk age.
+    /// Bursts faster than this remain co-packed. `None` disables idle flush (cap/EOF/age only).
+    pub idle_flush: Option<Duration>,
     /// Static attributes attached to each accepted line.
     pub attributes: BTreeMap<String, AttributeValue>,
 }
@@ -61,8 +74,30 @@ impl Default for RawLinesConfig {
     fn default() -> Self {
         Self {
             max_line_bytes: 8 * 1024,
+            max_pending_records: 32,
+            max_pending_bytes: 256 * 1024,
+            idle_flush: Some(Duration::from_millis(5)),
             attributes: BTreeMap::new(),
         }
+    }
+}
+
+impl RawLinesConfig {
+    /// Validates pending caps against the line limit.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_line_bytes == 0 {
+            return Err("max_line_bytes must be >= 1");
+        }
+        if self.max_pending_records == 0 {
+            return Err("max_pending_records must be >= 1");
+        }
+        if self.max_pending_bytes == 0 {
+            return Err("max_pending_bytes must be >= 1");
+        }
+        if self.max_pending_bytes < self.max_line_bytes {
+            return Err("max_pending_bytes must be >= max_line_bytes");
+        }
+        Ok(())
     }
 }
 
@@ -145,7 +180,7 @@ pub async fn serve_raw_lines_connection(
 ///
 /// Each line becomes a one-record [`Submission`]. The connection owns a freshly
 /// allocated producer identity at epoch 0. `OK` is written only after a
-/// committed receipt.
+/// committed receipt, in input order, without flushing once per line.
 ///
 /// This is the **lab** path: it does not observe Canon before accepting work.
 /// Prefer [`serve_canon_raw_lines_connection`] for a Scripture node that must
@@ -162,7 +197,7 @@ pub async fn serve_chunk_raw_lines_connection(
 /// Canon-gated raw-lines admission over a started [`VerseRuntime`].
 ///
 /// Performs one fresh [`VerseRuntime::resolve_route`] before accepting any payload:
-/// - [`CanonRoute::Serve`] admits through [`VerseRuntime::submit`] / [`VerseRuntime::flush`];
+/// - [`CanonRoute::Serve`] admits through [`VerseRuntime::submit`];
 /// - [`CanonRoute::NotOwner`] writes a compact provisional `ERR not-owner …` line;
 /// - [`CanonRoute::Fenced`] writes `ERR fenced …` with the newer route when known;
 /// - [`CanonRoute::Recovering`] writes `ERR recovering …`;
@@ -178,10 +213,23 @@ pub async fn serve_canon_raw_lines_connection(
     runtime: Arc<VerseRuntime>,
     config: RawLinesConfig,
 ) -> io::Result<()> {
+    serve_canon_raw_lines_connection_with_metrics(stream, runtime, config, None).await
+}
+
+/// Like [`serve_canon_raw_lines_connection`], with optional connection metrics.
+pub async fn serve_canon_raw_lines_connection_with_metrics(
+    stream: TcpStream,
+    runtime: Arc<VerseRuntime>,
+    config: RawLinesConfig,
+    metrics: Option<Arc<RawLinesConnectionMetrics>>,
+) -> io::Result<()> {
+    if let Err(reason) = config.validate() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
     let (reader, mut writer) = stream.into_split();
     match runtime.resolve_route().await {
         Ok(CanonRoute::Serve { .. }) => {
-            serve_canon_raw_lines_from_split(reader, writer, runtime, config, 0).await
+            serve_canon_raw_lines_from_split(reader, writer, runtime, config, 0, metrics).await
         }
         Ok(CanonRoute::NotOwner {
             canon_revision,
@@ -235,159 +283,101 @@ pub async fn serve_chunk_raw_lines_from(
     config: RawLinesConfig,
     sequence: u64,
 ) -> io::Result<()> {
+    if let Err(reason) = config.validate() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
     let (reader, writer) = stream.into_split();
     serve_chunk_raw_lines_from_split(reader, writer, service, journal_id, config, sequence).await
 }
 
+struct ChunkSink {
+    service: Arc<ChunkJournalService>,
+    journal_id: scripture::JournalId,
+}
+
+impl RawLinesSink for ChunkSink {
+    async fn submit(&self, submission: Submission) -> Result<scripture::ReceiptFuture, String> {
+        self.service
+            .submit(self.journal_id, submission)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.service
+            .flush(self.journal_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct CanonSink {
+    runtime: Arc<VerseRuntime>,
+}
+
+impl RawLinesSink for CanonSink {
+    async fn submit(&self, submission: Submission) -> Result<scripture::ReceiptFuture, String> {
+        self.runtime
+            .submit(submission)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.runtime
+            .flush()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 async fn serve_chunk_raw_lines_from_split<R, W>(
     reader: R,
-    mut writer: W,
+    writer: W,
     service: Arc<ChunkJournalService>,
     journal_id: scripture::JournalId,
     config: RawLinesConfig,
-    mut sequence: u64,
+    sequence: u64,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let producer_id = allocate_connection_producer();
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut exhausted = false;
-    loop {
-        match read_line(&mut reader, config.max_line_bytes).await {
-            Ok(Some(line)) => {
-                if exhausted {
-                    write_error(&mut writer, "producer sequence space exhausted").await?;
-                    return Ok(());
-                }
-                let submission = Submission {
-                    producer_id,
-                    producer_epoch: 0,
-                    sequence,
-                    records: vec![Record {
-                        attributes: config.attributes.clone(),
-                        payload: Bytes::from(line),
-                    }],
-                };
-                match next_producer_sequence(sequence) {
-                    Some(next) => sequence = next,
-                    None => exhausted = true,
-                }
-                let receipt = match service.submit(journal_id, submission).await {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        write_error(&mut writer, &error.to_string()).await?;
-                        return Ok(());
-                    }
-                };
-                if let Err(error) = service.flush(journal_id).await {
-                    write_error(&mut writer, &error.to_string()).await?;
-                    return Ok(());
-                }
-                match receipt.await {
-                    Ok(receipt) => {
-                        writer
-                            .write_all(
-                                format!(
-                                    "OK {} {}\n",
-                                    receipt.first_offset.get(),
-                                    receipt.next_offset.get()
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                        writer.flush().await?;
-                    }
-                    Err(error) => {
-                        write_error(&mut writer, &error.to_string()).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(None) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                write_error(&mut writer, &error.to_string()).await?;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    serve_raw_lines_pipeline(
+        reader,
+        writer,
+        ChunkSink {
+            service,
+            journal_id,
+        },
+        config,
+        sequence,
+        None,
+    )
+    .await
 }
 
 async fn serve_canon_raw_lines_from_split<R, W>(
     reader: R,
-    mut writer: W,
+    writer: W,
     runtime: Arc<VerseRuntime>,
     config: RawLinesConfig,
-    mut sequence: u64,
+    sequence: u64,
+    metrics: Option<Arc<RawLinesConnectionMetrics>>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let producer_id = allocate_connection_producer();
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut exhausted = false;
-    loop {
-        match read_line(&mut reader, config.max_line_bytes).await {
-            Ok(Some(line)) => {
-                if exhausted {
-                    write_error(&mut writer, "producer sequence space exhausted").await?;
-                    return Ok(());
-                }
-                let submission = Submission {
-                    producer_id,
-                    producer_epoch: 0,
-                    sequence,
-                    records: vec![Record {
-                        attributes: config.attributes.clone(),
-                        payload: Bytes::from(line),
-                    }],
-                };
-                match next_producer_sequence(sequence) {
-                    Some(next) => sequence = next,
-                    None => exhausted = true,
-                }
-                let receipt = match runtime.submit(submission).await {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        write_error(&mut writer, &error.to_string()).await?;
-                        return Ok(());
-                    }
-                };
-                if let Err(error) = runtime.flush().await {
-                    write_error(&mut writer, &error.to_string()).await?;
-                    return Ok(());
-                }
-                match receipt.await {
-                    Ok(receipt) => {
-                        writer
-                            .write_all(
-                                format!(
-                                    "OK {} {}\n",
-                                    receipt.first_offset.get(),
-                                    receipt.next_offset.get()
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                        writer.flush().await?;
-                    }
-                    Err(error) => {
-                        write_error(&mut writer, &error.to_string()).await?;
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(None) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                write_error(&mut writer, &error.to_string()).await?;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    serve_raw_lines_pipeline(
+        reader,
+        writer,
+        CanonSink { runtime },
+        config,
+        sequence,
+        metrics,
+    )
+    .await
 }
 
 async fn write_error<W: AsyncWrite + Unpin>(writer: &mut W, reason: &str) -> io::Result<()> {
@@ -732,6 +722,7 @@ mod tests {
 
         let mut client = TcpStream::connect(address).await.expect("connect");
         client.write_all(b"boom\n").await.expect("write");
+        client.shutdown().await.expect("shutdown");
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.expect("read");
         let text = String::from_utf8(response).expect("utf8");
@@ -785,7 +776,10 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use super::super::{RawLinesConfig, serve_canon_raw_lines_connection};
+        use super::super::{
+            BatchingSnapshot, RawLinesConfig, RawLinesConnectionMetrics,
+            serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,
+        };
 
         fn journal() -> JournalId {
             JournalId::from_bytes(*b"canon-raw-jrnl!!")
@@ -932,6 +926,80 @@ mod tests {
             assert!(runtime.is_serving());
             let response = exchange(Arc::new(runtime), b"hello\n").await;
             assert_eq!(response, "OK 0 1\n");
+        }
+
+        #[tokio::test]
+        async fn pipelined_small_lines_share_one_committed_chunk() {
+            let harness = Harness::memory();
+            harness
+                .virtual_log()
+                .bootstrap_with_application_fence(
+                    harness.first.clone(),
+                    fence(0, owner_a()).encode(),
+                )
+                .await
+                .expect("bootstrap");
+            let mut cfg = config(owner_a());
+            cfg.policy.max_chunk_records = 8;
+            cfg.policy.max_chunk_bytes = 64 * 1024;
+            let runtime = Arc::new(
+                VerseRuntime::start(
+                    cfg,
+                    harness.virtual_log(),
+                    SystemClock::new(),
+                    scripture::SystemTimer::new(),
+                )
+                .await
+                .expect("start"),
+            );
+            let metrics = Arc::new(RawLinesConnectionMetrics::default());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let serve_runtime = Arc::clone(&runtime);
+            let serve_metrics = Arc::clone(&metrics);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let cfg = RawLinesConfig {
+                    idle_flush: None,
+                    max_pending_records: 16,
+                    ..RawLinesConfig::default()
+                };
+                serve_canon_raw_lines_connection_with_metrics(
+                    stream,
+                    serve_runtime,
+                    cfg,
+                    Some(serve_metrics),
+                )
+                .await
+                .expect("serve")
+            });
+
+            let mut client = TcpStream::connect(address).await.expect("connect");
+            for i in 0..8 {
+                client
+                    .write_all(format!("line-{i}\n").as_bytes())
+                    .await
+                    .expect("write");
+            }
+            client.shutdown().await.expect("shutdown");
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.expect("read");
+            server.await.expect("join");
+            let text = String::from_utf8(response).expect("utf8");
+            let oks: Vec<_> = text
+                .lines()
+                .filter(|line| line.starts_with("OK "))
+                .collect();
+            assert_eq!(oks.len(), 8, "expected 8 ordered OKs, got {text}");
+
+            let driver = runtime.driver_metrics().expect("serving metrics");
+            let batching = BatchingSnapshot::from_parts(driver, metrics.snapshot());
+            assert_eq!(
+                batching.committed_chunks, 1,
+                "eight small lines must co-pack into one data chunk; got {batching:?}"
+            );
+            assert_eq!(batching.admitted_records, 8);
+            assert!(batching.records_per_chunk >= 7.9);
         }
 
         #[tokio::test]

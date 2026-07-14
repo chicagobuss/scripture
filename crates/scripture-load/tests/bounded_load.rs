@@ -106,6 +106,7 @@ async fn bounded_load_receives_ok_acks() {
         ack_timeout: Duration::from_secs(2),
         chunk_policy: NamedChunkPolicy::fleet_lab_default(),
         backend: "in-memory".to_owned(),
+        inflight_per_connection: 1,
     })
     .await
     .expect("load");
