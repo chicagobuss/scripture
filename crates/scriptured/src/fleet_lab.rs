@@ -225,7 +225,7 @@ pub enum VerseControlOutcome {
 
 /// Fleet-lab supervisor for one Scripture Verse in one process.
 ///
-/// Control methods take `&self` and serialize through [`Self::control`] so a
+/// Control methods take `&self` and serialize through the private control lock so a
 /// raw-lines listener may hold [`Arc<VerseRuntime>`] clones while the operator
 /// thread runs consuming handoff/replace.
 pub struct VerseNodeSupervisor {

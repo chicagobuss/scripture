@@ -20,7 +20,7 @@ const SUBMISSION_REQUEST_NAMESPACE: [u8; 4] = [0, 0, 0, 0];
 ///
 /// - `SequencerClientId` ← [`ProducerId::as_bytes`] (16 opaque bytes)
 /// - `SequencerRequestId` ← 16 bytes: `producer_epoch` (`u32` BE) +
-///   `sequence` (`u64` BE) + [`SUBMISSION_REQUEST_NAMESPACE`] (4 zero pad)
+///   `sequence` (`u64` BE) + a four-byte zero namespace pad
 ///
 /// Equal `(producer_id, producer_epoch, sequence)` always yields equal keys.
 /// Distinct identities yield distinct keys even when payload bytes would match.

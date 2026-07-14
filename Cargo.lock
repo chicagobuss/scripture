@@ -554,18 +554,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "holylog-remote-sequencer-tcp"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "holylog",
- "subtle",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1554,7 +1542,6 @@ dependencies = [
  "holylog",
  "holylog-object-store",
  "holylog-object-store-register",
- "holylog-remote-sequencer-tcp",
  "object_store",
  "scripture",
  "scripture-service",
