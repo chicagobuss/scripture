@@ -611,6 +611,14 @@ impl ChunkJournalService {
         Ok(self.owner(journal_id)?.health())
     }
 
+    /// Returns a lock-free driver metrics snapshot when the owner handle is present.
+    pub fn driver_metrics(
+        &self,
+        journal_id: JournalId,
+    ) -> Result<Option<scripture::DriverMetrics>, ChunkServiceError> {
+        Ok(self.owner(journal_id)?.handle.as_ref().map(|h| h.metrics()))
+    }
+
     /// Read-only check used by Canon route resolution.
     ///
     /// Reports whether a Canon-bound local owner exactly matches the supplied

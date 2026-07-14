@@ -1,4 +1,4 @@
-//! Object-store durable parts for the Scripture fleet lab (RustFS / S3).
+//! Object-store durable parts for the Scripture fleet exercise (RustFS / R2).
 
 use std::sync::Arc;
 
@@ -12,18 +12,94 @@ use holylog_object_store::{
     BackendCapabilities, ConditionalCreate, ListingOrder, ListingVisibility, ObjectStoreLogDrive,
     ObjectStoreMetrics, PointSemantics, WritePolicy,
 };
+use holylog_object_store_register::RegisterCapabilities;
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store::{ObjectStore, aws::AmazonS3Builder};
 
 use crate::fleet_lab::{DurableLogletParts, PartsFactory};
 
-/// Shared object-store root for one fleet-lab run.
+/// Exclusive object-store root prefix for one fleet-exercise run.
+pub const FLEET_EXERCISE_ROOT_PREFIX: &str = "scripture-fleet-exercise";
+
+/// Attested backend profiles the fleet-lab runner may construct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendProfile {
+    /// Local RustFS path-style S3 (Holylog local-s3 compose).
+    RustFs,
+    /// Cloudflare R2 (S3-compatible); register attested via [`RegisterCapabilities::cloudflare_r2`].
+    CloudflareR2,
+}
+
+impl BackendProfile {
+    /// Parses `rustfs` or `r2`. An `s3` token is reserved and rejected.
+    pub fn parse(raw: &str) -> Result<Self, ObjectStoreLabError> {
+        match raw {
+            "rustfs" => Ok(Self::RustFs),
+            "r2" => Ok(Self::CloudflareR2),
+            "s3" => Err(ObjectStoreLabError::BackendProfile(
+                "backend profile 's3' is reserved for a follow-up AWS exercise; use rustfs or r2"
+                    .into(),
+            )),
+            other => Err(ObjectStoreLabError::BackendProfile(format!(
+                "unknown backend profile '{other}' (expected rustfs|r2)"
+            ))),
+        }
+    }
+
+    /// Stable report label (also used by `scripture-load --backend`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RustFs => "rustfs",
+            Self::CloudflareR2 => "r2",
+        }
+    }
+
+    /// Register capability claim for the shared Verse register pointer.
+    #[must_use]
+    pub fn register_capabilities(self) -> RegisterCapabilities {
+        match self {
+            Self::RustFs => RegisterCapabilities::amazon_s3(),
+            Self::CloudflareR2 => RegisterCapabilities::cloudflare_r2(),
+        }
+    }
+
+    /// LogDrive capability declaration for this profile.
+    #[must_use]
+    pub fn drive_capabilities(self) -> BackendCapabilities {
+        // RustFS and R2 are both attested for atomic conditional create + lex listing.
+        BackendCapabilities::new(
+            PointSemantics::LinearizableSingleValue,
+            ListingOrder::Lexicographic,
+            ListingVisibility::Strong,
+            ConditionalCreate::Atomic,
+        )
+    }
+}
+
+/// Validates a run id and builds the exclusive root under [`FLEET_EXERCISE_ROOT_PREFIX`].
+pub fn fleet_exercise_root(run_id: &str) -> Result<String, ObjectStoreLabError> {
+    if run_id.is_empty() || run_id.contains('/') || run_id.contains('\\') {
+        return Err(ObjectStoreLabError::RunId(
+            "run-id must be non-empty and must not contain path separators".into(),
+        ));
+    }
+    if run_id.contains("..") {
+        return Err(ObjectStoreLabError::RunId(
+            "run-id must not contain '..'".into(),
+        ));
+    }
+    Ok(format!("{FLEET_EXERCISE_ROOT_PREFIX}/{run_id}"))
+}
+
+/// Shared object-store root for one fleet-exercise run.
 pub struct ObjectStorePartsFactory {
     store: Arc<dyn ObjectStore>,
     root: String,
     capabilities: BackendCapabilities,
     write_policy: WritePolicy,
-    /// Shared adapter counters for load reports.
+    /// Shared adapter counters across data/seal/trim drives for this factory.
     pub metrics: Arc<ObjectStoreMetrics>,
 }
 
@@ -48,12 +124,13 @@ impl ObjectStorePartsFactory {
     /// RustFS local-lab defaults (attested conditional-create + lex listing).
     #[must_use]
     pub fn rustfs_capabilities() -> BackendCapabilities {
-        BackendCapabilities::new(
-            PointSemantics::LinearizableSingleValue,
-            ListingOrder::Lexicographic,
-            ListingVisibility::Strong,
-            ConditionalCreate::Atomic,
-        )
+        BackendProfile::RustFs.drive_capabilities()
+    }
+
+    /// Cloudflare R2 drive capabilities (same point/listing/create claims as RustFS).
+    #[must_use]
+    pub fn r2_capabilities() -> BackendCapabilities {
+        BackendProfile::CloudflareR2.drive_capabilities()
     }
 
     fn parts_for(&self, loglet_id: &LogletId) -> Result<DurableLogletParts, ObjectStoreLabError> {
@@ -77,11 +154,12 @@ impl ObjectStorePartsFactory {
     }
 
     fn drive(&self, prefix: Path) -> Result<Arc<dyn LogDrive>, ObjectStoreLabError> {
-        Ok(Arc::new(ObjectStoreLogDrive::new(
+        Ok(Arc::new(ObjectStoreLogDrive::with_metrics(
             Arc::clone(&self.store),
             prefix,
             self.capabilities,
             self.write_policy,
+            Arc::clone(&self.metrics),
         )?) as Arc<dyn LogDrive>)
     }
 }
@@ -103,7 +181,7 @@ impl PartsFactory for ObjectStorePartsFactory {
     }
 }
 
-/// Failures while constructing fleet-lab object-store adapters.
+/// Failures while constructing fleet-exercise object-store adapters.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreLabError {
     /// Object-store LogDrive rejected the capability declaration or path.
@@ -115,10 +193,16 @@ pub enum ObjectStoreLabError {
     /// Unexpected namespace layout from [`LogletObjectNamespaces`].
     #[error("unexpected Loglet namespace layout: {0}")]
     Namespace(String),
+    /// Rejected backend profile token.
+    #[error("backend profile: {0}")]
+    BackendProfile(String),
+    /// Rejected run id / root.
+    #[error("run id: {0}")]
+    RunId(String),
 }
 
-/// Connects to a path-style S3-compatible endpoint (RustFS lab defaults).
-pub fn connect_rustfs(
+/// Connects to a path-style S3-compatible endpoint (RustFS or R2).
+pub fn connect_s3_compat(
     endpoint: &str,
     bucket: &str,
     region: &str,
@@ -136,4 +220,47 @@ pub fn connect_rustfs(
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
             .build()?,
     ) as Arc<dyn ObjectStore>)
+}
+
+/// Connects to a path-style S3-compatible endpoint (RustFS lab defaults).
+///
+/// Prefer [`connect_s3_compat`] for new call sites.
+pub fn connect_rustfs(
+    endpoint: &str,
+    bucket: &str,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
+    connect_s3_compat(endpoint, bucket, region, access_key, secret_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_backend_profiles_and_rejects_s3_reservation() {
+        assert_eq!(
+            BackendProfile::parse("rustfs").expect("rustfs"),
+            BackendProfile::RustFs
+        );
+        assert_eq!(
+            BackendProfile::parse("r2").expect("r2"),
+            BackendProfile::CloudflareR2
+        );
+        assert!(BackendProfile::parse("s3").is_err());
+        assert!(BackendProfile::parse("garage").is_err());
+    }
+
+    #[test]
+    fn fleet_exercise_root_rejects_path_escape() {
+        assert_eq!(
+            fleet_exercise_root("run-1").expect("ok"),
+            "scripture-fleet-exercise/run-1"
+        );
+        assert!(fleet_exercise_root("").is_err());
+        assert!(fleet_exercise_root("a/b").is_err());
+        assert!(fleet_exercise_root("..").is_err());
+    }
 }

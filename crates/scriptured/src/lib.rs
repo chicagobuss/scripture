@@ -10,6 +10,8 @@
 //! New durable work targets the Canon-gated path. Lab helpers remain for local
 //! composition tests until a separate removal review.
 
+#[cfg(feature = "fleet-lab")]
+mod fleet_exercise_config;
 mod fleet_lab;
 #[cfg(feature = "fleet-lab")]
 mod object_store_lab;
@@ -21,7 +23,15 @@ pub use fleet_lab::{
 };
 
 #[cfg(feature = "fleet-lab")]
-pub use object_store_lab::{ObjectStoreLabError, ObjectStorePartsFactory, connect_rustfs};
+pub use fleet_exercise_config::{
+    FleetConfigError, StoreCredentials, StoreEndpointConfig, credential_presence, env_file_exists,
+    load_env_file, resolve_credentials, resolve_endpoint_config,
+};
+#[cfg(feature = "fleet-lab")]
+pub use object_store_lab::{
+    BackendProfile, FLEET_EXERCISE_ROOT_PREFIX, ObjectStoreLabError, ObjectStorePartsFactory,
+    connect_rustfs, connect_s3_compat, fleet_exercise_root,
+};
 
 use std::collections::BTreeMap;
 use std::io;
