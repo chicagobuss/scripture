@@ -14,9 +14,11 @@ fleet-lab = [
     "dep:holylog-object-store",
     "dep:holylog-object-store-register",
     "dep:object_store",
+    "dep:futures",
     "holylog-object-store/s3",
     "holylog-object-store-register/aws",
 ]
+fleet-lab-r2-smoke = ["fleet-lab"]
 
 [dependencies]
 bytes.workspace = true
@@ -25,10 +27,11 @@ holylog-remote-sequencer-http = { workspace = true, optional = true }
 holylog-object-store = { workspace = true, optional = true }
 holylog-object-store-register = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, default-features = false }
+futures = { workspace = true, optional = true }
 scripture = { path = "../scripture" }
 scripture-service = { path = "../scripture-service" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
@@ -42,6 +45,11 @@ required-features = ["fleet-lab"]
 name = "remote_sequencer_http_lab"
 path = "tests/remote_sequencer_http_lab.rs"
 required-features = ["remote-sequencer-http-lab"]
+
+[[test]]
+name = "fleet_lab_r2_smoke"
+path = "tests/fleet_lab_r2_smoke.rs"
+required-features = ["fleet-lab-r2-smoke"]
 
 [lints]
 workspace = true

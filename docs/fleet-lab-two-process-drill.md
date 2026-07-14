@@ -4,10 +4,17 @@ This is a local, non-production drill. It proves serving/standby composition,
 bounded raw-lines load, and the soft-sequencer rule: a crashed owner must not
 reattach an open Loglet.
 
+Multi-machine R2 / ZeroTier orchestration lives in `deploy/fleet-exercise/`.
+Both use the exclusive object-store root
+`scripture-fleet-exercise/<run-id>/`.
+
 ## Safety gate
 
 Read Holylog’s production Loglet / soft-sequencer safety gate before changing
 runners. Ordinary node startup must not bootstrap, elect, or auto-replace.
+
+Secrets must not appear on argv. Prefer process env or `--env-file`. Legacy
+`--access-key` / `--secret-key` are rejected.
 
 ## In-process evidence (always runnable)
 
@@ -33,17 +40,20 @@ Requires Holylog’s local S3 compose project and the `fleet-lab` feature.
 ```sh
 docker compose -f ../holylog/deploy/local-s3/compose.yaml up -d --wait
 RUN_ID="drill-$(date -u +%Y%m%dT%H%M%SZ)"
-# All objects live under fleet-lab/${RUN_ID}/ — never wipe the whole bucket.
+# All objects live under scripture-fleet-exercise/${RUN_ID}/ — never wipe the whole bucket.
 ```
 
 ### 1. Node A — bootstrap and serve
 
 ```sh
 cargo run -p scriptured --features fleet-lab --bin fleet-lab-node -- \
+  --backend rustfs \
   --run-id "$RUN_ID" \
   --bind 127.0.0.1:9000 \
   --owner 'fleet-lab-own-a!' \
   --advertise 'tcp://127.0.0.1:9000' \
+  --status-bind 127.0.0.1:9100 \
+  --summary-dir "/tmp/fleet-exercise/$RUN_ID" \
   --bootstrap \
   --loglet-id "gen-a0"
 ```
@@ -54,13 +64,16 @@ In a second terminal (same `RUN_ID`):
 
 ```sh
 cargo run -p scriptured --features fleet-lab --bin fleet-lab-node -- \
+  --backend rustfs \
   --run-id "$RUN_ID" \
   --bind 127.0.0.1:9001 \
   --owner 'fleet-lab-own-b!' \
-  --advertise 'tcp://127.0.0.1:9001'
+  --advertise 'tcp://127.0.0.1:9001' \
+  --status-bind 127.0.0.1:9101 \
+  --summary-dir "/tmp/fleet-exercise/$RUN_ID"
 ```
 
-B must report standby / non-serving. It must not invent a writer for A’s open generation.
+B must report Standby / non-serving. It must not invent a writer for A’s open generation.
 
 ### 3. Load against A
 
@@ -80,16 +93,20 @@ Record the summary line (accepted records/bytes, ACK percentiles, errors).
 
 ### 4. Controlled handoff / recovery (planned operator API)
 
-The `fleet-lab-node` binary does **not** yet expose an administrative control
-endpoint for drain/seal/publish or seal-and-replace. Treat the following as the
-intended operator sequence against the in-process supervisor API
-(`VerseNodeSupervisor::drain_seal_publish` /
+The `fleet-lab-node` binary exposes a **lab-only read-only** `--status-bind`
+endpoint. It does **not** expose drain/seal/publish or seal-and-replace.
+Treat the following as the intended operator sequence against the in-process
+supervisor API (`VerseNodeSupervisor::drain_seal_publish` /
 `replace_after_lost_sequencer`), not as a runnable CLI drill:
 
 1. Stop the producer (Ctrl-C is fine for this milestone; transparent reroute is later).
 2. On A, call an explicit drain/seal/publish to B (not automatic on listener shutdown).
 3. Start or promote B only after Canon publishes B’s ownership.
 4. Resume `scripture-load` against B’s bind address with the same `--run-id`.
+
+On SIGINT/SIGTERM, `fleet-lab-node` stops accepting, best-effort flushes the
+open chunk when Serving, writes a summary JSON, and exits. That is **not**
+`drain_seal_publish` and does not wait for producers.
 
 Crash variant (partially runnable today): kill A without handoff. Restarting A
 without `--bootstrap` must report `RecoveryRequired` and refuse to serve the
@@ -98,14 +115,24 @@ provisions a fresh Loglet id.
 
 ### 5. Cleanup (prefix only)
 
-Delete only `fleet-lab/${RUN_ID}/` objects. Do not clear the `holylog-rustfs`
-bucket by default.
+Delete only `scripture-fleet-exercise/${RUN_ID}/` objects. Do not clear the
+`holylog-rustfs` bucket by default.
+
+## Cloudflare R2 smoke (operator-authorized only)
+
+```sh
+# Env must already contain R2_* credentials. Do not paste secrets into chat/Tracker.
+cargo test -p scriptured --features fleet-lab-r2-smoke --test fleet_lab_r2_smoke \
+  --locked -- --ignored --exact fleet_exercise_owner_standby_and_raw_lines_over_r2
+```
+
+Optional: `FLEET_EXERCISE_RETAIN_ON_FAILURE=1` keeps the unique prefix on failure.
 
 ## Chunk policy and backend naming
 
 Reports must name:
 
-- Backend: `in-memory` (unit/integration) or `rustfs` (this drill)
+- Backend: `in-memory` (unit/integration), `rustfs`, or `r2`
 - Chunk policy: phase-one requires `max_inflight_chunks = 1`; the load tool’s
   default label is `fleet-lab-64kib-phase-one`
 

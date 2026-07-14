@@ -267,6 +267,24 @@ impl VerseRuntime {
         }
     }
 
+    /// Driver metrics while Serving and the owner handle is still present.
+    #[must_use]
+    pub fn driver_metrics(&self) -> Option<scripture::DriverMetrics> {
+        match &self.phase {
+            VersePhase::Serving(service) => service.driver_metrics(self.journal_id).ok().flatten(),
+            VersePhase::Standby | VersePhase::Terminal(_) => None,
+        }
+    }
+
+    /// Owner health while Serving.
+    #[must_use]
+    pub fn health(&self) -> Option<crate::chunk_service::OwnerHealth> {
+        match &self.phase {
+            VersePhase::Serving(service) => service.health(self.journal_id).ok(),
+            VersePhase::Standby | VersePhase::Terminal(_) => None,
+        }
+    }
+
     /// Consuming fenced A→B (or Unowned) handoff.
     ///
     /// Precondition failures return [`VerseHandoffFailure`] with the runtime
