@@ -6,8 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::executor::block_on;
-use holylog::atomic::AtomicLog;
+use holylog::atomic::{AtomicLog, InMemorySeal, InMemoryTrimPoint, Seal, TrimPoint};
+use holylog::drive::LogDrive;
 use holylog::memory::InMemoryLogDrive;
+use holylog::provision::{
+    BindTag, InMemoryExclusiveClaimStore, LogletComponents, LogletObjectNamespaces,
+    ProvisionAuthority, ProvisionerId, ResolvedLoglet, WritableLoglet,
+};
 use holylog::virtual_log::{
     CompareToken, ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver,
     RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
@@ -23,19 +28,24 @@ fn journal() -> JournalId {
     JournalId::from_bytes(*b"journal-id-01234")
 }
 
+const CHUNKLOG_TEST_ROOT: &str = "scripture-chunklog-tests";
+
 #[derive(Default)]
 struct TestResolver {
-    loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+    loglets: Mutex<BTreeMap<LogletId, ResolvedLoglet>>,
 }
 
 impl TestResolver {
-    fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-        self.loglets.lock().expect("resolver lock").insert(id, log);
+    fn insert_writable(&self, id: LogletId, writable: Arc<WritableLoglet>) {
+        self.loglets
+            .lock()
+            .expect("resolver lock")
+            .insert(id, ResolvedLoglet::Writable(writable));
     }
 }
 
 impl LogletResolver for TestResolver {
-    fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
+    fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<ResolvedLoglet>> {
         let id = id.clone();
         Box::pin(async move {
             Ok(self
@@ -124,35 +134,16 @@ fn chunk_at_generation(
 #[test]
 fn virtual_writer_is_fenced_by_a_canon_cutover() {
     block_on(async {
-        let resolver = Arc::new(TestResolver::default());
-        let register = Arc::new(InMemoryConditionalRegister::new());
-        let first = LogletId::new("canon-line-first").expect("first id");
-        let second = LogletId::new("canon-line-second").expect("second id");
-        let first_log = Arc::new(
-            AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                .build()
-                .expect("first log"),
-        );
-        let second_log = Arc::new(
-            AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                .build()
-                .expect("second log"),
-        );
-        resolver.insert(first.clone(), first_log);
-        resolver.insert(second.clone(), second_log);
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
 
-        let owner_log = VirtualLog::new(
-            Arc::clone(&register) as Arc<dyn ConditionalRegister>,
-            Arc::clone(&resolver) as Arc<dyn LogletResolver>,
+        let mut old_owner = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
         );
-        let reconfigurer = VirtualLog::new(
-            Arc::clone(&register) as Arc<dyn ConditionalRegister>,
-            Arc::clone(&resolver) as Arc<dyn LogletResolver>,
-        );
-        owner_log.bootstrap(first).await.expect("bootstrap");
-
-        let mut old_owner =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, owner_log, RecordOffset::new(0));
         assert_eq!(
             old_owner
                 .append(&chunk_at_generation(11, 0, 1, 0))
@@ -162,14 +153,7 @@ fn virtual_writer_is_fenced_by_a_canon_cutover() {
             0
         );
 
-        {
-            let __observed = reconfigurer.observe_membership().await.expect("observe");
-            let __fence = __observed.state.application_fence.clone();
-            reconfigurer
-                .reconfigure_from_observation(&__observed, second, __fence)
-                .await
-        }
-        .expect("cutover");
+        harness.reconfigure_second(owned(1).encode()).await;
 
         assert!(matches!(
             old_owner.append(&chunk_at_generation(12, 1, 1, 0)).await,
@@ -182,8 +166,13 @@ fn virtual_writer_is_fenced_by_a_canon_cutover() {
             Err(scripture::ChunkLogError::Poisoned)
         ));
 
-        let mut successor_owner =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 1, reconfigurer, RecordOffset::new(1));
+        let mut successor_owner = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            1,
+            harness.virtual_log(),
+            RecordOffset::new(1),
+        );
         assert_eq!(
             successor_owner
                 .append(&chunk_at_generation(13, 1, 1, 1))
@@ -271,39 +260,43 @@ fn owned(revision: u64) -> CanonFence {
     )
 }
 
-struct FlipOnLaterRead {
+struct FlipOnSecondReadAfterArm {
     inner: InMemoryConditionalRegister,
-    reads: AtomicUsize,
-    flip_at: usize,
+    armed: std::sync::atomic::AtomicBool,
+    reads_after_arm: AtomicUsize,
     flipped: Mutex<Option<VirtualLogState>>,
 }
 
-impl FlipOnLaterRead {
-    fn new(flip_at: usize) -> Self {
+impl FlipOnSecondReadAfterArm {
+    fn new() -> Self {
         Self {
             inner: InMemoryConditionalRegister::new(),
-            reads: AtomicUsize::new(0),
-            flip_at,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            reads_after_arm: AtomicUsize::new(0),
             flipped: Mutex::new(None),
         }
     }
 
     fn arm_flip(&self, state: VirtualLogState) {
         *self.flipped.lock().expect("flip lock") = Some(state);
+        self.armed.store(true, Ordering::Release);
+        self.reads_after_arm.store(0, Ordering::Release);
     }
 }
 
-impl ConditionalRegister for FlipOnLaterRead {
+impl ConditionalRegister for FlipOnSecondReadAfterArm {
     fn read(&self) -> RegisterFuture<'_, Option<VersionedState>> {
         Box::pin(async {
-            let n = self.reads.fetch_add(1, Ordering::SeqCst);
-            if n >= self.flip_at
-                && let Some(state) = self.flipped.lock().expect("flip lock").clone()
-            {
-                return Ok(Some(VersionedState {
-                    token: CompareToken::from_revision(state.revision),
-                    state,
-                }));
+            if self.armed.load(Ordering::Acquire) {
+                let n = self.reads_after_arm.fetch_add(1, Ordering::SeqCst);
+                if n >= 1
+                    && let Some(state) = self.flipped.lock().expect("flip lock").clone()
+                {
+                    return Ok(Some(VersionedState {
+                        token: CompareToken::from_revision(state.revision),
+                        state,
+                    }));
+                }
             }
             self.inner.read().await
         })
@@ -319,37 +312,71 @@ impl ConditionalRegister for FlipOnLaterRead {
 }
 
 struct VirtualHarness {
-    resolver: Arc<TestResolver>,
     register: Arc<dyn ConditionalRegister>,
+    authority: ProvisionAuthority,
+    resolver: Arc<TestResolver>,
     first: LogletId,
     second: LogletId,
-    second_log: Arc<AtomicLog>,
+    second_writable: Arc<Mutex<Option<Arc<WritableLoglet>>>>,
 }
 
 impl VirtualHarness {
-    fn new(register: Arc<dyn ConditionalRegister>) -> Self {
-        let resolver = Arc::new(TestResolver::default());
+    async fn new(register: Arc<dyn ConditionalRegister>) -> Self {
         let first = LogletId::new("recover-line-first").expect("first id");
         let second = LogletId::new("recover-line-second").expect("second id");
-        let first_log = Arc::new(
-            AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                .build()
-                .expect("first log"),
-        );
-        let second_log = Arc::new(
-            AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                .build()
-                .expect("second log"),
-        );
-        resolver.insert(first.clone(), Arc::clone(&first_log));
-        resolver.insert(second.clone(), Arc::clone(&second_log));
         Self {
-            resolver,
             register,
+            authority: ProvisionAuthority::new(
+                Arc::new(InMemoryExclusiveClaimStore::new()),
+                ProvisionerId::new("chunklog-virtual"),
+            ),
+            resolver: Arc::new(TestResolver::default()),
             first,
             second,
-            second_log,
+            second_writable: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn bind(id: &LogletId) -> BindTag {
+        BindTag::new(id.as_str().as_bytes().to_vec())
+    }
+
+    fn components(k: u64) -> LogletComponents {
+        LogletComponents::new(
+            Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>,
+            Arc::new(InMemorySeal::new()) as Arc<dyn Seal>,
+            Arc::new(InMemoryTrimPoint::new()) as Arc<dyn TrimPoint>,
+            k,
+        )
+    }
+
+    async fn provision(
+        &self,
+        id: &LogletId,
+        k: u64,
+    ) -> (
+        BindTag,
+        Arc<WritableLoglet>,
+        holylog::provision::FreshWritableProvisionReceipt,
+    ) {
+        let bind = Self::bind(id);
+        let (receipt, writable) = self
+            .authority
+            .provision_fresh(
+                id.clone(),
+                LogletObjectNamespaces::under_root(CHUNKLOG_TEST_ROOT, id),
+                bind.clone(),
+                Self::components(k),
+            )
+            .await
+            .expect("provision fresh");
+        let writable = Arc::new(writable);
+        if id == &self.second {
+            *self.second_writable.lock().expect("lock") = Some(Arc::clone(&writable));
+        }
+        self.resolver
+            .insert_writable(id.clone(), Arc::clone(&writable));
+        (bind, writable, receipt)
     }
 
     fn virtual_log(&self) -> VirtualLog {
@@ -358,37 +385,60 @@ impl VirtualHarness {
             Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
         )
     }
+
+    async fn bootstrap_first(&self, fence: holylog::virtual_log::ApplicationFence) {
+        let (bind, writable, receipt) = self.provision(&self.first, 0).await;
+        self.virtual_log()
+            .bootstrap_with_receipt(receipt, writable.as_ref(), &bind, fence)
+            .await
+            .expect("bootstrap");
+    }
+
+    async fn reconfigure_second(&self, fence: holylog::virtual_log::ApplicationFence) {
+        let (bind, writable, receipt) = self.provision(&self.second, 0).await;
+        let log = self.virtual_log();
+        let observed = log.observe_membership().await.expect("observe");
+        log.reconfigure_with_receipt(&observed, receipt, writable.as_ref(), &bind, fence)
+            .await
+            .expect("reconfigure");
+    }
+
+    async fn reconfigure_id(&self, id: &LogletId, fence: holylog::virtual_log::ApplicationFence) {
+        let (bind, writable, receipt) = self.provision(id, 0).await;
+        let log = self.virtual_log();
+        let observed = log.observe_membership().await.expect("observe");
+        log.reconfigure_with_receipt(&observed, receipt, writable.as_ref(), &bind, fence)
+            .await
+            .expect("reconfigure");
+    }
+
+    fn second_writable(&self) -> Arc<WritableLoglet> {
+        self.second_writable
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("second writable")
+    }
 }
 
 #[test]
 fn virtual_recovery_rebuilds_suffix_across_canon_cutover() {
     block_on(async {
-        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
-
-        let mut gen0 =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
+        let mut gen0 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
+        );
         let first = chunk_at_generation(1, 0, 1, 0);
         let second = chunk_at_generation(2, 1, 1, 0);
         assert_eq!(gen0.append(&first).await.expect("first").slot, 0);
         assert_eq!(gen0.append(&second).await.expect("second").slot, 1);
 
-        let cutter = harness.virtual_log();
-        {
-            let __observed = cutter.observe_membership().await.expect("observe");
-            cutter
-                .reconfigure_from_observation(
-                    &__observed,
-                    harness.second.clone(),
-                    owned(1).encode(),
-                )
-                .await
-        }
-        .expect("cutover");
+        harness.reconfigure_second(owned(1).encode()).await;
 
         let mut recovery = ChunkLogWriter::recover_virtual(
             journal(),
@@ -418,31 +468,21 @@ fn virtual_recovery_rebuilds_suffix_across_canon_cutover() {
 #[test]
 fn virtual_recovery_preserves_mixed_generation_suffix_order() {
     block_on(async {
-        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
-        let mut gen0 =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
+        let mut gen0 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
+        );
         let a = chunk_at_generation(10, 0, 1, 0);
         let b = chunk_at_generation(11, 1, 1, 0);
         gen0.append(&a).await.expect("a");
         gen0.append(&b).await.expect("b");
 
-        let cutter = harness.virtual_log();
-        {
-            let __observed = cutter.observe_membership().await.expect("observe");
-            cutter
-                .reconfigure_from_observation(
-                    &__observed,
-                    harness.second.clone(),
-                    owned(1).encode(),
-                )
-                .await
-        }
-        .expect("cutover");
+        harness.reconfigure_second(owned(1).encode()).await;
 
         let mut gen1 = ChunkLogWriter::new_virtual(
             journal(),
@@ -483,35 +523,25 @@ fn virtual_recovery_preserves_mixed_generation_suffix_order() {
 #[test]
 fn virtual_recovery_rejects_future_chunk_generation() {
     block_on(async {
-        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
-        let mut gen0 =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
+        let mut gen0 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
+        );
         gen0.append(&chunk_at_generation(1, 0, 1, 0))
             .await
             .expect("gen0");
 
-        let cutter = harness.virtual_log();
-        {
-            let __observed = cutter.observe_membership().await.expect("observe");
-            cutter
-                .reconfigure_from_observation(
-                    &__observed,
-                    harness.second.clone(),
-                    owned(1).encode(),
-                )
-                .await
-        }
-        .expect("cutover");
+        harness.reconfigure_second(owned(1).encode()).await;
 
         // Plant a corrupt future-generation payload into the active Loglet.
         let forged = chunk_at_generation(99, 1, 1, 9);
         harness
-            .second_log
+            .second_writable()
             .append(forged.bytes.clone())
             .await
             .expect("plant forged");
@@ -537,30 +567,20 @@ fn virtual_recovery_rejects_future_chunk_generation() {
 #[test]
 fn virtual_recovery_rejects_generation_regression_in_logical_order() {
     block_on(async {
-        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
-        let mut gen0 =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
+        let mut gen0 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
+        );
         gen0.append(&chunk_at_generation(20, 0, 1, 0))
             .await
             .expect("gen0 append");
 
-        let cutter = harness.virtual_log();
-        {
-            let __observed = cutter.observe_membership().await.expect("observe");
-            cutter
-                .reconfigure_from_observation(
-                    &__observed,
-                    harness.second.clone(),
-                    owned(1).encode(),
-                )
-                .await
-        }
-        .expect("cutover");
+        harness.reconfigure_second(owned(1).encode()).await;
         let mut gen1 = ChunkLogWriter::new_virtual(
             journal(),
             cohort(),
@@ -577,7 +597,7 @@ fn virtual_recovery_rejects_generation_regression_in_logical_order() {
         // object-store evidence that recovery must not normalize.
         let regressed = chunk_at_generation(22, 2, 1, 0);
         harness
-            .second_log
+            .second_writable()
             .append(regressed.bytes.clone())
             .await
             .expect("plant regressed chunk");
@@ -603,12 +623,8 @@ fn virtual_recovery_rejects_generation_regression_in_logical_order() {
 #[test]
 fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
     block_on(async {
-        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new()));
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
+        let harness = VirtualHarness::new(Arc::new(InMemoryConditionalRegister::new())).await;
+        harness.bootstrap_first(owned(0).encode()).await;
 
         assert!(matches!(
             ChunkLogWriter::recover_virtual(
@@ -653,30 +669,9 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
             ))
         ));
 
-        let unowned = harness.virtual_log();
-        // Replace fence with Unowned via cutover onto a fresh loglet.
-        let third = LogletId::new("recover-line-unowned").expect("third");
-        harness.resolver.insert(
-            third.clone(),
-            Arc::new(
-                AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                    .build()
-                    .expect("third"),
-            ),
-        );
-        // Need an owned appendable log first — reconfigure from current.
-        // Current is still first at rev 0. Cutover to second with Unowned fence.
-        {
-            let __observed = unowned.observe_membership().await.expect("observe");
-            unowned
-                .reconfigure_from_observation(
-                    &__observed,
-                    harness.second.clone(),
-                    fence(1, CanonOwner::Unowned).encode(),
-                )
-                .await
-        }
-        .expect("unowned cutover");
+        harness
+            .reconfigure_id(&harness.second, fence(1, CanonOwner::Unowned).encode())
+            .await;
         assert!(matches!(
             observe_canon_authority(&harness.virtual_log(), journal(), verse(), owner_id()).await,
             Err(CanonAuthorityError::Unowned { .. })
@@ -701,15 +696,16 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
 #[test]
 fn virtual_recovery_fails_closed_when_canon_advances_mid_recovery() {
     block_on(async {
-        let flip = Arc::new(FlipOnLaterRead::new(1));
-        let harness = VirtualHarness::new(Arc::clone(&flip) as Arc<dyn ConditionalRegister>);
-        let bootstrap = harness.virtual_log();
-        bootstrap
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0).encode())
-            .await
-            .expect("bootstrap");
-        let mut gen0 =
-            ChunkLogWriter::new_virtual(journal(), cohort(), 0, bootstrap, RecordOffset::new(0));
+        let flip = Arc::new(FlipOnSecondReadAfterArm::new());
+        let harness = VirtualHarness::new(Arc::clone(&flip) as Arc<dyn ConditionalRegister>).await;
+        harness.bootstrap_first(owned(0).encode()).await;
+        let mut gen0 = ChunkLogWriter::new_virtual(
+            journal(),
+            cohort(),
+            0,
+            harness.virtual_log(),
+            RecordOffset::new(0),
+        );
         gen0.append(&chunk_at_generation(1, 0, 1, 0))
             .await
             .expect("append");

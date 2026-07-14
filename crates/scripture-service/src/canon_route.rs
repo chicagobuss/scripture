@@ -274,19 +274,13 @@ pub async fn resolve_canon_route_with_epoch(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use holylog::atomic::AtomicLog;
     use holylog::drive::{DriveError, DriveFuture, LogDrive};
     use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
-    use holylog::memory::InMemoryLogDrive;
     use holylog::remote_sequencer::{ActivateOutcome, InMemoryRemoteSequencer, SequencerEpoch};
-    use holylog::virtual_log::{
-        ApplicationFence, ConditionalRegister, InMemoryConditionalRegister, LogletId,
-        LogletResolver, ResolveFuture, VirtualLog,
-    };
+    use holylog::virtual_log::{ApplicationFence, InMemoryConditionalRegister};
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnedSequencerBinding,
         OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
@@ -301,6 +295,7 @@ mod tests {
         CanonTransitionOutcome, CanonTransitionRequest, publish_canon_transition,
     };
     use crate::chunk_service::{ChunkJournalService, LocalCanonOwnerMatch, OwnerStatus};
+    use crate::virtuallog_test_support::VirtualLogHarness;
     use crate::{CanonOwnerRequest, recover_canon_owner};
 
     fn journal() -> JournalId {
@@ -391,66 +386,14 @@ mod tests {
         owned_legacy(owner)
     }
 
-    #[derive(Default)]
-    struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
-    }
-
-    impl Resolver {
-        fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-            self.loglets.lock().expect("lock").insert(id, log);
-        }
-    }
-
-    impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-        }
-    }
-
-    struct Harness {
-        register: Arc<dyn ConditionalRegister>,
-        resolver: Arc<Resolver>,
-        first: LogletId,
-        second: LogletId,
-    }
-
-    impl Harness {
-        fn memory() -> Self {
-            Self::with_first_drive(Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>)
-        }
-
-        fn with_first_drive(first_drive: Arc<dyn LogDrive>) -> Self {
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new("route-first").expect("id");
-            let second = LogletId::new("route-second").expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(AtomicLog::builder(first_drive, 0).build().expect("log")),
-            );
-            resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            Self {
-                register: Arc::new(InMemoryConditionalRegister::new()),
-                resolver,
-                first,
-                second,
-            }
-        }
-
-        fn virtual_log(&self) -> VirtualLog {
-            VirtualLog::new(
-                Arc::clone(&self.register),
-                Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-            )
-        }
+    async fn route_harness() -> VirtualLogHarness {
+        VirtualLogHarness::with_ids(
+            "route-first",
+            "route-second",
+            "route-third",
+            Arc::new(InMemoryConditionalRegister::new()),
+        )
+        .await
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -586,16 +529,11 @@ mod tests {
 
     #[tokio::test]
     async fn v2_fence_requires_a_matching_local_epoch_before_serving() {
-        let harness = Harness::memory();
+        let harness = route_harness().await;
         let epoch = SequencerEpoch::test(42);
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                fence_with_epoch(0, owner_a(), epoch).encode(),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(fence_with_epoch(0, owner_a(), epoch).encode())
+            .await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -660,12 +598,8 @@ mod tests {
 
     #[tokio::test]
     async fn named_running_canon_owner_resolves_serve() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -697,12 +631,8 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_route_moves_from_a_to_recovering_to_b_serve_with_epoch() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -735,7 +665,7 @@ mod tests {
                 CanonTransitionRequest {
                     authority,
                     drained,
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&harness.second, 0).await,
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
                     verse_id: verse(),
@@ -830,15 +760,10 @@ mod tests {
 
     #[tokio::test]
     async fn stale_owner_after_handoff_returns_not_owner_with_newer_epoch_route() {
-        let harness = Harness::memory();
+        let harness = route_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                fence_with_epoch(0, owner_a(), SequencerEpoch::test(10)).encode(),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(fence_with_epoch(0, owner_a(), SequencerEpoch::test(10)).encode())
+            .await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -876,7 +801,7 @@ mod tests {
                 CanonTransitionRequest {
                     authority,
                     drained,
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&harness.second, 0).await,
                     next_owner: successor_owner,
                     journal_id: journal(),
                     verse_id: verse(),
@@ -910,12 +835,8 @@ mod tests {
 
     #[tokio::test]
     async fn standby_refuses_writes_for_foreign_owner_epoch() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_b()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_b()).encode()).await;
         let fence = CanonFence::from_virtual_log_state(
             &harness
                 .virtual_log()
@@ -939,15 +860,10 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_resolves_recovering() {
-        let harness = Harness::memory();
+        let harness = route_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode())
+            .await;
         let service = ChunkJournalService::new();
         assert!(matches!(
             resolve_canon_route(
@@ -965,12 +881,8 @@ mod tests {
 
     #[tokio::test]
     async fn lab_register_never_resolves_serve() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -993,12 +905,8 @@ mod tests {
 
     #[tokio::test]
     async fn draining_canon_owner_resolves_recovering() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -1042,12 +950,13 @@ mod tests {
     #[tokio::test]
     async fn poisoned_canon_owner_resolves_recovering() {
         let drive = FailAfterWriteDrive::new();
-        let harness = Harness::with_first_drive(Arc::clone(&drive) as Arc<dyn LogDrive>);
+        let harness = route_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+            .bootstrap_first_with_drive(
+                Arc::clone(&drive) as Arc<dyn LogDrive>,
+                fence(0, owner_a()).encode(),
+            )
+            .await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -1094,12 +1003,8 @@ mod tests {
 
     #[tokio::test]
     async fn finished_canon_owner_resolves_recovering() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = route_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -1131,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_fence_and_uninitialized_register_are_typed_errors() {
-        let harness = Harness::memory();
+        let harness = route_harness().await;
         assert!(matches!(
             resolve_canon_route(
                 &harness.virtual_log(),
@@ -1145,13 +1050,8 @@ mod tests {
         ));
 
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                ApplicationFence::new(b"not-a-canon-fence".to_vec()),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(ApplicationFence::new(b"not-a-canon-fence".to_vec()))
+            .await;
         assert!(matches!(
             resolve_canon_route(
                 &harness.virtual_log(),
