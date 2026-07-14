@@ -13,6 +13,7 @@ pub mod clock;
 pub mod driver;
 pub mod journal;
 pub mod model;
+pub mod sequencer_key;
 pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
@@ -39,6 +40,7 @@ pub use driver::{
     PolicyError, Receipt, ReceiptFuture, Submission,
 };
 pub use holylog::remote_sequencer::SequencerEpoch;
+pub use holylog::remote_sequencer::SequencerRequestKey;
 pub use journal::{
     AppendAck, JournalReader, JournalWriter, ReadError, ReadEvent, ReaderCheckpointError,
     RetentionAuthority, TrimGap, WriteError,
@@ -46,4 +48,5 @@ pub use journal::{
 pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
+pub use sequencer_key::{sequencer_request_key_for_chunk, sequencer_request_key_for_submission};
 pub use trace::{CostScope, Effect, Event, Ledger, RejectReason, TerminalOutcome};

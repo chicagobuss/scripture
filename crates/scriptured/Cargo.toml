@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = []
+remote-sequencer-lab = ["dep:holylog-remote-sequencer-tcp"]
 fleet-lab = [
     "dep:holylog-object-store",
     "dep:holylog-object-store-register",
@@ -20,6 +21,7 @@ fleet-lab = [
 [dependencies]
 bytes.workspace = true
 holylog.workspace = true
+holylog-remote-sequencer-tcp = { workspace = true, optional = true }
 holylog-object-store = { workspace = true, optional = true }
 holylog-object-store-register = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, default-features = false }
@@ -29,12 +31,18 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+holylog-remote-sequencer-tcp.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 
 [[bin]]
 name = "fleet-lab-node"
 path = "src/bin/fleet_lab_node.rs"
 required-features = ["fleet-lab"]
+
+[[test]]
+name = "remote_sequencer_lab"
+path = "tests/remote_sequencer_lab.rs"
+required-features = ["remote-sequencer-lab"]
 
 [lints]
 workspace = true
