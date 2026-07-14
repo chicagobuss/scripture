@@ -121,8 +121,12 @@ where
     let mut exhausted = false;
 
     loop {
-        let under_cap =
-            pending.len() < config.max_pending_records && pending_bytes < config.max_pending_bytes;
+        // Reserve space for one maximum-sized line before accepting another.
+        // A line is read before its exact payload size is known, so merely
+        // checking `pending_bytes < max_pending_bytes` could overshoot the
+        // advertised byte cap by one complete line.
+        let under_cap = pending.len() < config.max_pending_records
+            && pending_bytes <= config.max_pending_bytes - config.max_line_bytes;
 
         if pending.is_empty() {
             match read_capped_line(&mut reader, config.max_line_bytes).await {
@@ -217,6 +221,16 @@ where
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                            if let Err(reason) = sink.flush().await {
+                                return fail_closed(&mut writer, &metrics, &reason).await;
+                            }
+                            drain_all(
+                                &mut writer,
+                                &mut pending,
+                                &mut pending_bytes,
+                                &metrics,
+                            )
+                            .await?;
                             return fail_closed(&mut writer, &metrics, &error.to_string()).await;
                         }
                         Err(error) => return Err(error),
