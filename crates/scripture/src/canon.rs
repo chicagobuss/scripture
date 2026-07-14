@@ -560,7 +560,7 @@ pub async fn observe_canon_authority(
 /// Observes membership with its storage witness and validates Canon ownership.
 ///
 /// Uses [`VirtualLog::observe_membership`] so a later
-/// [`VirtualLog::reconfigure_from_observation`] can CAS against the exact
+/// [`VirtualLog::reconfigure_with_receipt`] can CAS against the exact
 /// validated observation.
 pub async fn observe_canon_authority_witnessed(
     virtual_log: &VirtualLog,

@@ -22,6 +22,9 @@ pub mod reconcile;
 mod scripture_node;
 mod verse_runtime;
 
+#[cfg(any(test, feature = "virtuallog-test-support"))]
+pub mod virtuallog_test_support;
+
 pub use canon_node::{
     CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
 };
@@ -33,8 +36,8 @@ pub use canon_route::{
     resolve_canon_route_with_epoch,
 };
 pub use canon_transition::{
-    CanonTransitionError, CanonTransitionOutcome, CanonTransitionRequest, PublishedCanon,
-    publish_canon_transition,
+    AbandonedProvisionCandidate, CanonTransitionError, CanonTransitionOutcome,
+    CanonTransitionRequest, ProvisionedSuccessor, PublishedCanon, publish_canon_transition,
 };
 pub use chunk_service::{
     ChunkJournalService, ChunkServiceError, DrainError, DrainedOwner, LocalCanonOwnerMatch,

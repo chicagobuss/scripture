@@ -161,22 +161,20 @@ where
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use holylog::atomic::AtomicLog;
-    use holylog::memory::InMemoryLogDrive;
     use holylog::virtual_log::{
-        CompareToken, ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver,
-        RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
+        CompareToken, ConditionalRegister, InMemoryConditionalRegister, RegisterFuture,
+        VersionedState, VirtualLogState,
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, ManualClock,
         ManualTimer, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission,
         SystemClock, VerseId, WriterId,
     };
-    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{CanonOwnerError, CanonOwnerRequest, recover_canon_owner};
+    use crate::virtuallog_test_support::VirtualLogHarness;
 
     fn journal() -> JournalId {
         JournalId::from_bytes(*b"factory-journal!")
@@ -242,70 +240,21 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
-    struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+    async fn factory_harness() -> VirtualLogHarness {
+        VirtualLogHarness::with_ids(
+            "factory-first",
+            "factory-second",
+            "factory-third",
+            Arc::new(InMemoryConditionalRegister::new()),
+        )
+        .await
     }
 
-    impl Resolver {
-        fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-            self.loglets.lock().expect("lock").insert(id, log);
-        }
-    }
-
-    impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-        }
-    }
-
-    struct Harness {
+    async fn factory_harness_with_register(
         register: Arc<dyn ConditionalRegister>,
-        resolver: Arc<Resolver>,
-        first: LogletId,
-        second: LogletId,
-    }
-
-    impl Harness {
-        fn memory() -> Self {
-            Self::with_register(Arc::new(InMemoryConditionalRegister::new()))
-        }
-
-        fn with_register(register: Arc<dyn ConditionalRegister>) -> Self {
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new("factory-first").expect("id");
-            let second = LogletId::new("factory-second").expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            Self {
-                register,
-                resolver,
-                first,
-                second,
-            }
-        }
-
-        fn virtual_log(&self) -> VirtualLog {
-            VirtualLog::new(
-                Arc::clone(&self.register),
-                Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-            )
-        }
+    ) -> VirtualLogHarness {
+        VirtualLogHarness::with_ids("factory-first", "factory-second", "factory-third", register)
+            .await
     }
 
     struct FlipRegister {
@@ -357,12 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_boot_constructs_an_actor_that_commits() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = factory_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
 
         let recovered = recover_canon_owner(
             request(owner_a()),
@@ -398,12 +343,8 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_refuses_a_and_recovers_b_with_dense_offsets() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = factory_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
 
         let recovered_a = recover_canon_owner(
             request(owner_a()),
@@ -434,17 +375,9 @@ mod tests {
         assert_eq!(receipt.canon_revision, 0);
         service.stop_owner(journal()).await.expect("stop a");
 
-        {
-            let log = harness.virtual_log();
-            let observed = log.observe_membership().await.expect("observe");
-            log.reconfigure_from_observation(
-                &observed,
-                harness.second.clone(),
-                fence(1, owner_b()).encode(),
-            )
-            .await
-            .expect("cutover");
-        }
+        harness
+            .reconfigure_id(&harness.second, fence(1, owner_b()).encode())
+            .await;
 
         assert!(matches!(
             recover_canon_owner(
@@ -512,15 +445,10 @@ mod tests {
 
     #[tokio::test]
     async fn unowned_and_not_owner_yield_no_actor() {
-        let harness = Harness::memory();
+        let harness = factory_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode())
+            .await;
         assert!(matches!(
             recover_canon_owner(
                 request(owner_a()),
@@ -532,12 +460,8 @@ mod tests {
             Err(CanonOwnerError::Recovery(ChunkLogError::Authority(_)))
         ));
 
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = factory_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         assert!(matches!(
             recover_canon_owner(
                 request(owner_b()),
@@ -553,12 +477,9 @@ mod tests {
     #[tokio::test]
     async fn mid_recovery_cutover_yields_no_actor() {
         let flip = Arc::new(FlipRegister::new(1));
-        let harness = Harness::with_register(Arc::clone(&flip) as Arc<dyn ConditionalRegister>);
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness =
+            factory_harness_with_register(Arc::clone(&flip) as Arc<dyn ConditionalRegister>).await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         flip.arm(VirtualLogState {
             revision: 1,
             generations: vec![holylog::virtual_log::GenerationDescriptor {
@@ -583,12 +504,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_handle_terminates_the_unspawned_actor_task() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = factory_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let clock = Arc::new(ManualClock::new());
         let timer = ManualTimer::new(Arc::clone(&clock));
         let recovered =

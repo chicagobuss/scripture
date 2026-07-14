@@ -264,16 +264,13 @@ pub enum CanonNodeStartError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use holylog::atomic::AtomicLog;
-    use holylog::memory::InMemoryLogDrive;
     use holylog::virtual_log::{
-        ApplicationFence, CompareToken, ConditionalRegister, InMemoryConditionalRegister, LogletId,
-        LogletResolver, RegisterFuture, ResolveFuture, VersionedState, VirtualLog, VirtualLogState,
+        ApplicationFence, CompareToken, ConditionalRegister, InMemoryConditionalRegister,
+        RegisterFuture, VersionedState, VirtualLogState,
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId,
@@ -286,6 +283,7 @@ mod tests {
     };
     use crate::canon_owner::CanonOwnerError;
     use crate::canon_route::CanonRoute;
+    use crate::virtuallog_test_support::VirtualLogHarness;
 
     fn journal() -> JournalId {
         JournalId::from_bytes(*b"node-journal-id!")
@@ -339,59 +337,20 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
-    struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+    async fn node_harness() -> VirtualLogHarness {
+        VirtualLogHarness::with_ids(
+            "node-first",
+            "node-second",
+            "node-third",
+            Arc::new(InMemoryConditionalRegister::new()),
+        )
+        .await
     }
 
-    impl Resolver {
-        fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-            self.loglets.lock().expect("lock").insert(id, log);
-        }
-    }
-
-    impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-        }
-    }
-
-    struct Harness {
+    async fn node_harness_with_register(
         register: Arc<dyn ConditionalRegister>,
-        resolver: Arc<Resolver>,
-        first: LogletId,
-    }
-
-    impl Harness {
-        fn memory() -> Self {
-            Self::with_register(Arc::new(InMemoryConditionalRegister::new()))
-        }
-
-        fn with_register(register: Arc<dyn ConditionalRegister>) -> Self {
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new("node-first").expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            Self {
-                register,
-                resolver,
-                first,
-            }
-        }
-
-        fn virtual_log(&self) -> VirtualLog {
-            VirtualLog::new(
-                Arc::clone(&self.register),
-                Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-            )
-        }
+    ) -> VirtualLogHarness {
+        VirtualLogHarness::with_ids("node-first", "node-second", "node-third", register).await
     }
 
     struct FlipRegister {
@@ -443,12 +402,8 @@ mod tests {
 
     #[tokio::test]
     async fn named_self_starts_serving_and_resolves_serve() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = node_harness().await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         let started = CanonNode::start(
             config(owner_a()),
             harness.virtual_log(),
@@ -484,12 +439,8 @@ mod tests {
 
     #[tokio::test]
     async fn other_owner_and_unowned_are_standby_without_actors() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_b()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = node_harness().await;
+        harness.bootstrap_first(fence(0, owner_b()).encode()).await;
         assert!(matches!(
             CanonNode::start(
                 config(owner_a()),
@@ -508,15 +459,10 @@ mod tests {
             } if owner_id == owner_b()
         ));
 
-        let harness = Harness::memory();
+        let harness = node_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode(),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(CanonFence::new(0, journal(), verse(), CanonOwner::Unowned).encode())
+            .await;
         assert!(matches!(
             CanonNode::start(
                 config(owner_a()),
@@ -534,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_and_mismatch_are_typed_startup_errors() {
-        let harness = Harness::memory();
+        let harness = node_harness().await;
         assert!(matches!(
             CanonNode::start(
                 config(owner_a()),
@@ -547,13 +493,8 @@ mod tests {
         ));
 
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
-                ApplicationFence::new(b"not-a-canon-fence".to_vec()),
-            )
-            .await
-            .expect("bootstrap");
+            .bootstrap_first(ApplicationFence::new(b"not-a-canon-fence".to_vec()))
+            .await;
         assert!(matches!(
             CanonNode::start(
                 config(owner_a()),
@@ -565,11 +506,9 @@ mod tests {
             Err(CanonNodeStartError::Fence(_))
         ));
 
-        let harness = Harness::memory();
+        let harness = node_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                harness.first.clone(),
+            .bootstrap_first(
                 CanonFence::new(
                     0,
                     JournalId::from_bytes(*b"other-journal!!!"),
@@ -586,8 +525,7 @@ mod tests {
                 )
                 .encode(),
             )
-            .await
-            .expect("bootstrap");
+            .await;
         assert!(matches!(
             CanonNode::start(
                 config(owner_a()),
@@ -603,12 +541,9 @@ mod tests {
     #[tokio::test]
     async fn mid_recovery_cutover_does_not_serve() {
         let flip = Arc::new(FlipRegister::new(2));
-        let harness = Harness::with_register(Arc::clone(&flip) as Arc<dyn ConditionalRegister>);
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), fence(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness =
+            node_harness_with_register(Arc::clone(&flip) as Arc<dyn ConditionalRegister>).await;
+        harness.bootstrap_first(fence(0, owner_a()).encode()).await;
         // Preliminary start observe + recovery authority observe see revision 0;
         // the closing re-inspect flips to revision 1 and must fail closed.
         flip.arm(VirtualLogState {

@@ -206,10 +206,16 @@ fn endpoints_stay_compact_and_log_safe() {
 #[test]
 fn observe_rejects_malformed_application_fence_bytes() {
     use futures::executor::block_on;
-    use holylog::atomic::AtomicLog;
+    use holylog::atomic::{InMemorySeal, InMemoryTrimPoint, Seal, TrimPoint};
+    use holylog::drive::LogDrive;
     use holylog::memory::InMemoryLogDrive;
+    use holylog::provision::{
+        BindTag, InMemoryExclusiveClaimStore, LogletComponents, LogletObjectNamespaces,
+        ProvisionAuthority, ProvisionerId, ResolvedLoglet,
+    };
     use holylog::virtual_log::{
-        ConditionalRegister, InMemoryConditionalRegister, LogletResolver, ResolveFuture, VirtualLog,
+        ApplicationFence, ConditionalRegister, InMemoryConditionalRegister, LogletId,
+        LogletResolver, ResolveFuture, VirtualLog,
     };
     use scripture::{CanonAuthorityError, observe_canon_authority};
     use std::collections::BTreeMap;
@@ -217,10 +223,10 @@ fn observe_rejects_malformed_application_fence_bytes() {
 
     #[derive(Default)]
     struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+        loglets: Mutex<BTreeMap<LogletId, ResolvedLoglet>>,
     }
     impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
+        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<ResolvedLoglet>> {
             let id = id.clone();
             Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
         }
@@ -229,20 +235,39 @@ fn observe_rejects_malformed_application_fence_bytes() {
     block_on(async {
         let resolver = Arc::new(Resolver::default());
         let id = LogletId::new("malformed-fence-loglet").expect("id");
-        resolver.loglets.lock().expect("lock").insert(
-            id.clone(),
-            Arc::new(
-                AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                    .build()
-                    .expect("log"),
-            ),
+        let bind = BindTag::new(id.as_str().as_bytes().to_vec());
+        let authority = ProvisionAuthority::new(
+            Arc::new(InMemoryExclusiveClaimStore::new()),
+            ProvisionerId::new("canon-malformed"),
         );
+        let (receipt, writable) = authority
+            .provision_fresh(
+                id.clone(),
+                LogletObjectNamespaces::under_root("scripture-canon-tests", &id),
+                bind.clone(),
+                LogletComponents::new(
+                    Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>,
+                    Arc::new(InMemorySeal::new()) as Arc<dyn Seal>,
+                    Arc::new(InMemoryTrimPoint::new()) as Arc<dyn TrimPoint>,
+                    0,
+                ),
+            )
+            .await
+            .expect("provision");
+        let writable = Arc::new(writable);
+        resolver
+            .loglets
+            .lock()
+            .expect("lock")
+            .insert(id.clone(), ResolvedLoglet::Writable(Arc::clone(&writable)));
         let log = VirtualLog::new(
             Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>,
-            resolver as Arc<dyn LogletResolver>,
+            Arc::clone(&resolver) as Arc<dyn LogletResolver>,
         );
-        log.bootstrap_with_application_fence(
-            id,
+        log.bootstrap_with_receipt(
+            receipt,
+            writable.as_ref(),
+            &bind,
             ApplicationFence::new(b"not-a-canon-fence".to_vec()),
         )
         .await

@@ -231,15 +231,10 @@ impl std::fmt::Debug for ScriptureNode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    use holylog::atomic::AtomicLog;
-    use holylog::memory::InMemoryLogDrive;
-    use holylog::virtual_log::{
-        ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver, ResolveFuture,
-        VirtualLog,
-    };
+    use holylog::virtual_log::InMemoryConditionalRegister;
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId,
         RecoveryBound, SystemClock, VerseId, WriterId,
@@ -248,6 +243,7 @@ mod tests {
     use super::{ScriptureNode, ScriptureNodeConfigError, VerseKey};
     use crate::canon_route::CanonRoute;
     use crate::verse_runtime::VerseRuntimeConfig;
+    use crate::virtuallog_test_support::VirtualLogHarness;
 
     fn journal_a() -> JournalId {
         JournalId::from_bytes(*b"node-journal-a!!")
@@ -309,77 +305,26 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
-    struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
-    }
-
-    impl Resolver {
-        fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-            self.loglets.lock().expect("lock").insert(id, log);
-        }
-    }
-
-    impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-        }
-    }
-
-    struct LineHarness {
-        register: Arc<dyn ConditionalRegister>,
-        resolver: Arc<Resolver>,
-        first: LogletId,
-    }
-
-    impl LineHarness {
-        fn memory(name: &str) -> Self {
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new(name).expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            Self {
-                register: Arc::new(InMemoryConditionalRegister::new()),
-                resolver,
-                first,
-            }
-        }
-
-        fn virtual_log(&self) -> VirtualLog {
-            VirtualLog::new(
-                Arc::clone(&self.register),
-                Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-            )
-        }
+    async fn line_harness(name: &str) -> VirtualLogHarness {
+        VirtualLogHarness::with_ids(
+            name,
+            &format!("{name}-second"),
+            &format!("{name}-third"),
+            Arc::new(InMemoryConditionalRegister::new()),
+        )
+        .await
     }
 
     #[tokio::test]
     async fn serving_and_standby_verses_are_independent() {
-        let serve = LineHarness::memory("shell-serve");
-        let standby = LineHarness::memory("shell-standby");
+        let serve = line_harness("shell-serve").await;
+        let standby = line_harness("shell-standby").await;
         serve
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                serve.first.clone(),
-                fence(journal_a(), verse_a(), 0, owner()).encode(),
-            )
-            .await
-            .expect("bootstrap serve");
+            .bootstrap_first(fence(journal_a(), verse_a(), 0, owner()).encode())
+            .await;
         standby
-            .virtual_log()
-            .bootstrap_with_application_fence(
-                standby.first.clone(),
-                fence(journal_b(), verse_b(), 0, other()).encode(),
-            )
-            .await
-            .expect("bootstrap standby");
+            .bootstrap_first(fence(journal_b(), verse_b(), 0, other()).encode())
+            .await;
 
         let logs = BTreeMap::from([
             (VerseKey::new(journal_a(), verse_a()), serve.virtual_log()),
@@ -430,15 +375,10 @@ mod tests {
 
     #[tokio::test]
     async fn bad_verse_reports_failure_while_valid_verse_starts() {
-        let good = LineHarness::memory("shell-good");
-        good.virtual_log()
-            .bootstrap_with_application_fence(
-                good.first.clone(),
-                fence(journal_a(), verse_a(), 0, owner()).encode(),
-            )
-            .await
-            .expect("bootstrap");
-        let bad = LineHarness::memory("shell-bad");
+        let good = line_harness("shell-good").await;
+        good.bootstrap_first(fence(journal_a(), verse_a(), 0, owner()).encode())
+            .await;
+        let bad = line_harness("shell-bad").await;
         // Uninitialized register ⇒ typed startup error.
         let logs = BTreeMap::from([
             (VerseKey::new(journal_a(), verse_a()), good.virtual_log()),

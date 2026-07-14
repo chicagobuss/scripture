@@ -3,14 +3,77 @@
 //! Pair with [`crate::recover_canon_owner`]: owner A drains and publishes; owner B
 //! later constructs from durable evidence. Failed transitions stay visibly
 //! drained — never auto-resume A.
+//!
+//! Publication is gated on a move-only [`ProvisionedSuccessor`] (Decision 0012 /
+//! Holylog v0.2): the receipt is consumed only on Applied. On CAS conflict the
+//! receipt is returned in [`CanonTransitionOutcome::ConflictNeedsInspect`]. On
+//! Holylog `Err` after the receipt was moved into `reconfigure_with_receipt`, the
+//! candidate is abandoned — Holylog does not hand the receipt back on that path.
 
-use holylog::virtual_log::{LogletId, Reconfiguration, VirtualLog, VirtualLogError};
+use std::sync::Arc;
+
+use holylog::provision::{BindTag, FreshWritableProvisionReceipt, WritableLoglet};
+use holylog::virtual_log::{LogletId, ReceiptReconfiguration, VirtualLog, VirtualLogError};
 use scripture::{
     CanonAuthorityError, CanonFence, CanonOwner, JournalId, OwnerId, VerseId,
     WitnessedCanonAuthority,
 };
 
 use crate::chunk_service::{ChunkJournalService, ChunkServiceError, DrainedOwner};
+
+/// Move-only provisioned successor ready for receipt-gated reconfiguration.
+///
+/// Obtain via [`holylog::provision::ProvisionAuthority::provision_fresh`]. The
+/// successor Loglet ID is derived from [`WritableLoglet::loglet_id`], not stored
+/// separately.
+#[derive(Debug)]
+pub struct ProvisionedSuccessor {
+    /// Single-use publication receipt (non-cloneable).
+    pub receipt: FreshWritableProvisionReceipt,
+    /// Append-capable handle installed under the same Loglet ID.
+    pub writable: Arc<WritableLoglet>,
+    /// Bind tag presented at provision time; must match the receipt.
+    pub bind: BindTag,
+}
+
+impl ProvisionedSuccessor {
+    /// Loglet ID from the writable handle (single source of truth).
+    #[must_use]
+    pub fn loglet_id(&self) -> &LogletId {
+        self.writable.loglet_id()
+    }
+
+    /// Converts into an abandoned candidate after a lost CAS (or similar).
+    #[must_use]
+    pub fn into_abandoned(self) -> AbandonedProvisionCandidate {
+        AbandonedProvisionCandidate {
+            receipt: self.receipt,
+            writable: self.writable,
+            bind: self.bind,
+        }
+    }
+}
+
+/// Unpublished provisioned candidate retained for explicit operator handling.
+///
+/// Produced on CAS conflict so the receipt is not silently dropped.
+#[derive(Debug)]
+pub struct AbandonedProvisionCandidate {
+    /// Unconsumed receipt that still authorizes publishing this candidate.
+    pub receipt: FreshWritableProvisionReceipt,
+    /// Still-unpublished writable handle.
+    pub writable: Arc<WritableLoglet>,
+    /// Bind tag bound at provision time.
+    pub bind: BindTag,
+}
+
+impl AbandonedProvisionCandidate {
+    /// Loglet ID from the writable handle.
+    #[must_use]
+    pub fn loglet_id(&self) -> &LogletId {
+        self.writable.loglet_id()
+    }
+}
 
 /// Inputs for one fenced Canon publish attempt after a successful local drain.
 #[derive(Debug)]
@@ -19,8 +82,8 @@ pub struct CanonTransitionRequest {
     pub authority: WitnessedCanonAuthority,
     /// Local drain proof for A.
     pub drained: DrainedOwner,
-    /// Private fresh successor Loglet (empty, open, resolvable).
-    pub successor: LogletId,
+    /// Provisioned empty successor (receipt + writable + bind).
+    pub successor: ProvisionedSuccessor,
     /// Desired successor Canon owner (B or explicit [`CanonOwner::Unowned`]).
     pub next_owner: CanonOwner,
     /// Expected journal identity.
@@ -49,9 +112,18 @@ pub struct PublishedCanon {
 pub enum CanonTransitionOutcome {
     /// Membership and Canon fence published together; local A was stopped.
     Published(PublishedCanon),
-    /// CAS lost to a competing transition; A's supplied fence was not published.
-    ConflictNeedsInspect,
+    /// CAS lost to a competing transition; A's fence was not published.
+    ///
+    /// The successor remains unpublished and the receipt is preserved for
+    /// explicit retry or deliberate abandonment.
+    ConflictNeedsInspect {
+        /// Unpublished provisioned successor (receipt unconsumed).
+        candidate: AbandonedProvisionCandidate,
+    },
     /// Seal/CAS path failed after drain; A remains drained.
+    ///
+    /// The provision receipt was already moved into Holylog and is **not**
+    /// returned on `Err` — treat the candidate as abandoned.
     FailedNeedsReconcile {
         /// Underlying Holylog failure.
         error: VirtualLogError,
@@ -115,16 +187,24 @@ pub async fn publish_canon_transition(
     // Encode validates owner/endpoint schema before Holylog stores opaque bytes.
     let application_fence = next_fence.encode();
 
+    let ProvisionedSuccessor {
+        receipt,
+        writable,
+        bind,
+    } = request.successor;
+
     let outcome = virtual_log
-        .reconfigure_from_observation(
+        .reconfigure_with_receipt(
             request.authority.observed(),
-            request.successor.clone(),
+            receipt,
+            writable.as_ref(),
+            &bind,
             application_fence,
         )
         .await;
 
     match outcome {
-        Ok(Reconfiguration::Applied {
+        Ok(ReceiptReconfiguration::Applied {
             predecessor,
             successor,
             boundary,
@@ -139,7 +219,16 @@ pub async fn publish_canon_transition(
                 fence: next_fence,
             }))
         }
-        Ok(Reconfiguration::Conflict) => Ok(CanonTransitionOutcome::ConflictNeedsInspect),
+        Ok(ReceiptReconfiguration::Conflict { receipt }) => {
+            Ok(CanonTransitionOutcome::ConflictNeedsInspect {
+                candidate: AbandonedProvisionCandidate {
+                    receipt,
+                    writable,
+                    bind,
+                },
+            })
+        }
+        // Receipt was moved into Holylog and is not returned on Err.
         Err(error) => Ok(CanonTransitionOutcome::FailedNeedsReconcile { error }),
     }
 }
@@ -211,19 +300,13 @@ fn validate_transition_inputs(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
-    use holylog::atomic::AtomicLog;
     use holylog::drive::{DriveError, DriveFuture, LogDrive};
     use holylog::logdrive::{Address, ReferenceLogDrive, TailDescription};
-    use holylog::memory::InMemoryLogDrive;
-    use holylog::virtual_log::{
-        ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver, ResolveFuture,
-        VersionedState, VirtualLog, VirtualLogState,
-    };
+    use holylog::virtual_log::{InMemoryConditionalRegister, VersionedState, VirtualLogState};
     use scripture::{
         CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, ManualClock, ManualTimer,
         OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound, Submission, SystemClock,
@@ -237,6 +320,7 @@ mod tests {
     use crate::chunk_service::{
         ChunkJournalService, ChunkServiceError, DrainError, DrainedOwner, OwnerStatus,
     };
+    use crate::virtuallog_test_support::VirtualLogHarness;
     use crate::{CanonOwnerRequest, recover_canon_owner};
 
     fn journal() -> JournalId {
@@ -312,77 +396,14 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Resolver {
-        loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
-    }
-
-    impl Resolver {
-        fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-            self.loglets.lock().expect("lock").insert(id, log);
-        }
-    }
-
-    impl LogletResolver for Resolver {
-        fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-        }
-    }
-
-    struct Harness {
-        register: Arc<dyn ConditionalRegister>,
-        resolver: Arc<Resolver>,
-        first: LogletId,
-        second: LogletId,
-        third: LogletId,
-    }
-
-    impl Harness {
-        fn memory() -> Self {
-            Self::with_first_drive(Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>)
-        }
-
-        fn with_first_drive(first_drive: Arc<dyn LogDrive>) -> Self {
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new("transit-first").expect("id");
-            let second = LogletId::new("transit-second").expect("id");
-            let third = LogletId::new("transit-third").expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(AtomicLog::builder(first_drive, 0).build().expect("log")),
-            );
-            resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            resolver.insert(
-                third.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            Self {
-                register: Arc::new(InMemoryConditionalRegister::new()),
-                resolver,
-                first,
-                second,
-                third,
-            }
-        }
-
-        fn virtual_log(&self) -> VirtualLog {
-            VirtualLog::new(
-                Arc::clone(&self.register),
-                Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-            )
-        }
+    async fn transit_harness() -> VirtualLogHarness {
+        VirtualLogHarness::with_ids(
+            "transit-first",
+            "transit-second",
+            "transit-third",
+            Arc::new(InMemoryConditionalRegister::new()),
+        )
+        .await
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -452,12 +473,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_publish_recover_continues_dense_offsets() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
 
         let recovered = recover_canon_owner(
             request(owner_a()),
@@ -504,7 +521,7 @@ mod tests {
             CanonTransitionRequest {
                 authority,
                 drained,
-                successor: harness.second.clone(),
+                successor: harness.provision(&harness.second, 0).await,
                 next_owner: owned_owner(owner_b()),
                 journal_id: journal(),
                 verse_id: verse(),
@@ -549,12 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn competing_transition_leaves_a_drained_without_loser_fence() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
 
         let recovered = recover_canon_owner(
             request(owner_a()),
@@ -578,17 +591,9 @@ mod tests {
         let drained = service.drain_owner(journal(), &stale).await.expect("drain");
 
         let winner_fence = owned(1, owner_b());
-        {
-            let log = harness.virtual_log();
-            let observed = log.observe_membership().await.expect("observe");
-            log.reconfigure_from_observation(
-                &observed,
-                harness.second.clone(),
-                winner_fence.encode(),
-            )
-            .await
-            .expect("winner");
-        }
+        harness
+            .reconfigure_id(&harness.second, winner_fence.encode())
+            .await;
 
         let outcome = publish_canon_transition(
             &mut service,
@@ -596,7 +601,7 @@ mod tests {
             CanonTransitionRequest {
                 authority: stale,
                 drained,
-                successor: harness.third.clone(),
+                successor: harness.provision(&harness.third, 0).await,
                 next_owner: owned_owner(OwnerId::from_bytes(*b"transit-owner-c!")),
                 journal_id: journal(),
                 verse_id: verse(),
@@ -606,7 +611,7 @@ mod tests {
         .expect("conflict outcome");
         assert!(matches!(
             outcome,
-            CanonTransitionOutcome::ConflictNeedsInspect
+            CanonTransitionOutcome::ConflictNeedsInspect { .. }
         ));
         assert_eq!(
             service.health(journal()).expect("health").status,
@@ -619,12 +624,8 @@ mod tests {
 
     #[tokio::test]
     async fn publish_unowned_then_factory_refuses_owners() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -653,7 +654,7 @@ mod tests {
             CanonTransitionRequest {
                 authority,
                 drained,
-                successor: harness.second.clone(),
+                successor: harness.provision(&harness.second, 0).await,
                 next_owner: CanonOwner::Unowned,
                 journal_id: journal(),
                 verse_id: verse(),
@@ -691,12 +692,13 @@ mod tests {
     #[tokio::test]
     async fn poison_flush_blocks_drain_and_publish() {
         let drive = FailAfterWriteDrive::new();
-        let harness = Harness::with_first_drive(Arc::clone(&drive) as Arc<dyn LogDrive>);
+        let harness = transit_harness().await;
         harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+            .bootstrap_first_with_drive(
+                Arc::clone(&drive) as Arc<dyn LogDrive>,
+                owned(0, owner_a()).encode(),
+            )
+            .await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -732,12 +734,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_mismatch_and_non_fresh_fail_closed() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -762,6 +760,11 @@ mod tests {
             .await
             .expect("drain");
 
+        use holylog::virtual_log::LogletId;
+
+        let mismatch_a = LogletId::new("transit-mismatch-a").expect("id");
+        let mismatch_b = LogletId::new("transit-mismatch-b").expect("id");
+
         assert!(matches!(
             publish_canon_transition(
                 &mut service,
@@ -774,7 +777,7 @@ mod tests {
                         owner_a(),
                         0,
                     ),
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&mismatch_a, 0).await,
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
                     verse_id: verse(),
@@ -791,7 +794,7 @@ mod tests {
                 CanonTransitionRequest {
                     authority: authority.clone(),
                     drained: DrainedOwner::for_test(journal(), verse(), owner_a(), 0),
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&mismatch_b, 0).await,
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
                     verse_id: VerseId::from_bytes(*b"other-line-id!!!"),
@@ -807,7 +810,9 @@ mod tests {
             CanonTransitionRequest {
                 authority,
                 drained,
-                successor: harness.first.clone(),
+                successor: harness
+                    .provision_with_root(&harness.first, "transit-retry-root", 0)
+                    .await,
                 next_owner: owned_owner(owner_b()),
                 journal_id: journal(),
                 verse_id: verse(),
@@ -827,12 +832,8 @@ mod tests {
 
     #[tokio::test]
     async fn revision_overflow_fails_before_reconfigure() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -875,7 +876,7 @@ mod tests {
                 CanonTransitionRequest {
                     authority,
                     drained,
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&harness.second, 0).await,
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
                     verse_id: verse(),
@@ -888,12 +889,8 @@ mod tests {
 
     #[tokio::test]
     async fn lab_register_cannot_drain_for_publish() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -934,12 +931,8 @@ mod tests {
 
     #[tokio::test]
     async fn drain_rejects_authority_for_a_different_published_owner() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -951,17 +944,9 @@ mod tests {
         let mut service = ChunkJournalService::new();
         service.register_canon_owner(recovered).expect("register");
 
-        {
-            let log = harness.virtual_log();
-            let observed = log.observe_membership().await.expect("observe");
-            log.reconfigure_from_observation(
-                &observed,
-                harness.second.clone(),
-                owned(1, owner_b()).encode(),
-            )
-            .await
-            .expect("publish B without draining A");
-        }
+        harness
+            .reconfigure_id(&harness.second, owned(1, owner_b()).encode())
+            .await;
         let authority_b = observe_canon_authority_witnessed(
             &harness.virtual_log(),
             journal(),
@@ -982,12 +967,8 @@ mod tests {
 
     #[tokio::test]
     async fn inconsistent_witness_refuses_publish_without_seal_or_stop() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let recovered = recover_canon_owner(
             request(owner_a()),
             harness.virtual_log(),
@@ -1021,7 +1002,7 @@ mod tests {
                 CanonTransitionRequest {
                     authority: bad,
                     drained,
-                    successor: harness.second.clone(),
+                    successor: harness.provision(&harness.second, 0).await,
                     next_owner: owned_owner(owner_b()),
                     journal_id: journal(),
                     verse_id: verse(),
@@ -1044,12 +1025,8 @@ mod tests {
 
     #[tokio::test]
     async fn manual_clock_drain_still_flushes_open_chunk() {
-        let harness = Harness::memory();
-        harness
-            .virtual_log()
-            .bootstrap_with_application_fence(harness.first.clone(), owned(0, owner_a()).encode())
-            .await
-            .expect("bootstrap");
+        let harness = transit_harness().await;
+        harness.bootstrap_first(owned(0, owner_a()).encode()).await;
         let clock = Arc::new(ManualClock::new());
         let timer = ManualTimer::new(Arc::clone(&clock));
         let recovered =

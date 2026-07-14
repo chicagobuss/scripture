@@ -7,6 +7,9 @@ description = "Transport-neutral, single-writer service primitives for Scripture
 license = "MIT"
 publish = false
 
+[features]
+virtuallog-test-support = []
+
 [dependencies]
 scripture = { path = "../scripture" }
 holylog.workspace = true
