@@ -60,8 +60,8 @@ than estimates. Operators with a service they like and trust are explicitly
 invited off this table — that is what the adapter kit is for.
 
 **Scripture does not stripe by default.** Striping is holylog's per-log
-bandwidth knob for byte-capped backends, gated behind holylog decision 0011;
-scripture reaches for it only in the hot tier, and documents why.
+bandwidth knob for byte-capped backends (decision 0011 accepted; not used by
+default); scripture reaches for it only in the hot tier, and documents why.
 
 ## Phase plan
 

@@ -35,8 +35,12 @@ use state::{BlockedSubmission, Command, DedupWindow, OpenChunk, SealedWork};
 
 /// Acknowledgement level reported on a receipt.
 ///
-/// Phase 1 only ever emits [`AckLevel::Committed`].
+/// Phase 1 only ever emits [`AckLevel::Committed`]. Lower variants are reserved
+/// for future spool/replication profiles and are **never** a durability claim
+/// on their own. Marked non-exhaustive so new levels can land without silent
+/// incomplete matches in consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AckLevel {
     /// One node held the bytes in memory. Never a durability claim.
     Accepted,
