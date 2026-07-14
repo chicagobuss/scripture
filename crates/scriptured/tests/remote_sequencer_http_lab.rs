@@ -3,8 +3,7 @@
 //! Run with:
 //! `cargo test -p scriptured --features remote-sequencer-http-lab --locked`
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,10 +11,7 @@ use holylog::atomic::{AtomicLog, InMemorySeal, InMemoryTrimPoint, Sequencer, Seq
 use holylog::drive::LogDrive;
 use holylog::memory::InMemoryLogDrive;
 use holylog::remote_sequencer::{ActivateOutcome, InMemoryRemoteSequencer, SequencerEpoch};
-use holylog::virtual_log::{
-    ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver, ResolveFuture,
-    VirtualLog,
-};
+use holylog::virtual_log::InMemoryConditionalRegister;
 use holylog_remote_sequencer_http::{
     FixedCapabilityAuthenticator, RemoteSequencerHttpClient, RemoteSequencerHttpMetrics,
     RemoteSequencerHttpServer, SequencerCapability,
@@ -28,6 +24,7 @@ use scripture::{
 use scripture_service::{
     AdmissionDisposition, CanonOwnerRequest, CanonRoute, ChunkJournalService, LocalCanonOwnerMatch,
     admission_for, recover_canon_owner, resolve_canon_route, resolve_canon_route_with_epoch,
+    virtuallog_test_support::VirtualLogHarness,
 };
 use tokio::net::TcpListener;
 
@@ -152,58 +149,17 @@ fn canon_owner_request() -> CanonOwnerRequest {
     }
 }
 
-#[derive(Default)]
-struct Resolver {
-    loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
+async fn http_harness() -> VirtualLogHarness {
+    VirtualLogHarness::with_ids(
+        "http-lab-first",
+        "http-lab-second",
+        "http-lab-third",
+        Arc::new(InMemoryConditionalRegister::new()),
+    )
+    .await
 }
 
-impl Resolver {
-    fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-        self.loglets.lock().expect("lock").insert(id, log);
-    }
-}
-
-impl LogletResolver for Resolver {
-    fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-        let id = id.clone();
-        Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-    }
-}
-
-struct Harness {
-    register: Arc<dyn ConditionalRegister>,
-    resolver: Arc<Resolver>,
-    first: LogletId,
-}
-
-impl Harness {
-    fn memory() -> Self {
-        let resolver = Arc::new(Resolver::default());
-        let first = LogletId::new("http-lab-first").expect("id");
-        resolver.insert(
-            first.clone(),
-            Arc::new(
-                AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                    .build()
-                    .expect("log"),
-            ),
-        );
-        Self {
-            register: Arc::new(InMemoryConditionalRegister::new()),
-            resolver,
-            first,
-        }
-    }
-
-    fn virtual_log(&self) -> VirtualLog {
-        VirtualLog::new(
-            Arc::clone(&self.register),
-            Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-        )
-    }
-}
-
-async fn register_serving_owner(harness: &Harness) -> ChunkJournalService {
+async fn register_serving_owner(harness: &VirtualLogHarness) -> ChunkJournalService {
     let recovered = recover_canon_owner(
         canon_owner_request(),
         harness.virtual_log(),
@@ -233,12 +189,8 @@ async fn canon_v2_missing_local_epoch_refuses_before_remote_acquire() {
         AdmissionDisposition::Fenced
     );
 
-    let harness = Harness::memory();
-    harness
-        .virtual_log()
-        .bootstrap_with_application_fence(harness.first.clone(), fence.encode())
-        .await
-        .expect("bootstrap");
+    let harness = http_harness().await;
+    harness.bootstrap_first(fence.encode()).await;
     let service = register_serving_owner(&harness).await;
     assert!(matches!(
         resolve_canon_route_with_epoch(
@@ -278,12 +230,8 @@ async fn canon_v2_mismatched_local_epoch_refuses_before_remote_acquire() {
         AdmissionDisposition::Fenced
     );
 
-    let harness = Harness::memory();
-    harness
-        .virtual_log()
-        .bootstrap_with_application_fence(harness.first.clone(), fence.encode())
-        .await
-        .expect("bootstrap");
+    let harness = http_harness().await;
+    harness.bootstrap_first(fence.encode()).await;
     let service = register_serving_owner(&harness).await;
     assert!(matches!(
         resolve_canon_route_with_epoch(
@@ -349,12 +297,8 @@ async fn legacy_v1_fence_admits_without_epoch_and_blocks_remote_sequencer() {
         AdmissionDisposition::Serving
     );
 
-    let harness = Harness::memory();
-    harness
-        .virtual_log()
-        .bootstrap_with_application_fence(harness.first.clone(), fence.encode())
-        .await
-        .expect("bootstrap");
+    let harness = http_harness().await;
+    harness.bootstrap_first(fence.encode()).await;
     let service = register_serving_owner(&harness).await;
 
     assert!(matches!(

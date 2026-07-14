@@ -28,7 +28,7 @@ holylog-object-store-register = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, default-features = false }
 futures = { workspace = true }
 scripture = { path = "../scripture" }
-scripture-service = { path = "../scripture-service" }
+scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
