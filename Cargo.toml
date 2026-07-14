@@ -12,6 +12,7 @@ resolver = "3"
 bytes = "1.12"
 futures = "0.3"
 holylog = { path = "../holylog" }
+holylog-remote-sequencer-http = { path = "../holylog/crates/holylog-remote-sequencer-http" }
 holylog-object-store = { path = "../holylog/crates/holylog-object-store" }
 holylog-object-store-register = { path = "../holylog/crates/holylog-object-store-register" }
 object_store = { version = "0.14", default-features = false }

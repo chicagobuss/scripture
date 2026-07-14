@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = []
+remote-sequencer-http-lab = ["dep:holylog-remote-sequencer-http"]
 fleet-lab = [
     "dep:holylog-object-store",
     "dep:holylog-object-store-register",
@@ -20,6 +21,7 @@ fleet-lab = [
 [dependencies]
 bytes.workspace = true
 holylog.workspace = true
+holylog-remote-sequencer-http = { workspace = true, optional = true }
 holylog-object-store = { workspace = true, optional = true }
 holylog-object-store-register = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true, default-features = false }
@@ -35,6 +37,11 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"
 name = "fleet-lab-node"
 path = "src/bin/fleet_lab_node.rs"
 required-features = ["fleet-lab"]
+
+[[test]]
+name = "remote_sequencer_http_lab"
+path = "tests/remote_sequencer_http_lab.rs"
+required-features = ["remote-sequencer-http-lab"]
 
 [lints]
 workspace = true
