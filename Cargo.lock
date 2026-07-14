@@ -573,7 +573,8 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "holylog"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.0#2d1a56479c36a8c8c9679e398056938ef8e05422"
 dependencies = [
  "bytes",
  "futures",
@@ -584,7 +585,8 @@ dependencies = [
 
 [[package]]
 name = "holylog-object-store"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.0#2d1a56479c36a8c8c9679e398056938ef8e05422"
 dependencies = [
  "bytes",
  "futures",
@@ -595,7 +597,8 @@ dependencies = [
 
 [[package]]
 name = "holylog-object-store-register"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.0#2d1a56479c36a8c8c9679e398056938ef8e05422"
 dependencies = [
  "bytes",
  "futures",
@@ -607,7 +610,8 @@ dependencies = [
 
 [[package]]
 name = "holylog-remote-sequencer-http"
-version = "0.1.0"
+version = "0.2.0"
+source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.0#2d1a56479c36a8c8c9679e398056938ef8e05422"
 dependencies = [
  "axum",
  "bytes",
