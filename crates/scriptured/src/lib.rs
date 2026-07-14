@@ -990,7 +990,13 @@ mod tests {
                 .lines()
                 .filter(|line| line.starts_with("OK "))
                 .collect();
-            assert_eq!(oks.len(), 8, "expected 8 ordered OKs, got {text}");
+            assert_eq!(
+                oks,
+                [
+                    "OK 0 1", "OK 1 2", "OK 2 3", "OK 3 4", "OK 4 5", "OK 5 6", "OK 6 7", "OK 7 8",
+                ],
+                "expected ordered committed OKs, got {text}"
+            );
 
             let driver = runtime.driver_metrics().expect("serving metrics");
             let batching = BatchingSnapshot::from_parts(driver, metrics.snapshot());
