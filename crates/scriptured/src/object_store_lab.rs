@@ -209,17 +209,21 @@ pub fn connect_s3_compat(
     access_key: &str,
     secret_key: &str,
 ) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
-    Ok(Arc::new(
-        AmazonS3Builder::new()
-            .with_endpoint(endpoint)
-            .with_bucket_name(bucket)
-            .with_region(region)
-            .with_access_key_id(access_key)
-            .with_secret_access_key(secret_key)
-            .with_virtual_hosted_style_request(false)
-            .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-            .build()?,
-    ) as Arc<dyn ObjectStore>)
+    let mut builder = AmazonS3Builder::new()
+        .with_endpoint(endpoint)
+        .with_bucket_name(bucket)
+        .with_region(region)
+        .with_access_key_id(access_key)
+        .with_secret_access_key(secret_key)
+        .with_virtual_hosted_style_request(false)
+        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
+    // `object_store` deliberately refuses plaintext by default. The only
+    // accepted HTTP endpoint in this lab is RustFS on loopback; R2 profile
+    // construction rejects HTTP above before reaching this helper.
+    if endpoint.starts_with("http://") {
+        builder = builder.with_allow_http(true);
+    }
+    Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
 }
 
 /// Connects to a path-style S3-compatible endpoint (RustFS lab defaults).

@@ -34,6 +34,11 @@ use tokio::net::TcpListener;
 async fn main() {
     if let Err(error) = try_main().await {
         eprintln!("fleet-lab-node: {error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            eprintln!("fleet-lab-node: caused by: {cause}");
+            source = cause.source();
+        }
         process::exit(1);
     }
 }
