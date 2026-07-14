@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use holylog::provision::ExclusiveClaimStore;
 use holylog::virtual_log::{ConditionalRegister, LogletId};
-use holylog_object_store::{ObjectStoreMetrics, WritePolicy};
+use holylog_object_store::{ObjectStoreExclusiveClaim, ObjectStoreMetrics, WritePolicy};
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::path::Path;
 use scripture::{
@@ -140,6 +141,10 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         args.profile.register_capabilities(),
     )?) as Arc<dyn ConditionalRegister>;
     let metrics = Arc::new(ObjectStoreMetrics::default());
+    let claims = Arc::new(ObjectStoreExclusiveClaim::new(
+        Arc::clone(&store),
+        args.profile.drive_capabilities(),
+    )?) as Arc<dyn ExclusiveClaimStore>;
     let parts = Arc::new(ObjectStorePartsFactory::new(
         store,
         store_cfg.root.clone(),
@@ -149,7 +154,7 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
     ));
     let resolver = Arc::new(FleetLabResolver::default());
     let config = verse_config(args.owner);
-    let node = VerseNodeSupervisor::with_parts_factory(
+    let node = VerseNodeSupervisor::with_parts_factory_and_claims(
         NodeIdentity {
             owner_id: args.owner,
             endpoint: args.endpoint.clone(),
@@ -158,6 +163,7 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         resolver,
         parts,
         config,
+        claims,
     );
 
     let outcome = if args.bootstrap {
@@ -331,7 +337,7 @@ fn disposition_label(outcome: &VerseControlOutcome) -> &'static str {
         VerseControlOutcome::Serving => "Serving",
         VerseControlOutcome::Standby => "Standby",
         VerseControlOutcome::RecoveryRequired { .. } => "RecoveryRequired",
-        VerseControlOutcome::ConflictNeedsInspect => "ConflictNeedsInspect",
+        VerseControlOutcome::ConflictNeedsInspect { .. } => "ConflictNeedsInspect",
         VerseControlOutcome::StartFailed(_) => "StartFailed",
     }
 }

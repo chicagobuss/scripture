@@ -871,20 +871,15 @@ mod tests {
     }
 
     mod canon_gated {
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Arc;
         use std::time::Duration;
 
-        use holylog::atomic::AtomicLog;
-        use holylog::memory::InMemoryLogDrive;
-        use holylog::virtual_log::{
-            ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver,
-            ResolveFuture, VirtualLog,
-        };
+        use holylog::virtual_log::{ConditionalRegister, InMemoryConditionalRegister, LogletId};
         use scripture::{
             CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnedSequencerBinding,
             OwnerEndpoint, OwnerId, RecoveryBound, SequencerEpoch, SystemClock, VerseId, WriterId,
         };
+        use scripture_service::virtuallog_test_support::VirtualLogHarness;
         use scripture_service::{VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
@@ -946,55 +941,14 @@ mod tests {
             )
         }
 
-        #[derive(Default)]
-        struct Resolver {
-            loglets: Mutex<BTreeMap<LogletId, Arc<AtomicLog>>>,
-        }
-
-        impl Resolver {
-            fn insert(&self, id: LogletId, log: Arc<AtomicLog>) {
-                self.loglets.lock().expect("lock").insert(id, log);
-            }
-        }
-
-        impl LogletResolver for Resolver {
-            fn resolve(&self, id: &LogletId) -> ResolveFuture<'_, Option<Arc<AtomicLog>>> {
-                let id = id.clone();
-                Box::pin(async move { Ok(self.loglets.lock().expect("lock").get(&id).cloned()) })
-            }
-        }
-
-        struct Harness {
-            register: Arc<dyn ConditionalRegister>,
-            resolver: Arc<Resolver>,
-            first: LogletId,
-        }
-
-        impl Harness {
-            fn memory() -> Self {
-                let resolver = Arc::new(Resolver::default());
-                let first = LogletId::new("canon-raw-first").expect("id");
-                resolver.insert(
-                    first.clone(),
-                    Arc::new(
-                        AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                            .build()
-                            .expect("log"),
-                    ),
-                );
-                Self {
-                    register: Arc::new(InMemoryConditionalRegister::new()),
-                    resolver,
-                    first,
-                }
-            }
-
-            fn virtual_log(&self) -> VirtualLog {
-                VirtualLog::new(
-                    Arc::clone(&self.register),
-                    Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-                )
-            }
+        async fn raw_harness() -> VirtualLogHarness {
+            VirtualLogHarness::with_ids(
+                "canon-raw-first",
+                "canon-raw-second",
+                "canon-raw-third",
+                Arc::new(InMemoryConditionalRegister::new()),
+            )
+            .await
         }
 
         async fn exchange(runtime: Arc<VerseRuntime>, payload: &[u8]) -> String {
@@ -1019,15 +973,8 @@ mod tests {
 
         #[tokio::test]
         async fn serving_node_writes_committed_ok() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_a()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
@@ -1043,15 +990,8 @@ mod tests {
 
         #[tokio::test]
         async fn pipelined_small_lines_share_one_committed_chunk() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_a()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let mut cfg = config(owner_a());
             cfg.policy.max_chunk_records = 8;
             cfg.policy.max_chunk_bytes = 64 * 1024;
@@ -1123,15 +1063,8 @@ mod tests {
 
         #[tokio::test]
         async fn other_owner_returns_exact_not_owner_without_append() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_a()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
@@ -1142,25 +1075,9 @@ mod tests {
             .expect("start a");
             assert!(runtime.is_serving());
             let second = LogletId::new("canon-raw-second").expect("id");
-            harness.resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            {
-                let log = harness.virtual_log();
-                let observed = log.observe_membership().await.expect("observe");
-                log.reconfigure_from_observation(
-                    &observed,
-                    second.clone(),
-                    fence(1, owner_b()).encode(),
-                )
-                .await
-                .expect("cutover to B");
-            }
+            harness
+                .reconfigure_id(&second, fence(1, owner_b()).encode())
+                .await;
             let response = exchange(Arc::new(runtime), b"should-not-append\n").await;
             assert_eq!(
                 response,
@@ -1173,15 +1090,8 @@ mod tests {
 
         #[tokio::test]
         async fn unowned_returns_recovering_without_append() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_a()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
@@ -1192,25 +1102,12 @@ mod tests {
             .expect("start");
             assert!(runtime.is_serving());
             let second = LogletId::new("canon-raw-unowned").expect("id");
-            harness.resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            {
-                let log = harness.virtual_log();
-                let observed = log.observe_membership().await.expect("observe");
-                log.reconfigure_from_observation(
-                    &observed,
-                    second.clone(),
+            harness
+                .reconfigure_id(
+                    &second,
                     CanonFence::new(1, journal(), verse(), CanonOwner::Unowned).encode(),
                 )
-                .await
-                .expect("unowned");
-            }
+                .await;
             let response = exchange(Arc::new(runtime), b"nope\n").await;
             assert_eq!(response, "ERR recovering canon=1\n");
             let tail = harness.virtual_log().check_tail().await.expect("tail");
@@ -1255,26 +1152,17 @@ mod tests {
                 inner: InMemoryConditionalRegister::new(),
                 armed: AtomicBool::new(false),
             });
-            let resolver = Arc::new(Resolver::default());
-            let first = LogletId::new("canon-raw-fail").expect("id");
-            resolver.insert(
-                first.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
-            let log = VirtualLog::new(
+            let harness = VirtualLogHarness::with_ids(
+                "canon-raw-fail",
+                "canon-raw-fail-2",
+                "canon-raw-fail-3",
                 Arc::clone(&register) as Arc<dyn ConditionalRegister>,
-                Arc::clone(&resolver) as Arc<dyn LogletResolver>,
-            );
-            log.bootstrap_with_application_fence(first, fence(0, owner_a()).encode())
-                .await
-                .expect("bootstrap");
+            )
+            .await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
-                log,
+                harness.virtual_log(),
                 SystemClock::new(),
                 scripture::SystemTimer::new(),
             )
@@ -1288,15 +1176,8 @@ mod tests {
 
         #[tokio::test]
         async fn standby_runtime_listener_returns_not_owner_without_append() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_b()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_b()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
@@ -1319,15 +1200,8 @@ mod tests {
 
         #[tokio::test]
         async fn after_handoff_old_runtime_never_accepts_payload() {
-            let harness = Harness::memory();
-            harness
-                .virtual_log()
-                .bootstrap_with_application_fence(
-                    harness.first.clone(),
-                    fence(0, owner_a()).encode(),
-                )
-                .await
-                .expect("bootstrap");
+            let harness = raw_harness().await;
+            harness.bootstrap_first(fence(0, owner_a()).encode()).await;
             let runtime = VerseRuntime::start(
                 config(owner_a()),
                 harness.virtual_log(),
@@ -1337,17 +1211,10 @@ mod tests {
             .await
             .expect("start");
             let second = LogletId::new("canon-raw-handoff").expect("id");
-            harness.resolver.insert(
-                second.clone(),
-                Arc::new(
-                    AtomicLog::builder(Arc::new(InMemoryLogDrive::new()), 0)
-                        .build()
-                        .expect("log"),
-                ),
-            );
+            let successor = harness.provision(&second, 0).await;
             let (runtime, outcome) = runtime
                 .drain_seal_publish(VerseHandoffRequest {
-                    successor: second,
+                    successor,
                     next_owner: {
                         let endpoint =
                             OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint");

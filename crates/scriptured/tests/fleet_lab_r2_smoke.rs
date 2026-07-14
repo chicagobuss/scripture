@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
+use holylog::provision::{ExclusiveClaimStore, InMemoryExclusiveClaimStore};
 use holylog::virtual_log::{ConditionalRegister, LogletId};
 use holylog_object_store::{ObjectStoreMetrics, WritePolicy};
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
@@ -164,10 +165,11 @@ async fn run_smoke(
         Arc::clone(&metrics),
     ));
     let resolver = Arc::new(FleetLabResolver::default());
+    let claims: Arc<dyn ExclusiveClaimStore> = Arc::new(InMemoryExclusiveClaimStore::new());
 
     let owner_a = OwnerId::from_bytes(*b"fleet-lab-own-a!");
     let owner_b = OwnerId::from_bytes(*b"fleet-lab-own-b!");
-    let node_a = VerseNodeSupervisor::with_parts_factory(
+    let node_a = VerseNodeSupervisor::with_parts_factory_and_claims(
         NodeIdentity {
             owner_id: owner_a,
             endpoint: OwnerEndpoint::new("tcp://127.0.0.1:19000")?,
@@ -176,6 +178,7 @@ async fn run_smoke(
         Arc::clone(&resolver),
         Arc::clone(&parts),
         verse_config(owner_a),
+        Arc::clone(&claims),
     );
     let outcome = node_a
         .bootstrap_verse(
@@ -187,7 +190,7 @@ async fn run_smoke(
         .await?;
     assert!(matches!(outcome, VerseControlOutcome::Serving));
 
-    let node_b = VerseNodeSupervisor::with_parts_factory(
+    let node_b = VerseNodeSupervisor::with_parts_factory_and_claims(
         NodeIdentity {
             owner_id: owner_b,
             endpoint: OwnerEndpoint::new("tcp://127.0.0.1:19001")?,
@@ -196,6 +199,7 @@ async fn run_smoke(
         resolver,
         parts,
         verse_config(owner_b),
+        claims,
     );
     let standby = node_b
         .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)

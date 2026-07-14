@@ -179,6 +179,14 @@ impl PartsFactory for ObjectStorePartsFactory {
     ) -> Result<DurableLogletParts, crate::fleet_lab::PartsFactoryError> {
         self.fresh(loglet_id)
     }
+
+    fn namespaces(
+        &self,
+        loglet_id: &LogletId,
+    ) -> Result<holylog::provision::LogletObjectNamespaces, crate::fleet_lab::PartsFactoryError>
+    {
+        Ok(LogletObjectNamespaces::under_root(&self.root, loglet_id))
+    }
 }
 
 /// Failures while constructing fleet-exercise object-store adapters.
@@ -242,6 +250,8 @@ pub fn connect_rustfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use holylog_object_store::{ConditionalCreate, ObjectStoreExclusiveClaim};
+    use object_store::memory::InMemory;
 
     #[test]
     fn parses_backend_profiles_and_rejects_s3_reservation() {
@@ -266,5 +276,17 @@ mod tests {
         assert!(fleet_exercise_root("").is_err());
         assert!(fleet_exercise_root("a/b").is_err());
         assert!(fleet_exercise_root("..").is_err());
+    }
+
+    #[test]
+    fn object_store_claim_refuses_non_atomic_conditional_create() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let caps = BackendCapabilities::new(
+            PointSemantics::LinearizableSingleValue,
+            ListingOrder::Lexicographic,
+            ListingVisibility::Strong,
+            ConditionalCreate::Unsupported,
+        );
+        assert!(ObjectStoreExclusiveClaim::new(store, caps).is_err());
     }
 }
