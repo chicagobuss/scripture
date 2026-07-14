@@ -132,6 +132,12 @@ pub fn resolve_endpoint_config(
             } else {
                 format!("https://{endpoint}")
             };
+            if endpoint.starts_with("http://") {
+                return Err(FleetConfigError::Message(
+                    "r2 requires an HTTPS endpoint; plaintext HTTP is reserved for the local RustFS lab"
+                        .into(),
+                ));
+            }
             let bucket = bucket
                 .or_else(|| lookup(overlay, "R2_BUCKET"))
                 .ok_or_else(|| {
@@ -259,6 +265,20 @@ mod tests {
         assert_eq!(cfg.root, "scripture-fleet-exercise/run-a");
         assert_eq!(cfg.bucket, "holylog-rustfs");
         assert_eq!(cfg.profile.label(), "rustfs");
+    }
+
+    #[test]
+    fn r2_rejects_a_plaintext_endpoint() {
+        let error = resolve_endpoint_config(
+            BackendProfile::CloudflareR2,
+            "run-a",
+            Some("http://example.invalid".into()),
+            Some("bucket-a".into()),
+            None,
+            &BTreeMap::new(),
+        )
+        .expect_err("R2 must not use plaintext HTTP");
+        assert!(error.to_string().contains("HTTPS"));
     }
 
     fn tempfile_dir() -> std::path::PathBuf {
