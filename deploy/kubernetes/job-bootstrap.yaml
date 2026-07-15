@@ -1,0 +1,42 @@
+# One-shot greenfield Canon bootstrap. Not a Deployment.
+# Requires REPLACE_WITH_* placeholders and an existing Secret.
+# Does not open ingress. Owner/standby Deployments start afterward from Canon.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scripture-bootstrap
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: scripture
+          image: scripture:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - bootstrap
+            - --config
+            - /etc/scripture/scripture.yaml
+            - --loglet-id
+            - REPLACE_WITH_LOGLET_ID
+          envFrom:
+            - secretRef:
+                name: scripture-store-credentials
+          volumeMounts:
+            - name: config
+              mountPath: /etc/scripture
+              readOnly: true
+      volumes:
+        - name: config
+          # Reuses the owner ConfigMap (same Verse + store prefix). Loglet id
+          # comes from argv, never from a forever-bootstrap Deployment.
+          configMap:
+            name: scripture-owner-config

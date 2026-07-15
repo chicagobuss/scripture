@@ -1,0 +1,33 @@
+[package]
+name = "scripture-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Scripture process command (scripture serve)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "scripture"
+path = "src/main.rs"
+# Avoid cargo-doc path collision with the `scripture` library crate.
+doc = false
+
+[dependencies]
+holylog.workspace = true
+holylog-object-store = { workspace = true, features = ["s3"] }
+holylog-object-store-register = { workspace = true, features = ["aws"] }
+object_store = { workspace = true, default-features = false }
+scripture = { path = "../scripture" }
+scripture-runtime = { path = "../scripture-runtime" }
+scripture-service = { path = "../scripture-service" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+# Private operator inputs and evidence; never commit them.
+.fleet-lab/
+*.env
+deploy/fleet-exercise/inventory/hosts.env
+deploy/fleet-exercise/results/*
+!deploy/fleet-exercise/results/.gitkeep

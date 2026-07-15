@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/scripture-load"]
+resolver = "3"
+
+[workspace.dependencies]
+bytes = "1.12"
+futures = "0.3"
+holylog = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.0" }
+thiserror = "2.0"
+tokio = { version = "1.47", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

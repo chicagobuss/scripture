@@ -1,8 +1,4 @@
 /target
 Cargo.lock.bak
+/config/local/
 /references/opendata/
-/deploy/fleet-exercise/bin/fleet-lab-node
-/deploy/fleet-exercise/bin/scripture-load
-/deploy/fleet-exercise/inventory/hosts.env
-/deploy/fleet-exercise/results/*
-!/deploy/fleet-exercise/results/.gitkeep

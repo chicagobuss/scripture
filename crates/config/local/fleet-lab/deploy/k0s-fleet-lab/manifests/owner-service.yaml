@@ -1,0 +1,14 @@
+# Local overlay: selects ready owner only. Placement/nodeNames are personal.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scripture-owner
+  namespace: scripture-lab
+spec:
+  selector:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: owner
+  ports:
+    - name: ingress
+      port: 9000
+      targetPort: ingress

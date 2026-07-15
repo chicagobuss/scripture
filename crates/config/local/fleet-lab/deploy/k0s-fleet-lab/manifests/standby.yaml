@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scripture-standby
+  namespace: scripture-lab
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: standby
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scripture
+      app.kubernetes.io/component: standby
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture
+        app.kubernetes.io/component: standby
+    spec:
+      # Personal nodeName filled by operator overlay.
+      containers:
+        - name: scripture
+          image: scripture:0.1.0
+          imagePullPolicy: Never
+          args:
+            - serve
+            - --config
+            - /etc/scripture/scripture.yaml
+          ports:
+            - name: ingress
+              containerPort: 9000
+            - name: status
+              containerPort: 9100
+          envFrom:
+            - secretRef:
+                name: scripture-store-credentials
+          volumeMounts:
+            - name: config
+              mountPath: /etc/scripture
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: status
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: status
+      volumes:
+        - name: config
+          configMap:
+            name: scripture-standby-config

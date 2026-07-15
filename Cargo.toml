@@ -3,8 +3,8 @@ members = [
     "crates/protoscripture",
     "crates/scripture",
     "crates/scripture-service",
-    "crates/scriptured",
-    "crates/scripture-load",
+    "crates/scripture-runtime",
+    "crates/scripture-cli",
 ]
 resolver = "3"
 
@@ -21,6 +21,8 @@ crc32c = "0.6"
 proptest = "1.9"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

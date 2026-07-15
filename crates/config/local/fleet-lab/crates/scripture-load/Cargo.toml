@@ -1,0 +1,21 @@
+[package]
+name = "scripture-load"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Bounded raw-lines load producer (committed-only ack semantics)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "scripture-load"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+# Selects the owner Role candidate only, and only while Pods are Ready
+# (readyz ⇒ Serving). Standby and RecoveryRequired Pods are never endpoints.
+# Traffic here is not an ownership grant; Canon disposition remains authoritative.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scripture-owner
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: owner
+spec:
+  selector:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: owner
+  ports:
+    - name: ingress
+      port: 9000
+      targetPort: ingress

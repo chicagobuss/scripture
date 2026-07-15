@@ -1,0 +1,26 @@
+[package]
+name = "scripture-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Scripture product runtime composition (serve path)"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+holylog.workspace = true
+holylog-object-store = { workspace = true, features = ["s3"] }
+holylog-object-store-register = { workspace = true, features = ["aws"] }
+object_store = { workspace = true, default-features = false }
+scripture = { path = "../scripture" }
+scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+
+[lints]
+workspace = true

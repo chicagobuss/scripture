@@ -1,0 +1,5 @@
+# Optional personal overlay: copy from Scripture deploy/kubernetes/deployment-owner.yaml
+# and add nodeName / namespace only. Keep args as plain `serve --config`.
+apiVersion: v1
+kind: List
+items: []

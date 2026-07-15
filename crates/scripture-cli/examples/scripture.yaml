@@ -1,0 +1,40 @@
+# Example Scripture configuration (non-secret).
+#
+# Credentials are never listed here. Provide them via process environment:
+# - rustfs: RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY (or AWS_ACCESS_KEY_ID /
+#   AWS_SECRET_ACCESS_KEY)
+# - r2: R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#
+# Identity fields that are canonical IDs must be exactly 16 ASCII bytes.
+# Replace REPLACE_WITH_* durable-store placeholders before use.
+
+version: 1
+
+node:
+  owner_id: "scripture-own-a!"
+  advertise: "tcp://scripture-owner:9000"
+
+listener:
+  bind: "0.0.0.0:9000"
+
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+
+store:
+  backend: r2
+  endpoint: "https://REPLACE_WITH_ENDPOINT"
+  bucket: "REPLACE_WITH_BUCKET"
+  region: auto
+  prefix: "scripture/deployments/REPLACE_WITH_PREFIX"
+
+paths: {}
+
+metrics:
+  status_bind: "127.0.0.1:9100"
+
+# Omit bootstrap YAML — greenfield uses:
+#   scripture bootstrap --config … --loglet-id <ID>
+# then ordinary: scripture serve --config …
