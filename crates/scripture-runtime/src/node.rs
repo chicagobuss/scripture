@@ -843,6 +843,12 @@ impl VerseNodeSupervisor {
         )
         .await?;
 
+        // Reject activation if a runtime is already installed (e.g. Serving or Standby)
+        // on the owning node.
+        if self.runtime.lock().await.is_some() {
+            return Err(SupervisorError::RuntimeInUse { key: self.key });
+        }
+
         // Fail closed for uninitialized/empty membership
         if observed.observed().state.generations.is_empty() {
             return Err(SupervisorError::VirtualLog(
@@ -1165,7 +1171,7 @@ mod tests {
     use holylog::provision::{
         ExclusiveClaimStore, InMemoryExclusiveClaimStore, OpenReattachError, resolve_read_seal,
     };
-    use holylog::virtual_log::{InMemoryConditionalRegister, LogletId};
+    use holylog::virtual_log::{ConditionalRegister, InMemoryConditionalRegister, LogletId};
     use scripture::{
         ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, SystemClock,
         VerseId, WriterId,
@@ -1990,4 +1996,83 @@ mod tests {
             SupervisorError::InvalidActivationDisposition { .. }
         ));
     }
+
+    #[tokio::test]
+    async fn activate_empty_open_generation_refuses_when_serving() {
+        let register = Arc::new(InMemoryConditionalRegister::new());
+        let parts = Arc::new(SharedMemoryPartsFactory::default());
+        let claims = Arc::new(InMemoryExclusiveClaimStore::new());
+        let resolver = Arc::new(ProcessLogletResolver::default());
+        let node = VerseNodeSupervisor::with_parts_factory_and_claims(
+            identity(owner_a()),
+            Arc::clone(&register) as Arc<dyn holylog::virtual_log::ConditionalRegister>,
+            Arc::clone(&resolver),
+            Arc::clone(&parts) as Arc<dyn super::PartsFactory>,
+            config(owner_a()),
+            Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
+        );
+        let first = LogletId::new("first-gen").expect("id");
+        let second = LogletId::new("second-gen").expect("id");
+
+        // Bootstrap and start serving (first-gen starts out empty)
+        let outcome = node
+            .bootstrap_verse(
+                first.clone(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+                2,
+            )
+            .await
+            .expect("bootstrap");
+        assert!(matches!(outcome, VerseControlOutcome::Serving));
+
+        // Ensure first-gen remains unsealed and resolver has a registered writable resolver entry
+        {
+            let store = node.store.lock().await;
+            assert_eq!(store.active, Some(first.clone()));
+        }
+        assert!(resolver.is_writable(&first));
+
+        // Attempting to activate successor while serving must fail closed with RuntimeInUse
+        let err = node
+            .activate_empty_open_generation(
+                second.clone(),
+                SystemClock::new(),
+                scripture::SystemTimer::new(),
+                2,
+            )
+            .await
+            .expect_err("activate fail");
+        assert!(matches!(err, SupervisorError::RuntimeInUse { .. }));
+
+        // Verify Canon, seal, and resolver state are unchanged:
+        // 1. Resolver still has writable state for first, and not for second
+        assert!(resolver.is_writable(&first));
+        assert!(!resolver.is_writable(&second));
+
+        // 2. Active in store is still first
+        {
+            let store = node.store.lock().await;
+            assert_eq!(store.active, Some(first.clone()));
+        }
+
+        // 3. The first-gen is still unsealed
+        let historical = resolve_read_seal(parts.open(&first).expect("open").components(2))
+            .await
+            .expect("seal");
+        assert!(!historical.observe_durable().await.expect("observe").sealed());
+
+        // 4. Canon active generation is still first
+        let observed_state = node
+            .virtual_log()
+            .observe_membership()
+            .await
+            .expect("observe")
+            .state;
+        assert_eq!(
+            observed_state.active().map(|g| g.loglet_id.clone()),
+            Some(first)
+        );
+    }
 }
+
