@@ -43,7 +43,7 @@ pressure-test the kernel surface, not to grow into the product; findings feed
 - deterministic count/byte/monotonic-age batching policy without any claim
   that buffered records are durable.
 
-## Service and raw-lines lab slice
+## Service and product runtime
 
 `crates/scripture-service` adds a bounded, cloneable submission handle over a
 single task that owns the non-cloneable writer. An acknowledgement future
@@ -52,20 +52,29 @@ actor resolves the failed and later requests as unavailable instead of leaving
 callers pending. It does not turn the v0 writer into a restart-safe or
 multi-process service.
 
-`crates/scriptured` contains the first deliberately thin network adapter:
-newline-delimited raw bytes in, `OK <first-offset> <next-offset>` after each
-durable line. It is a loopback-tested protocol harness, not a production
-daemon, schema registry, or HTTP API. In particular a connection that closes
-before its `OK` has an unknown durable outcome and must retry at-least-once.
+`crates/scripture-runtime` owns product Verse-node composition: Canon-aware
+startup, durable object-store parts, credential resolution, readiness/status
+semantics, and the temporary Canon-gated ingress used for HA testing (not a
+public producer protocol). Personal fleet tooling lives only under the ignored
+[`config/local/`](config/README.md) operator area, not in the product workspace.
 
-For a local protocol demonstration, the `scriptured` executable listens on
-`0.0.0.0:9000` by default (or `--bind HOST:PORT`). It intentionally uses an
-in-memory Holylog, so data survives only while the process is running:
+## Process command
+
+`crates/scripture-cli` ships the product binary `scripture`:
 
 ```sh
-cargo run -p scriptured -- --bind 127.0.0.1:9000
-printf 'first\nsecond\n' | nc 127.0.0.1 9000
+scripture validate --config /path/to/scripture.yaml
+scripture bootstrap --config /path/to/scripture.yaml --loglet-id <ID>
+scripture serve --config /path/to/scripture.yaml
 ```
+
+Non-secret settings live in a versioned YAML file (`deny_unknown_fields`).
+Credentials come only from the process environment (`RUSTFS_*`/`AWS_*` or
+`R2_*`) or a Secret-mounted env — never YAML, argv, ConfigMap, or logs.
+Generic Kubernetes examples and the image build live under
+[`deploy/kubernetes`](deploy/kubernetes). Probes: `/livez`, `/readyz`
+(Serving only), `/status`. This surface does not claim automatic failover,
+restart fencing, a public producer protocol, or Decision 0012 recovery.
 
 ## Development
 
@@ -73,8 +82,8 @@ Pinned to the same Rust toolchain as holylog, which is consumed as a path
 dependency during co-development.
 
 ```sh
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo run -p protoscripture
 ```

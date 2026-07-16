@@ -256,6 +256,7 @@ fn owned(revision: u64) -> CanonFence {
                 epoch: SequencerEpoch::test(revision),
                 sequencer_endpoint: endpoint,
             }),
+            writer_term: None,
         },
     )
 }

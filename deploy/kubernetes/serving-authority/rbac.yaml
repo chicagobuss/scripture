@@ -1,0 +1,33 @@
+# Bind this Role only to Scripture workloads that need to read or conditionally
+# update ServingAuthority records. It deliberately grants no lease, pod,
+# deployment, endpoint, ConfigMap, Secret, or status-subresource authority.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scripture-serving-authority
+  namespace: scripture-lab
+rules:
+  - apiGroups:
+      - scripture.dev
+    resources:
+      - servingauthorities
+    verbs:
+      - get
+      - create
+      - update
+      - patch
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scripture-serving-authority
+  namespace: scripture-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: scripture-serving-authority
+subjects:
+  - kind: ServiceAccount
+    name: scripture
+    namespace: scripture-lab
