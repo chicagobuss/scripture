@@ -1,0 +1,115 @@
+# One-shot correctness-campaign Job.
+# A/B recovery roles run in-process against a remote RustFS prefix.
+# Completed Job != Pass — collect checker-verdict.json.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scripture-campaign-REPLACE_WITH_RUN_ID
+  namespace: scripture-correctness
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: correctness-campaign
+    scripture.dev/run-id: REPLACE_WITH_RUN_ID
+    scripture.dev/scenario: REPLACE_WITH_SCENARIO
+    scripture.dev/role: campaign-driver
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture
+        app.kubernetes.io/component: correctness-campaign
+        scripture.dev/run-id: REPLACE_WITH_RUN_ID
+        scripture.dev/scenario: REPLACE_WITH_SCENARIO
+        scripture.dev/role: campaign-driver
+    spec:
+      serviceAccountName: scripture-correctness
+      restartPolicy: Never
+      # Keep the driver off the RustFS node so store I/O is genuinely remote.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - REPLACE_WITH_DRIVER_NODE
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: rustfs
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: campaign
+          image: scripture-campaign:0.1.0
+          # Home-fleet runs import the exact image locally. Refuse an implicit
+          # registry pull: operator attestation of the target-node image is a
+          # precondition for a live campaign.
+          imagePullPolicy: Never
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          args:
+            - --run-id
+            - REPLACE_WITH_RUN_ID
+            - --scenario
+            - REPLACE_WITH_SCENARIO
+            - --backend
+            - rustfs
+            - --artifact-dir
+            - /artifacts
+            - --endpoint
+            - $(CAMPAIGN_ENDPOINT)
+            - --bucket
+            - $(CAMPAIGN_BUCKET)
+            - --region
+            - $(CAMPAIGN_REGION)
+            - --prefix
+            - $(CAMPAIGN_PREFIX)
+          env:
+            - name: CAMPAIGN_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: scripture-correctness-REPLACE_WITH_RUN_ID
+                  key: endpoint
+            - name: CAMPAIGN_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: scripture-correctness-REPLACE_WITH_RUN_ID
+                  key: bucket
+            - name: CAMPAIGN_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: scripture-correctness-REPLACE_WITH_RUN_ID
+                  key: region
+            - name: CAMPAIGN_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: scripture-correctness-REPLACE_WITH_RUN_ID
+                  key: prefix
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scripture-correctness-store
+                  key: RUSTFS_ACCESS_KEY
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scripture-correctness-store
+                  key: RUSTFS_SECRET_KEY
+          volumeMounts:
+            - name: artifacts
+              mountPath: /artifacts
+      volumes:
+        - name: artifacts
+          emptyDir: {}

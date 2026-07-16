@@ -1,0 +1,28 @@
+{
+  "kube_context": "home-fleet",
+  "required_nodes": [
+    "bignlittles",
+    "mrmini",
+    "mrtiny",
+    "mrhacker"
+  ],
+  "rustfs_node": "bignlittles",
+  "rustfs_namespace": "scripture-lab",
+  "rustfs_service": "rustfs",
+  "rustfs_service_dns": "http://rustfs.scripture-lab.svc.cluster.local:9000",
+  "rustfs_bucket": "scripture-ha-lab",
+  "rustfs_region": "us-east-1",
+  "driver_node": "mrmini",
+  "image": "scripture-campaign:0.1.0",
+  "store_secret": "scripture-correctness-store",
+  "store_secret_namespace": "scripture-correctness",
+  "correctness_namespace": "scripture-correctness",
+  "load_namespace": "scripture-load",
+  "observe_namespace": "scripture-observe",
+  "ha_namespace": "scripture-ha",
+  "notes": [
+    "Non-secret topology only. Credentials live in the named Secret keys RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY.",
+    "Persistent HA drill state (scripture-ha / existing scripture-lab HA C) must not share prefixes with campaigns.",
+    "Prefer a store Secret that reuses the same key material as rustfs-credentials without copying values into Git."
+  ]
+}
