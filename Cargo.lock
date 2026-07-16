@@ -1959,6 +1959,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "scripture-campaign"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "holylog",
+ "holylog-correctness",
+ "holylog-object-store",
+ "holylog-object-store-register",
+ "object_store",
+ "scripture",
+ "scripture-runtime",
+ "scripture-service",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "scripture-cli"
 version = "0.1.0"
 dependencies = [
