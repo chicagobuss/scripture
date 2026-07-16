@@ -1,0 +1,51 @@
+[package]
+name = "scripture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A correctness-first durable journal system over holylog"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+r2-smoke = [
+    "dep:holylog-object-store",
+    "dep:object_store",
+    "dep:tokio",
+    "holylog-object-store/s3",
+    "object_store/aws",
+]
+s3-smoke = [
+    "dep:holylog-object-store",
+    "dep:object_store",
+    "dep:tokio",
+    "holylog-object-store/s3",
+    "object_store/aws",
+]
+gcs-smoke = [
+    "dep:holylog-object-store",
+    "dep:object_store",
+    "dep:tokio",
+    "holylog-object-store/gcp",
+    "object_store/gcp",
+]
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
+holylog.workspace = true
+holylog-object-store = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+crc32c.workspace = true
+futures.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
