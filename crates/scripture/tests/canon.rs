@@ -23,6 +23,7 @@ fn owner_v1_legacy() -> CanonOwner {
         owner_id: OwnerId::from_bytes(*b"canon-owner-id!!"),
         endpoint: endpoint(),
         sequencer: None,
+        writer_term: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn owner_v2(epoch: SequencerEpoch, sequencer_endpoint: OwnerEndpoint) -> CanonOw
             epoch,
             sequencer_endpoint,
         }),
+        writer_term: None,
     }
 }
 
@@ -299,6 +301,7 @@ fn witnessed_authority_rejects_mismatched_fence_and_observation() {
             owner_id: OwnerId::from_bytes(*b"other-owner-id!!"),
             endpoint: OwnerEndpoint::new("tcp://other.internal:9000").expect("endpoint"),
             sequencer: None,
+            writer_term: None,
         },
     );
     let authority = WitnessedCanonAuthority::from_parts_for_test(

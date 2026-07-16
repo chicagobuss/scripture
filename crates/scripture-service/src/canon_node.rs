@@ -333,6 +333,7 @@ mod tests {
                 owner_id: owner,
                 endpoint,
                 sequencer: None,
+                writer_term: None,
             },
         )
     }
@@ -521,6 +522,7 @@ mod tests {
                             sequencer_endpoint: OwnerEndpoint::new("tcp://owner.local:9000")
                                 .expect("endpoint"),
                         }),
+                        writer_term: None,
                     },
                 )
                 .encode(),

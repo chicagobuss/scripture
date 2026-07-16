@@ -1,0 +1,10 @@
+# Build only the source required for the product image. Local fleet state,
+# artifacts, and prior Rust build outputs must never become Docker context.
+.git
+target
+**/target
+config/local
+deploy/fleet-exercise/bin
+deploy/fleet-exercise/results
+Cargo.lock.bak
+references
