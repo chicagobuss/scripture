@@ -1,0 +1,44 @@
+//! Scripture product runtime composition.
+//!
+//! Owns generic Verse-node supervision, durable object-store parts, credential
+//! resolution, and the temporary Canon-gated ingress used for HA testing.
+//! Lab-only fleet orchestration does not live here.
+
+mod authority_bootstrap;
+mod authority_gate;
+mod credentials;
+mod ha_session;
+mod holylog_foundation;
+mod ingress;
+mod node;
+mod object_store;
+mod raw_lines;
+mod status;
+
+pub use authority_bootstrap::bootstrap_authority_domain;
+pub use authority_gate::{AuthorityGateDecision, AuthorityGateDenial, evaluate_authority_gate};
+pub use credentials::{CredentialError, StoreCredentials, resolve_credentials};
+pub use ha_session::{
+    HaActivationError, HaAdmissionError, HaServingSession, bootstrap_and_serve, promote_and_serve,
+    system_clocks,
+};
+pub use holylog_foundation::{
+    DefaultFreshLogletIdPolicy, FreshLogletIdPolicy, HolylogJournalFoundation,
+    owned_with_writer_term,
+};
+pub use ingress::{
+    serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,
+    serve_canon_raw_lines_connection_with_spool, serve_ha_raw_lines_connection,
+};
+pub use node::{
+    DurableLogletParts, InMemoryPartsFactory, NodeIdentity, PartsFactory, PartsFactoryError,
+    ProcessLogletResolver, SharedMemoryPartsFactory, SupervisorError, VerseControlOutcome,
+    VerseNodeSupervisor,
+};
+pub use object_store::{
+    BackendProfile, ObjectStoreError, ObjectStorePartsFactory, connect_s3_compat,
+};
+pub use raw_lines::{
+    BatchingSnapshot, RawLinesConfig, RawLinesConnectionMetrics, RawLinesConnectionSnapshot,
+};
+pub use status::{disposition_label, is_ready_to_serve, status_body};

@@ -236,6 +236,7 @@ mod tests {
                 owner_id: owner,
                 endpoint,
                 sequencer: None,
+                writer_term: None,
             },
         )
     }

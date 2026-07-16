@@ -14,10 +14,13 @@ virtuallog-test-support = []
 scripture = { path = "../scripture" }
 holylog.workspace = true
 thiserror.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 bytes.workspace = true
+holylog-correctness.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 futures.workspace = true
 

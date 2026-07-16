@@ -14,6 +14,7 @@ pub mod driver;
 pub mod journal;
 pub mod model;
 pub mod sequencer_key;
+pub mod serving_authority;
 pub mod spool;
 pub mod trace;
 
@@ -50,6 +51,10 @@ pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
 pub use sequencer_key::{sequencer_request_key_for_chunk, sequencer_request_key_for_submission};
+pub use serving_authority::{
+    AuthorityKey, AuthorityState, JournalGenerationRef, RouteHint, ServingAuthorityError,
+    ServingAuthorityRecord, TransitionId, TransitionKind, WriterAuthority, WriterTerm,
+};
 pub use spool::{
     FileSpoolStorage, FrameClassification, FrameKind, InMemorySpoolStorage, ProgressIdentity,
     RecoveryClassification, RecoveryReport, ScanTail, SpoolCell, SpoolCellHandle, SpoolCellState,

@@ -434,6 +434,7 @@ async fn resolve_standby_route(
             owner_id,
             endpoint,
             sequencer,
+            ..
         } if owner_id != this_owner => {
             let (sequencer_epoch, sequencer_endpoint) = sequencer
                 .as_ref()
@@ -483,9 +484,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use holylog::atomic::{InMemorySeal, InMemoryTrimPoint, Seal, TrimPoint};
+    use holylog::drive::LogDrive;
+    use holylog::memory::InMemoryLogDrive;
+    use holylog::provision::LogletComponents;
     use holylog::virtual_log::{
         ApplicationFence, CompareToken, ConditionalRegister, InMemoryConditionalRegister, LogletId,
         RegisterFuture, VersionedState, VirtualLogState,
+    };
+    use holylog_correctness::faults::{
+        FaultableConditionalRegister, FaultableLogDrive, FaultableSeal,
+    };
+    use holylog_correctness::{
+        ActorId, ActorTrace, ArmedFault, EventKind, FaultController, OperationId, RecordingSink,
+        RunId, TraceSink, Verdict, check_trace, payload_digest,
     };
     use scripture::{
         CanonFence, CanonOwner, ChunkLogError, ChunkPolicy, CohortId, JournalId, OwnerEndpoint,
@@ -551,6 +563,7 @@ mod tests {
                 owner_id: owner,
                 endpoint,
                 sequencer: None,
+                writer_term: None,
             },
         )
     }
@@ -561,6 +574,7 @@ mod tests {
             owner_id: owner,
             endpoint,
             sequencer: None,
+            writer_term: None,
         }
     }
 
@@ -579,6 +593,49 @@ mod tests {
     ) -> VirtualLogHarness {
         VirtualLogHarness::with_ids("line-rt-first", "line-rt-second", "line-rt-third", register)
             .await
+    }
+
+    fn traced_components(
+        faults: Arc<FaultController>,
+        trace: ActorTrace,
+        loglet_id: &LogletId,
+    ) -> LogletComponents {
+        let drive = Arc::new(FaultableLogDrive::new(
+            Arc::new(InMemoryLogDrive::new()) as Arc<dyn LogDrive>,
+            Arc::clone(&faults),
+            trace.clone(),
+            loglet_id.as_str(),
+        ));
+        let seal = Arc::new(FaultableSeal::new(
+            Arc::new(InMemorySeal::new()) as Arc<dyn Seal>,
+            faults,
+            trace,
+            loglet_id.as_str(),
+        ));
+        LogletComponents::new(
+            drive as Arc<dyn LogDrive>,
+            seal as Arc<dyn Seal>,
+            Arc::new(InMemoryTrimPoint::new()) as Arc<dyn TrimPoint>,
+            0,
+        )
+    }
+
+    fn trace_committed_receipt(
+        trace: &ActorTrace,
+        operation_id: OperationId,
+        receipt: &scripture::Receipt,
+        loglet_id: &LogletId,
+    ) {
+        let bytes = receipt.chunk_id.as_bytes();
+        trace.emit(
+            Some(operation_id),
+            EventKind::ScriptureCommittedAck {
+                logical_offset: receipt.first_offset.get(),
+                digest: payload_digest(&bytes),
+                size: bytes.len(),
+                loglet_id: loglet_id.as_str().into(),
+            },
+        );
     }
 
     struct FlipRegister {
@@ -1003,5 +1060,165 @@ mod tests {
             .await,
             Err(CanonOwnerError::Recovery(ChunkLogError::Authority(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn real_verse_runtime_reconciles_applied_root_cas_reply_loss() {
+        let run = RunId::new("scripture-runtime-root-cas-reply-loss-1");
+        let sink = RecordingSink::new().shared();
+        let foundation = ActorTrace::new(
+            run.clone(),
+            ActorId::new("foundation"),
+            Arc::clone(&sink) as Arc<dyn TraceSink>,
+        );
+        let root_faults = Arc::new(FaultController::new());
+        let register = Arc::new(FaultableConditionalRegister::new(
+            Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>,
+            Arc::clone(&root_faults),
+            foundation.clone(),
+        ));
+        let harness = VirtualLogHarness::with_ids(
+            "correctness-runtime-first",
+            "correctness-runtime-second",
+            "correctness-runtime-third",
+            register as Arc<dyn ConditionalRegister>,
+        )
+        .await;
+
+        let first_faults = Arc::new(FaultController::new());
+        let first = harness
+            .fleet
+            .provision_with_components(
+                &harness.first,
+                traced_components(
+                    Arc::clone(&first_faults),
+                    foundation.clone(),
+                    &harness.first,
+                ),
+            )
+            .await;
+        harness
+            .virtual_log()
+            .bootstrap_with_receipt(
+                first.receipt,
+                first.writable.as_ref(),
+                &first.bind,
+                fence(0, owner_a()).encode(),
+            )
+            .await
+            .expect("bootstrap A");
+
+        let runtime_a = VerseRuntime::start(
+            config(owner_a()),
+            harness.virtual_log(),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+        )
+        .await
+        .expect("start A");
+        let producer = ProducerId::from_bytes(*b"correct-prod-000");
+        let receipt_a = runtime_a
+            .submit(Submission {
+                producer_id: producer,
+                producer_epoch: 0,
+                sequence: 0,
+                records: vec![Record::new(
+                    [],
+                    bytes::Bytes::from_static(b"before-cutover"),
+                )],
+            })
+            .await
+            .expect("admit A");
+        runtime_a.flush().await.expect("flush A");
+        let receipt_a = receipt_a.await.expect("commit A");
+        trace_committed_receipt(
+            &ActorTrace::new(
+                run.clone(),
+                ActorId::new("scripture-a"),
+                Arc::clone(&sink) as Arc<dyn TraceSink>,
+            ),
+            OperationId::new("submission-a-0"),
+            &receipt_a,
+            &harness.first,
+        );
+
+        let second_faults = Arc::new(FaultController::new());
+        let successor = harness
+            .fleet
+            .provision_with_components(
+                &harness.second,
+                traced_components(
+                    Arc::clone(&second_faults),
+                    foundation.clone(),
+                    &harness.second,
+                ),
+            )
+            .await;
+        root_faults.arm(ArmedFault::RootCasReplyLost);
+        let (runtime_a, outcome) = runtime_a
+            .drain_seal_publish(VerseHandoffRequest {
+                successor,
+                next_owner: owned(owner_b()),
+                journal_id: journal(),
+                verse_id: verse(),
+            })
+            .await
+            .expect("applied root CAS is reported as a terminal reconciliation outcome");
+        assert!(matches!(
+            outcome,
+            CanonTransitionOutcome::FailedNeedsReconcile { .. }
+        ));
+        assert!(runtime_a.is_terminal());
+
+        let observed = harness
+            .virtual_log()
+            .observe_membership()
+            .await
+            .expect("read back applied root CAS");
+        assert_eq!(observed.state.revision, 1);
+        assert_eq!(
+            observed.state.active().expect("active").loglet_id,
+            harness.second
+        );
+
+        let runtime_b = VerseRuntime::start(
+            config(owner_b()),
+            harness.virtual_log(),
+            SystemClock::new(),
+            scripture::SystemTimer::new(),
+        )
+        .await
+        .expect("start B from readback evidence");
+        assert!(runtime_b.is_serving());
+        let receipt_b = runtime_b
+            .submit(Submission {
+                producer_id: producer,
+                producer_epoch: 0,
+                sequence: 1,
+                records: vec![Record::new([], bytes::Bytes::from_static(b"after-cutover"))],
+            })
+            .await
+            .expect("admit B");
+        runtime_b.flush().await.expect("flush B");
+        let receipt_b = receipt_b.await.expect("commit B");
+        trace_committed_receipt(
+            &ActorTrace::new(
+                run,
+                ActorId::new("scripture-b"),
+                Arc::clone(&sink) as Arc<dyn TraceSink>,
+            ),
+            OperationId::new("submission-b-1"),
+            &receipt_b,
+            &harness.second,
+        );
+        assert_eq!(receipt_a.first_offset.get(), 0);
+        assert_eq!(receipt_b.first_offset.get(), 1);
+        assert_eq!(receipt_b.canon_revision, 1);
+
+        let events = sink.events();
+        assert!(
+            matches!(check_trace(&events), Verdict::Pass),
+            "real Scripture runtime trace must satisfy Holylog checker: {events:#?}"
+        );
     }
 }
