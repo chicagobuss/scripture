@@ -1,0 +1,34 @@
+# Narrow in-namespace RBAC for campaign Jobs.
+# Grants only ConfigMap get/list in scripture-correctness so a future collector
+# can read rendered non-secret config. No Secret verbs, no cross-namespace
+# access, no ServingAuthority verbs (campaign authority store is in-process
+# for the initial RustFS sequence), and no access to scripture-ha.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scripture-correctness
+  namespace: scripture-correctness
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: correctness-campaign
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scripture-correctness
+  namespace: scripture-correctness
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: correctness-campaign
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: scripture-correctness
+subjects:
+  - kind: ServiceAccount
+    name: scripture-correctness
+    namespace: scripture-correctness

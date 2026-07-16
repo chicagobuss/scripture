@@ -5,6 +5,7 @@ members = [
     "crates/scripture-service",
     "crates/scripture-runtime",
     "crates/scripture-cli",
+    "crates/scripture-campaign",
     "crates/scripture-k8s-authority",
 ]
 resolver = "3"
