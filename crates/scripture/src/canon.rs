@@ -1,0 +1,599 @@
+//! Scripture-owned schema for the opaque Holylog application fence.
+//!
+//! A [`CanonFence`] is intentionally a compact, deterministic record. Holylog
+//! stores it atomically with a VirtualLog membership transition but never
+//! interprets it. This module does not grant ownership by itself: a service
+//! must still obtain a fresh linearizable register observation and respect the
+//! Holylog seal fence before it accepts an append.
+
+use std::fmt;
+
+use holylog::remote_sequencer::SequencerEpoch;
+use holylog::virtual_log::{
+    ApplicationFence, VersionedState, VirtualLog, VirtualLogError, VirtualLogState,
+};
+
+use crate::model::JournalId;
+
+const MAGIC: &[u8; 4] = b"SCNF";
+const FORMAT_VERSION_LEGACY: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
+const UNOWNED: u8 = 0;
+const OWNED: u8 = 1;
+const MAX_ENDPOINT_BYTES: usize = 1024;
+const FIXED_PREFIX_BYTES: usize = 4 + 1 + 8 + 16 + 16 + 1;
+const OWNED_OWNER_FIXED_BYTES: usize = 16 + 2;
+const OWNED_SEQUENCER_FIXED_BYTES: usize = 16 + 2;
+
+/// Stable identity of a physical ordered Scripture Verse (append lane).
+///
+/// A Verse is a replaceable physical realization of a logical Scripture. It is
+/// deliberately distinct from [`JournalId`], which names the logical journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VerseId([u8; 16]);
+
+impl VerseId {
+    /// Constructs a Verse identity from its durable 128-bit representation.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the durable 128-bit representation.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Display for VerseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Stable identity of a Scripture process allowed to own a Verse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnerId([u8; 16]);
+
+impl OwnerId {
+    /// Constructs an owner identity from its durable 128-bit representation.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the durable 128-bit representation.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Display for OwnerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Reachable endpoint advertised for one fenced owner.
+///
+/// Scripture deliberately does not impose a transport scheme here. A caller
+/// may use a DNS name, service-discovery target, or protocol URL; discovery is
+/// still advisory and this string is not a fencing grant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnerEndpoint(String);
+
+impl OwnerEndpoint {
+    /// Validates and stores one compact, non-empty endpoint advertisement.
+    pub fn new(value: impl Into<String>) -> Result<Self, CanonFenceError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(CanonFenceError::EmptyEndpoint);
+        }
+        if value.len() > MAX_ENDPOINT_BYTES {
+            return Err(CanonFenceError::EndpointTooLong {
+                actual: value.len(),
+                maximum: MAX_ENDPOINT_BYTES,
+            });
+        }
+        if value.chars().any(char::is_control) {
+            return Err(CanonFenceError::ControlCharacterInEndpoint);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the advertised endpoint text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Remote sequencer binding carried by a v2 Owned Canon fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSequencerBinding {
+    /// Activation epoch that must match a locally held remote sequencer.
+    pub epoch: SequencerEpoch,
+    /// Advisory endpoint for the epoch-fenced remote sequencer.
+    pub sequencer_endpoint: OwnerEndpoint,
+}
+
+/// Owner state encoded inside a Canon fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonOwner {
+    /// No node may accept new appends while the Verse is recovering or draining.
+    Unowned,
+    /// The named process is the owner designated by this Canon revision.
+    Owned {
+        /// Stable process identity.
+        owner_id: OwnerId,
+        /// Advisory endpoint clients may try after validating this revision.
+        endpoint: OwnerEndpoint,
+        /// `None` = legacy v1; `Some` = v2 remote sequencer fence.
+        sequencer: Option<OwnedSequencerBinding>,
+    },
+}
+
+/// Scripture's application-owned owner fence, atomically coupled to a
+/// [`VirtualLogState`] membership revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonFence {
+    /// Revision that must equal the enclosing VirtualLog register revision.
+    pub revision: u64,
+    /// Logical Scripture journal.
+    pub journal_id: JournalId,
+    /// Physical ordered Verse being fenced.
+    pub verse_id: VerseId,
+    /// Owner allowed to serve the Verse, or explicit recovery/drain state.
+    pub owner: CanonOwner,
+}
+
+impl CanonFence {
+    /// Creates a Canon fence. The caller must later bind it to the exact
+    /// enclosing VirtualLog revision through [`Self::from_virtual_log_state`].
+    #[must_use]
+    pub const fn new(
+        revision: u64,
+        journal_id: JournalId,
+        verse_id: VerseId,
+        owner: CanonOwner,
+    ) -> Self {
+        Self {
+            revision,
+            journal_id,
+            verse_id,
+            owner,
+        }
+    }
+
+    /// Returns true when this fence authorizes remote sequencer activation (v2 Owned).
+    #[must_use]
+    pub fn allows_remote_sequencer(&self) -> bool {
+        matches!(
+            &self.owner,
+            CanonOwner::Owned {
+                sequencer: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Returns canonical bytes suitable for Holylog's opaque application fence.
+    #[must_use]
+    pub fn encode(&self) -> ApplicationFence {
+        let (format_version, owned_tail_len) = match &self.owner {
+            // Unowned payload is identical across versions; publish as v2 so new
+            // writers speak one format. Legacy decoders still accept v1 bytes.
+            CanonOwner::Unowned => (FORMAT_VERSION, 0),
+            CanonOwner::Owned {
+                endpoint,
+                sequencer,
+                ..
+            } => {
+                let endpoint_len = endpoint.as_str().len();
+                let tail = OWNED_OWNER_FIXED_BYTES + endpoint_len;
+                match sequencer {
+                    None => (FORMAT_VERSION_LEGACY, tail),
+                    Some(binding) => (
+                        FORMAT_VERSION,
+                        tail + OWNED_SEQUENCER_FIXED_BYTES
+                            + binding.sequencer_endpoint.as_str().len(),
+                    ),
+                }
+            }
+        };
+        let mut encoded = Vec::with_capacity(FIXED_PREFIX_BYTES + owned_tail_len);
+        encoded.extend_from_slice(MAGIC);
+        encoded.push(format_version);
+        encoded.extend_from_slice(&self.revision.to_be_bytes());
+        encoded.extend_from_slice(&self.journal_id.as_bytes());
+        encoded.extend_from_slice(&self.verse_id.as_bytes());
+        match &self.owner {
+            CanonOwner::Unowned => encoded.push(UNOWNED),
+            CanonOwner::Owned {
+                owner_id,
+                endpoint,
+                sequencer,
+            } => {
+                encoded.push(OWNED);
+                encoded.extend_from_slice(&owner_id.as_bytes());
+                // OwnerEndpoint enforces a maximum far below u16::MAX.
+                let length = endpoint.as_str().len() as u16;
+                encoded.extend_from_slice(&length.to_be_bytes());
+                encoded.extend_from_slice(endpoint.as_str().as_bytes());
+                if let Some(binding) = sequencer {
+                    encoded.extend_from_slice(&binding.epoch.as_bytes());
+                    let sequencer_len = binding.sequencer_endpoint.as_str().len() as u16;
+                    encoded.extend_from_slice(&sequencer_len.to_be_bytes());
+                    encoded.extend_from_slice(binding.sequencer_endpoint.as_str().as_bytes());
+                }
+            }
+        }
+        ApplicationFence::new(encoded)
+    }
+
+    /// Decodes and fully validates canonical Scripture Canon-fence bytes.
+    pub fn decode(fence: &ApplicationFence) -> Result<Self, CanonFenceError> {
+        let bytes = fence.as_bytes();
+        let mut cursor = Cursor::new(bytes);
+        if cursor.take(4)? != MAGIC {
+            return Err(CanonFenceError::BadMagic);
+        }
+        let version = cursor.byte()?;
+        if version != FORMAT_VERSION_LEGACY && version != FORMAT_VERSION {
+            return Err(CanonFenceError::UnsupportedVersion { version });
+        }
+        let revision = u64::from_be_bytes(cursor.array()?);
+        let journal_id = JournalId::from_bytes(cursor.array()?);
+        let verse_id = VerseId::from_bytes(cursor.array()?);
+        let owner = match cursor.byte()? {
+            // v1 and v2 Unowned carry the same payload (no epoch / sequencer tip).
+            UNOWNED => CanonOwner::Unowned,
+            OWNED => {
+                let owner_id = OwnerId::from_bytes(cursor.array()?);
+                let endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
+                let endpoint = std::str::from_utf8(cursor.take(endpoint_len)?)
+                    .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
+                let sequencer = if version == FORMAT_VERSION {
+                    let epoch = SequencerEpoch::from_bytes(cursor.array()?);
+                    let sequencer_endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
+                    let sequencer_endpoint =
+                        std::str::from_utf8(cursor.take(sequencer_endpoint_len)?)
+                            .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
+                    Some(OwnedSequencerBinding {
+                        epoch,
+                        sequencer_endpoint: OwnerEndpoint::new(sequencer_endpoint)?,
+                    })
+                } else {
+                    if !cursor.is_at_end() {
+                        return Err(CanonFenceError::TrailingBytes);
+                    }
+                    None
+                };
+                CanonOwner::Owned {
+                    owner_id,
+                    endpoint: OwnerEndpoint::new(endpoint)?,
+                    sequencer,
+                }
+            }
+            tag => return Err(CanonFenceError::UnknownOwnerTag { tag }),
+        };
+        if !cursor.is_at_end() {
+            return Err(CanonFenceError::TrailingBytes);
+        }
+        Ok(Self {
+            revision,
+            journal_id,
+            verse_id,
+            owner,
+        })
+    }
+
+    /// Decodes this fence and verifies it is bound to exactly `state`'s
+    /// register revision.
+    pub fn from_virtual_log_state(state: &VirtualLogState) -> Result<Self, CanonFenceError> {
+        let fence = Self::decode(&state.application_fence)?;
+        if fence.revision != state.revision {
+            return Err(CanonFenceError::RevisionMismatch {
+                fence_revision: fence.revision,
+                state_revision: state.revision,
+            });
+        }
+        Ok(fence)
+    }
+}
+
+/// Canon-fence encoding or binding failure.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum CanonFenceError {
+    /// The bytes ended before a required field was available.
+    #[error("truncated Canon fence")]
+    Truncated,
+    /// The canonical format marker did not match.
+    #[error("invalid Canon fence magic")]
+    BadMagic,
+    /// The document format version is unsupported.
+    #[error("unsupported Canon fence version {version}")]
+    UnsupportedVersion {
+        /// Version byte observed.
+        version: u8,
+    },
+    /// Owner-state tag is unknown.
+    #[error("unknown Canon owner tag {tag}")]
+    UnknownOwnerTag {
+        /// Tag byte observed.
+        tag: u8,
+    },
+    /// Endpoint bytes were not valid UTF-8.
+    #[error("Canon owner endpoint is not UTF-8")]
+    EndpointNotUtf8,
+    /// Endpoint was empty.
+    #[error("Canon owner endpoint is empty")]
+    EmptyEndpoint,
+    /// Endpoint exceeded the compact fence budget.
+    #[error("Canon owner endpoint is too long: {actual} > {maximum}")]
+    EndpointTooLong {
+        /// Observed byte length.
+        actual: usize,
+        /// Maximum byte length.
+        maximum: usize,
+    },
+    /// Endpoint contained an ASCII or Unicode control character.
+    #[error("Canon owner endpoint contains a control character")]
+    ControlCharacterInEndpoint,
+    /// Extra bytes followed an otherwise valid canonical document.
+    #[error("trailing bytes after Canon fence")]
+    TrailingBytes,
+    /// Canon and enclosing VirtualLog revisions did not agree.
+    #[error("Canon revision {fence_revision} does not match VirtualLog revision {state_revision}")]
+    RevisionMismatch {
+        /// Revision carried inside the Canon fence.
+        fence_revision: u64,
+        /// Revision of the enclosing VirtualLog state.
+        state_revision: u64,
+    },
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], CanonFenceError> {
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or(CanonFenceError::Truncated)?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(CanonFenceError::Truncated)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn byte(&mut self) -> Result<u8, CanonFenceError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], CanonFenceError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| CanonFenceError::Truncated)
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+/// Fresh Canon authority observation used to start one owner attempt.
+///
+/// This is not a forever lease. Callers must treat a later register advance or
+/// seal fence as invalidating the attempt and re-inspect before serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonAuthoritySnapshot {
+    /// Linearizable VirtualLog membership observation.
+    pub state: VirtualLogState,
+    /// Fence bound to [`VirtualLogState::revision`].
+    pub fence: CanonFence,
+}
+
+impl CanonAuthoritySnapshot {
+    /// Canon / VirtualLog revision used for this observation.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.fence.revision
+    }
+}
+
+/// Canon authority bound to an exact register observation and storage witness.
+///
+/// Use this for operator-directed seal-and-publish transitions that must CAS
+/// only against the validated observation. Startup recovery that does not need
+/// the witness may keep using [`CanonAuthoritySnapshot`].
+///
+/// Fields are private so callers cannot assemble a fence that disagrees with
+/// the observed register value. Construct via
+/// [`observe_canon_authority_witnessed`] (or tests via
+/// [`Self::from_parts_for_test`]) and call [`Self::validate`] before any
+/// side-effecting transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessedCanonAuthority {
+    observed: VersionedState,
+    fence: CanonFence,
+}
+
+impl WitnessedCanonAuthority {
+    /// Canon / VirtualLog revision used for this observation.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.fence.revision
+    }
+
+    /// Borrowed membership observation plus storage witness.
+    #[must_use]
+    pub const fn observed(&self) -> &VersionedState {
+        &self.observed
+    }
+
+    /// Borrowed fence claimed for this observation.
+    #[must_use]
+    pub const fn fence(&self) -> &CanonFence {
+        &self.fence
+    }
+
+    /// Drops the storage witness, retaining membership and fence.
+    #[must_use]
+    pub fn snapshot(&self) -> CanonAuthoritySnapshot {
+        CanonAuthoritySnapshot {
+            state: self.observed.state.clone(),
+            fence: self.fence.clone(),
+        }
+    }
+
+    /// Re-decodes the fence from [`Self::observed`] and requires exact equality.
+    ///
+    /// Call before every side-effecting transition that trusts this value.
+    pub fn validate(&self) -> Result<(), CanonAuthorityError> {
+        let decoded = CanonFence::from_virtual_log_state(&self.observed.state)?;
+        if decoded != self.fence {
+            return Err(CanonAuthorityError::InconsistentWitness);
+        }
+        Ok(())
+    }
+
+    /// Constructs a value that may be internally inconsistent.
+    ///
+    /// Prefer [`observe_canon_authority_witnessed`]. Hidden for regression tests
+    /// that deliberately mismatch fence and observation.
+    #[doc(hidden)]
+    pub fn from_parts_for_test(observed: VersionedState, fence: CanonFence) -> Self {
+        Self { observed, fence }
+    }
+
+    pub(crate) fn from_validated(observed: VersionedState, fence: CanonFence) -> Self {
+        Self { observed, fence }
+    }
+}
+
+/// Why a fresh Canon observation refused to authorize an owner.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonAuthorityError {
+    /// Holylog register or VirtualLog failed.
+    #[error(transparent)]
+    VirtualLog(#[from] VirtualLogError),
+    /// Opaque fence bytes failed to decode or bind.
+    #[error(transparent)]
+    Fence(#[from] CanonFenceError),
+    /// The Canon fence names a different Scripture journal.
+    #[error("Canon journal {actual} does not match expected {expected}")]
+    JournalMismatch {
+        /// Expected journal.
+        expected: JournalId,
+        /// Journal named by the fence.
+        actual: JournalId,
+    },
+    /// The Canon fence names a different physical Verse.
+    #[error("Canon Verse {actual} does not match expected {expected}")]
+    VerseMismatch {
+        /// Expected Verse.
+        expected: VerseId,
+        /// Verse named by the fence.
+        actual: VerseId,
+    },
+    /// The Verse is explicitly unowned / recovering.
+    #[error("Canon revision {revision} leaves Verse {verse_id} unowned")]
+    Unowned {
+        /// Observed revision.
+        revision: u64,
+        /// Verse that is unowned.
+        verse_id: VerseId,
+    },
+    /// The fence names a different owner identity.
+    #[error("Canon owner {actual} does not match expected {expected} at revision {revision}")]
+    NotOwner {
+        /// Observed revision.
+        revision: u64,
+        /// Expected owner.
+        expected: OwnerId,
+        /// Owner named by the fence.
+        actual: OwnerId,
+    },
+    /// Claimed fence bytes do not match the fence decoded from the observation.
+    #[error("claimed Canon fence is inconsistent with the observed VirtualLog state")]
+    InconsistentWitness,
+}
+
+/// Reads a fresh VirtualLog register state and validates Canon identity/owner.
+///
+/// Always uses [`VirtualLog::state`] (linearizable). Cached membership is never
+/// treated as startup authority.
+pub async fn observe_canon_authority(
+    virtual_log: &VirtualLog,
+    expected_journal_id: JournalId,
+    expected_verse_id: VerseId,
+    expected_owner_id: OwnerId,
+) -> Result<CanonAuthoritySnapshot, CanonAuthorityError> {
+    Ok(observe_canon_authority_witnessed(
+        virtual_log,
+        expected_journal_id,
+        expected_verse_id,
+        expected_owner_id,
+    )
+    .await?
+    .snapshot())
+}
+
+/// Observes membership with its storage witness and validates Canon ownership.
+///
+/// Uses [`VirtualLog::observe_membership`] so a later
+/// [`VirtualLog::reconfigure_with_receipt`] can CAS against the exact
+/// validated observation.
+pub async fn observe_canon_authority_witnessed(
+    virtual_log: &VirtualLog,
+    expected_journal_id: JournalId,
+    expected_verse_id: VerseId,
+    expected_owner_id: OwnerId,
+) -> Result<WitnessedCanonAuthority, CanonAuthorityError> {
+    let observed = virtual_log.observe_membership().await?;
+    let fence = CanonFence::from_virtual_log_state(&observed.state)?;
+    if fence.journal_id != expected_journal_id {
+        return Err(CanonAuthorityError::JournalMismatch {
+            expected: expected_journal_id,
+            actual: fence.journal_id,
+        });
+    }
+    if fence.verse_id != expected_verse_id {
+        return Err(CanonAuthorityError::VerseMismatch {
+            expected: expected_verse_id,
+            actual: fence.verse_id,
+        });
+    }
+    match &fence.owner {
+        CanonOwner::Unowned => Err(CanonAuthorityError::Unowned {
+            revision: fence.revision,
+            verse_id: fence.verse_id,
+        }),
+        CanonOwner::Owned { owner_id, .. } if *owner_id != expected_owner_id => {
+            Err(CanonAuthorityError::NotOwner {
+                revision: fence.revision,
+                expected: expected_owner_id,
+                actual: *owner_id,
+            })
+        }
+        CanonOwner::Owned { .. } => Ok(WitnessedCanonAuthority::from_validated(observed, fence)),
+    }
+}

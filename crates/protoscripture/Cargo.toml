@@ -1,0 +1,20 @@
+[package]
+name = "protoscripture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Disposable spike that exercises the holylog kernel from a consumer's seat"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+holylog.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
