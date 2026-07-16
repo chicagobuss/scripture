@@ -3,24 +3,31 @@ members = [
     "crates/protoscripture",
     "crates/scripture",
     "crates/scripture-service",
-    "crates/scriptured",
-    "crates/scripture-load",
+    "crates/scripture-runtime",
+    "crates/scripture-cli",
+    "crates/scripture-campaign",
+    "crates/scripture-k8s-authority",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 bytes = "1.12"
 futures = "0.3"
-holylog = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.0" }
-holylog-remote-sequencer-http = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.0" }
-holylog-object-store = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.0" }
-holylog-object-store-register = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.0" }
+holylog = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.1" }
+holylog-correctness = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.1" }
+holylog-remote-sequencer-http = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.1" }
+holylog-object-store = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.1" }
+holylog-object-store-register = { git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.1" }
 object_store = { version = "0.14", default-features = false }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 crc32c = "0.6"
 proptest = "1.9"
 thiserror = "2.0"
 tokio = { version = "1.47", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+getrandom = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

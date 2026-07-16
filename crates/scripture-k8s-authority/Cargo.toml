@@ -1,0 +1,31 @@
+[package]
+name = "scripture-k8s-authority"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Kubernetes CRD-backed ServingAuthorityStore adapter"
+license = "MIT"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+blake3.workspace = true
+futures.workspace = true
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "0.98", default-features = true, features = ["client", "derive"] }
+schemars = "0.8"
+scripture = { path = "../scripture" }
+scripture-service = { path = "../scripture-service" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

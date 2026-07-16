@@ -14,10 +14,12 @@ use holylog::virtual_log::{
 };
 
 use crate::model::JournalId;
+use crate::serving_authority::WriterTerm;
 
 const MAGIC: &[u8; 4] = b"SCNF";
 const FORMAT_VERSION_LEGACY: u8 = 1;
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION_V2: u8 = 2;
+const FORMAT_VERSION_V3: u8 = 3;
 const UNOWNED: u8 = 0;
 const OWNED: u8 = 1;
 const MAX_ENDPOINT_BYTES: usize = 1024;
@@ -116,7 +118,7 @@ impl OwnerEndpoint {
     }
 }
 
-/// Remote sequencer binding carried by a v2 Owned Canon fence.
+/// Remote sequencer binding carried by a v2/v3 Owned Canon fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedSequencerBinding {
     /// Activation epoch that must match a locally held remote sequencer.
@@ -136,8 +138,10 @@ pub enum CanonOwner {
         owner_id: OwnerId,
         /// Advisory endpoint clients may try after validating this revision.
         endpoint: OwnerEndpoint,
-        /// `None` = legacy v1; `Some` = v2 remote sequencer fence.
+        /// `None` = legacy v1; `Some` = v2/v3 remote sequencer fence.
         sequencer: Option<OwnedSequencerBinding>,
+        /// Monotonic term of the writer authority (v3 format).
+        writer_term: Option<WriterTerm>,
     },
 }
 
@@ -173,7 +177,7 @@ impl CanonFence {
         }
     }
 
-    /// Returns true when this fence authorizes remote sequencer activation (v2 Owned).
+    /// Returns true when this fence authorizes remote sequencer activation (v2/v3 Owned).
     #[must_use]
     pub fn allows_remote_sequencer(&self) -> bool {
         matches!(
@@ -189,23 +193,35 @@ impl CanonFence {
     #[must_use]
     pub fn encode(&self) -> ApplicationFence {
         let (format_version, owned_tail_len) = match &self.owner {
-            // Unowned payload is identical across versions; publish as v2 so new
-            // writers speak one format. Legacy decoders still accept v1 bytes.
-            CanonOwner::Unowned => (FORMAT_VERSION, 0),
+            // Unowned payload is identical across versions; publish as v3 so new
+            // writers speak one format. Legacy decoders still accept legacy bytes.
+            CanonOwner::Unowned => (FORMAT_VERSION_V3, 0),
             CanonOwner::Owned {
                 endpoint,
                 sequencer,
+                writer_term,
                 ..
             } => {
                 let endpoint_len = endpoint.as_str().len();
-                let tail = OWNED_OWNER_FIXED_BYTES + endpoint_len;
-                match sequencer {
-                    None => (FORMAT_VERSION_LEGACY, tail),
-                    Some(binding) => (
-                        FORMAT_VERSION,
-                        tail + OWNED_SEQUENCER_FIXED_BYTES
-                            + binding.sequencer_endpoint.as_str().len(),
-                    ),
+                let mut tail = OWNED_OWNER_FIXED_BYTES + endpoint_len;
+                if writer_term.is_some() {
+                    // v3 Owned: term (8 bytes) + sequencer presence (1 byte)
+                    tail += 8 + 1;
+                    if let Some(binding) = sequencer {
+                        tail +=
+                            OWNED_SEQUENCER_FIXED_BYTES + binding.sequencer_endpoint.as_str().len();
+                    }
+                    (FORMAT_VERSION_V3, tail)
+                } else {
+                    // Legacy v1 or v2 Owned
+                    match sequencer {
+                        None => (FORMAT_VERSION_LEGACY, tail),
+                        Some(binding) => (
+                            FORMAT_VERSION_V2,
+                            tail + OWNED_SEQUENCER_FIXED_BYTES
+                                + binding.sequencer_endpoint.as_str().len(),
+                        ),
+                    }
                 }
             }
         };
@@ -221,6 +237,7 @@ impl CanonFence {
                 owner_id,
                 endpoint,
                 sequencer,
+                writer_term,
             } => {
                 encoded.push(OWNED);
                 encoded.extend_from_slice(&owner_id.as_bytes());
@@ -228,11 +245,29 @@ impl CanonFence {
                 let length = endpoint.as_str().len() as u16;
                 encoded.extend_from_slice(&length.to_be_bytes());
                 encoded.extend_from_slice(endpoint.as_str().as_bytes());
-                if let Some(binding) = sequencer {
-                    encoded.extend_from_slice(&binding.epoch.as_bytes());
-                    let sequencer_len = binding.sequencer_endpoint.as_str().len() as u16;
-                    encoded.extend_from_slice(&sequencer_len.to_be_bytes());
-                    encoded.extend_from_slice(binding.sequencer_endpoint.as_str().as_bytes());
+
+                if format_version == FORMAT_VERSION_V3 {
+                    let term_val = writer_term
+                        .expect("v3 Owned fence must carry a WriterTerm")
+                        .get();
+                    encoded.extend_from_slice(&term_val.to_be_bytes());
+                    if let Some(binding) = sequencer {
+                        encoded.push(1); // sequencer presence: Some
+                        encoded.extend_from_slice(&binding.epoch.as_bytes());
+                        let sequencer_len = binding.sequencer_endpoint.as_str().len() as u16;
+                        encoded.extend_from_slice(&sequencer_len.to_be_bytes());
+                        encoded.extend_from_slice(binding.sequencer_endpoint.as_str().as_bytes());
+                    } else {
+                        encoded.push(0); // sequencer presence: None
+                    }
+                } else {
+                    // Legacy v1/v2 Owned
+                    if let Some(binding) = sequencer {
+                        encoded.extend_from_slice(&binding.epoch.as_bytes());
+                        let sequencer_len = binding.sequencer_endpoint.as_str().len() as u16;
+                        encoded.extend_from_slice(&sequencer_len.to_be_bytes());
+                        encoded.extend_from_slice(binding.sequencer_endpoint.as_str().as_bytes());
+                    }
                 }
             }
         }
@@ -247,40 +282,70 @@ impl CanonFence {
             return Err(CanonFenceError::BadMagic);
         }
         let version = cursor.byte()?;
-        if version != FORMAT_VERSION_LEGACY && version != FORMAT_VERSION {
+        if version != FORMAT_VERSION_LEGACY
+            && version != FORMAT_VERSION_V2
+            && version != FORMAT_VERSION_V3
+        {
             return Err(CanonFenceError::UnsupportedVersion { version });
         }
         let revision = u64::from_be_bytes(cursor.array()?);
         let journal_id = JournalId::from_bytes(cursor.array()?);
         let verse_id = VerseId::from_bytes(cursor.array()?);
         let owner = match cursor.byte()? {
-            // v1 and v2 Unowned carry the same payload (no epoch / sequencer tip).
             UNOWNED => CanonOwner::Unowned,
             OWNED => {
                 let owner_id = OwnerId::from_bytes(cursor.array()?);
                 let endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
                 let endpoint = std::str::from_utf8(cursor.take(endpoint_len)?)
                     .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
-                let sequencer = if version == FORMAT_VERSION {
+
+                let (writer_term, sequencer) = if version == FORMAT_VERSION_V3 {
+                    let term_val = u64::from_be_bytes(cursor.array()?);
+                    let term = WriterTerm::new(term_val)
+                        .map_err(|_| CanonFenceError::InvalidWriterTerm)?;
+
+                    let seq_presence = cursor.byte()?;
+                    let seq = if seq_presence == 1 {
+                        let epoch = SequencerEpoch::from_bytes(cursor.array()?);
+                        let sequencer_endpoint_len =
+                            usize::from(u16::from_be_bytes(cursor.array()?));
+                        let sequencer_endpoint =
+                            std::str::from_utf8(cursor.take(sequencer_endpoint_len)?)
+                                .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
+                        Some(OwnedSequencerBinding {
+                            epoch,
+                            sequencer_endpoint: OwnerEndpoint::new(sequencer_endpoint)?,
+                        })
+                    } else if seq_presence == 0 {
+                        None
+                    } else {
+                        return Err(CanonFenceError::UnknownSequencerTag { tag: seq_presence });
+                    };
+                    (Some(term), seq)
+                } else if version == FORMAT_VERSION_V2 {
                     let epoch = SequencerEpoch::from_bytes(cursor.array()?);
                     let sequencer_endpoint_len = usize::from(u16::from_be_bytes(cursor.array()?));
                     let sequencer_endpoint =
                         std::str::from_utf8(cursor.take(sequencer_endpoint_len)?)
                             .map_err(|_| CanonFenceError::EndpointNotUtf8)?;
-                    Some(OwnedSequencerBinding {
+                    let seq = Some(OwnedSequencerBinding {
                         epoch,
                         sequencer_endpoint: OwnerEndpoint::new(sequencer_endpoint)?,
-                    })
+                    });
+                    (None, seq)
                 } else {
+                    // v1
                     if !cursor.is_at_end() {
                         return Err(CanonFenceError::TrailingBytes);
                     }
-                    None
+                    (None, None)
                 };
+
                 CanonOwner::Owned {
                     owner_id,
                     endpoint: OwnerEndpoint::new(endpoint)?,
                     sequencer,
+                    writer_term,
                 }
             }
             tag => return Err(CanonFenceError::UnknownOwnerTag { tag }),
@@ -358,6 +423,15 @@ pub enum CanonFenceError {
         fence_revision: u64,
         /// Revision of the enclosing VirtualLog state.
         state_revision: u64,
+    },
+    /// WriterTerm must be non-zero.
+    #[error("invalid writer term: must be non-zero")]
+    InvalidWriterTerm,
+    /// Sequencer presence tag is unknown.
+    #[error("unknown sequencer presence tag {tag}")]
+    UnknownSequencerTag {
+        /// Tag observed.
+        tag: u8,
     },
 }
 
