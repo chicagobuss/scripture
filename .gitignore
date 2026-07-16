@@ -1,5 +1,7 @@
 /target
 Cargo.lock.bak
+/config/local/
+/.tmp/
 /references/opendata/
 /deploy/fleet-exercise/bin/fleet-lab-node
 /deploy/fleet-exercise/bin/scripture-load
