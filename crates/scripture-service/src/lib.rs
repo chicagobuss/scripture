@@ -13,6 +13,7 @@
 //! [`ChunkJournalService::register_owner`] remains a local lab registry only and
 //! cannot drain for Canon publish.
 
+mod authority_coordinator;
 mod canon_node;
 mod canon_owner;
 mod canon_route;
@@ -20,11 +21,18 @@ mod canon_transition;
 mod chunk_service;
 pub mod reconcile;
 mod scripture_node;
+mod serving_authority_store;
 mod verse_runtime;
 
 #[cfg(any(test, feature = "virtuallog-test-support"))]
 pub mod virtuallog_test_support;
 
+pub use authority_coordinator::{
+    AuthorityCoordinator, CoordinatorError, CoordinatorFuture, DeterministicTransitionIdGenerator,
+    FoundationTransitionError, JournalFoundationTransition, LocalServingEligibility,
+    SecureTransitionIdGenerator, TransitionClassification, TransitionIdGenerationError,
+    TransitionIdGenerator,
+};
 pub use canon_node::{
     CanonNode, CanonNodeConfig, CanonNodeStart, CanonNodeStartError, CanonStandbyRoute,
 };
@@ -50,6 +58,11 @@ pub use reconcile::{
 pub use scripture_node::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError, ScriptureNodeHandoffError,
     ScriptureNodeStart, VerseKey,
+};
+pub use serving_authority_store::{
+    AuthoritySnapshot, AuthorityStoreFuture, CasOutcome, InMemoryServingAuthorityStore,
+    ServingAuthorityStore, ServingAuthorityStoreError, StoreVersion,
+    run_serving_authority_store_conformance,
 };
 pub use verse_runtime::{
     VerseAdmitError, VerseHandoffError, VerseHandoffFailure, VerseHandoffRequest, VerseRuntime,

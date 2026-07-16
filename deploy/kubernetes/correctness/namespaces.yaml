@@ -1,0 +1,25 @@
+# Purpose namespaces for Scripture correctness campaigns.
+# These are isolation/scheduling tools, not durability claims.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scripture-correctness
+  labels:
+    app.kubernetes.io/part-of: scripture
+    scripture.dev/purpose: correctness-campaign
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scripture-load
+  labels:
+    app.kubernetes.io/part-of: scripture
+    scripture.dev/purpose: campaign-load
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scripture-observe
+  labels:
+    app.kubernetes.io/part-of: scripture
+    scripture.dev/purpose: campaign-observe

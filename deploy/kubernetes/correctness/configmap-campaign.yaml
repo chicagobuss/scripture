@@ -1,0 +1,18 @@
+# Non-secret campaign store settings. Credentials arrive via Secret envFrom.
+# The local runner replaces REPLACE_WITH_* and stamps scripture.dev/run-id.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scripture-correctness-REPLACE_WITH_RUN_ID
+  namespace: scripture-correctness
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: correctness-campaign
+    scripture.dev/run-id: REPLACE_WITH_RUN_ID
+    scripture.dev/scenario: REPLACE_WITH_SCENARIO
+data:
+  endpoint: "REPLACE_WITH_RUSTFS_ENDPOINT"
+  bucket: "REPLACE_WITH_RUSTFS_BUCKET"
+  region: "REPLACE_WITH_RUSTFS_REGION"
+  # Exclusive root; must include the run_id token.
+  prefix: "scripture/correctness/REPLACE_WITH_RUN_ID"
