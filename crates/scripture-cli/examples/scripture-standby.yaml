@@ -1,0 +1,28 @@
+# Example Scripture configuration for an independent standby candidate.
+# Distinct owner_id and advertise endpoint. Never self-promotes.
+# Replace REPLACE_WITH_* durable-store placeholders before use.
+
+version: 1
+
+node:
+  owner_id: "scripture-own-b!"
+  advertise: "tcp://scripture-standby:9000"
+
+listener:
+  bind: "0.0.0.0:9000"
+
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+
+store:
+  backend: r2
+  endpoint: "https://REPLACE_WITH_ENDPOINT"
+  bucket: "REPLACE_WITH_BUCKET"
+  region: auto
+  prefix: "scripture/deployments/REPLACE_WITH_PREFIX"
+
+metrics:
+  status_bind: "127.0.0.1:9100"

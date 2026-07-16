@@ -103,6 +103,7 @@ fn owned_route_fields(
             owner_id,
             endpoint,
             sequencer,
+            ..
         } => {
             let (sequencer_epoch, sequencer_endpoint) = sequencer
                 .as_ref()
@@ -357,6 +358,7 @@ mod tests {
                 epoch,
                 sequencer_endpoint: endpoint,
             }),
+            writer_term: None,
         }
     }
 
@@ -370,6 +372,7 @@ mod tests {
             owner_id: owner,
             endpoint,
             sequencer: None,
+            writer_term: None,
         }
     }
 
@@ -512,6 +515,7 @@ mod tests {
                 owner_id: owner_a(),
                 endpoint: OwnerEndpoint::new("tcp://owner.local:9000").expect("endpoint"),
                 sequencer: None,
+                writer_term: None,
             },
         );
         assert!(!fence.allows_remote_sequencer());
