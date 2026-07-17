@@ -1532,6 +1532,7 @@ dependencies = [
 name = "scripture-campaign"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "futures",
  "holylog",
@@ -1542,6 +1543,7 @@ dependencies = [
  "scripture",
  "scripture-runtime",
  "scripture-service",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

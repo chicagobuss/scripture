@@ -22,6 +22,22 @@
 //! are in-process; this module makes no multi-node object-store durability,
 //! availability, or replica-independence claim.
 
+mod artifacts;
+mod legacy;
+mod preflight;
+mod producer_identity;
+mod profile;
+mod run;
+mod scenario;
+mod trace_observer;
+
+pub use artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
+pub use legacy::{legacy_main, print_campaign_help};
+pub use preflight::{PreflightReport, default_topology_path};
+pub use profile::{Profile, ProfileError, RustFsHomeFleetProfile};
+pub use run::{RunError, RunOptions, RunOutcome, detect_repo_root};
+pub use scenario::{Suite, SuiteError};
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,8 +53,8 @@ use holylog::virtual_log::{
 };
 use holylog_correctness::faults::{FaultableConditionalRegister, FaultableLogDrive, FaultableSeal};
 use holylog_correctness::{
-    ActorId, ActorTrace, ArmedFault, EventKind, FaultController, OperationId, RecordingSink, RunId,
-    TraceEvent, TraceSink, Verdict, check_trace, payload_digest,
+    ActorId, ActorTrace, ArmedFault, FaultController, RecordingSink, RunId, TraceEvent, TraceSink,
+    Verdict, check_trace,
 };
 use holylog_object_store::{ObjectStoreExclusiveClaim, ObjectStoreMetrics, WritePolicy};
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
@@ -56,6 +72,9 @@ use scripture_service::{
     AuthorityCoordinator, CanonTransitionOutcome, DeterministicTransitionIdGenerator,
     JournalFoundationTransition, VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig,
 };
+
+use producer_identity::campaign_producer;
+use trace_observer::TraceRuntimeObserver;
 
 use scripture_runtime::{
     BackendProfile, DurableLogletParts, HaServingSession, HolylogJournalFoundation, NodeIdentity,
@@ -110,6 +129,7 @@ impl Scenario {
 }
 
 /// Backend selection for a campaign run.
+#[derive(Clone)]
 pub enum CampaignBackend {
     /// Deterministic in-memory backend (fast preflight of the trace/checker path).
     InMemory,
@@ -118,6 +138,7 @@ pub enum CampaignBackend {
 }
 
 /// Real object-store backend bound to one exclusive run prefix.
+#[derive(Clone)]
 pub struct RustFsBackend {
     store: Arc<dyn ObjectStore>,
     root: String,
@@ -343,6 +364,7 @@ impl PartsFactory for TracingPartsFactory {
 }
 
 /// Redacted campaign evidence bundle.
+#[derive(Debug)]
 pub struct CampaignReport {
     /// Run identity used across trace, prefix, and artifacts.
     pub run_id: String,
@@ -468,8 +490,8 @@ fn owner_a() -> OwnerId {
 fn owner_b() -> OwnerId {
     OwnerId::from_bytes(*b"cmpn-owner-b!!!!")
 }
-fn producer() -> ProducerId {
-    ProducerId::from_bytes(*b"cmpn-producer!!!")
+fn producer_for(run_id: &str, actor: &str, ordinal: u64) -> ProducerId {
+    campaign_producer(run_id, actor, ordinal)
 }
 fn key() -> AuthorityKey {
     AuthorityKey {
@@ -511,24 +533,6 @@ fn campaign_owner(owner: OwnerId) -> CanonOwner {
 
 fn campaign_fence(revision: u64, owner: OwnerId) -> CanonFence {
     CanonFence::new(revision, journal(), verse(), campaign_owner(owner))
-}
-
-fn emit_committed_ack(
-    trace: &ActorTrace,
-    operation: &str,
-    receipt: &Receipt,
-    loglet_id: &LogletId,
-) {
-    let bytes = receipt.chunk_id.as_bytes();
-    trace.emit(
-        Some(OperationId::new(operation.to_owned())),
-        EventKind::ScriptureCommittedAck {
-            logical_offset: receipt.first_offset.get(),
-            digest: payload_digest(&bytes),
-            size: bytes.len(),
-            loglet_id: loglet_id.as_str().into(),
-        },
-    );
 }
 
 async fn membership_json(
@@ -582,12 +586,13 @@ async fn authority_json(
 
 async fn commit_record(
     runtime: &VerseRuntime,
+    producer_id: ProducerId,
     sequence: u64,
     payload: &'static [u8],
 ) -> Result<Receipt, CampaignError> {
     let pending = runtime
         .submit(Submission {
-            producer_id: producer(),
+            producer_id,
             producer_epoch: 0,
             sequence,
             records: vec![Record::new([], Bytes::from_static(payload))],
@@ -605,12 +610,13 @@ async fn commit_record(
 
 async fn commit_session(
     session: &HaServingSession,
+    producer_id: ProducerId,
     sequence: u64,
     payload: &'static [u8],
 ) -> Result<Receipt, CampaignError> {
     let pending = session
         .submit(Submission {
-            producer_id: producer(),
+            producer_id,
             producer_epoch: 0,
             sequence,
             records: vec![Record::new([], Bytes::from_static(payload))],
@@ -681,22 +687,19 @@ async fn run_baseline(
         SystemTimer::new(),
     )
     .await
-    .map_err(|error| CampaignError::Scenario(format!("start A: {error}")))?;
+    .map_err(|error| CampaignError::Scenario(format!("start A: {error}")))?
+    .with_observation(TraceRuntimeObserver::session(
+        run_id,
+        "scripture-a",
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+        Some(harness.first.as_str().into()),
+    ));
 
+    let producer = producer_for(run_id, "scripture-a", 0);
     let payloads: [&'static [u8]; 2] = [b"baseline-0", b"baseline-1"];
     for (sequence, payload) in payloads.into_iter().enumerate() {
         let sequence = sequence as u64;
-        let receipt = commit_record(&runtime, sequence, payload).await?;
-        emit_committed_ack(
-            &ActorTrace::new(
-                run.clone(),
-                ActorId::new("scripture-a"),
-                Arc::clone(&sink) as Arc<dyn TraceSink>,
-            ),
-            &format!("baseline-a-{sequence}"),
-            &receipt,
-            &harness.first,
-        );
+        commit_record(&runtime, producer, sequence, payload).await?;
     }
 
     let final_root = membership_json(
@@ -758,18 +761,20 @@ async fn run_root_cas_reply_lost(
         SystemTimer::new(),
     )
     .await
-    .map_err(|error| CampaignError::Scenario(format!("start A: {error}")))?;
-    let receipt_a = commit_record(&runtime_a, 0, b"before-cutover").await?;
-    emit_committed_ack(
-        &ActorTrace::new(
-            run.clone(),
-            ActorId::new("scripture-a"),
-            Arc::clone(&sink) as Arc<dyn TraceSink>,
-        ),
-        "root-cas-a-0",
-        &receipt_a,
-        &harness.first,
-    );
+    .map_err(|error| CampaignError::Scenario(format!("start A: {error}")))?
+    .with_observation(TraceRuntimeObserver::session(
+        run_id,
+        "scripture-a",
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+        Some(harness.first.as_str().into()),
+    ));
+    commit_record(
+        &runtime_a,
+        producer_for(run_id, "scripture-a", 0),
+        0,
+        b"before-cutover",
+    )
+    .await?;
 
     let second_faults = Arc::new(FaultController::new());
     let successor = harness
@@ -819,18 +824,20 @@ async fn run_root_cas_reply_lost(
         SystemTimer::new(),
     )
     .await
-    .map_err(|error| CampaignError::Scenario(format!("start B: {error}")))?;
-    let receipt_b = commit_record(&runtime_b, 1, b"after-cutover").await?;
-    emit_committed_ack(
-        &ActorTrace::new(
-            run.clone(),
-            ActorId::new("scripture-b"),
-            Arc::clone(&sink) as Arc<dyn TraceSink>,
-        ),
-        "root-cas-b-1",
-        &receipt_b,
-        &harness.second,
-    );
+    .map_err(|error| CampaignError::Scenario(format!("start B: {error}")))?
+    .with_observation(TraceRuntimeObserver::session(
+        run_id,
+        "scripture-b",
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+        Some(harness.second.as_str().into()),
+    ));
+    commit_record(
+        &runtime_b,
+        producer_for(run_id, "scripture-b", 0),
+        0,
+        b"after-cutover",
+    )
+    .await?;
 
     let final_root = membership_json(
         Arc::clone(&register),
@@ -932,13 +939,19 @@ async fn run_wedged_payload(
         SystemTimer::new(),
     )
     .await
-    .map_err(|error| CampaignError::Scenario(format!("bootstrap_and_serve A: {error}")))?;
+    .map_err(|error| CampaignError::Scenario(format!("bootstrap_and_serve A: {error}")))?
+    .with_observation(TraceRuntimeObserver::session(
+        run_id,
+        "scripture-a",
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+        None,
+    ));
     let expected = a_session.generation().clone();
 
     writer_faults.arm(ArmedFault::DieAfterPayload);
     let pending = a_session
         .submit(Submission {
-            producer_id: producer(),
+            producer_id: producer_for(run_id, "scripture-a", 0),
             producer_epoch: 0,
             sequence: 0,
             records: vec![Record::new(
@@ -998,19 +1011,21 @@ async fn run_wedged_payload(
     )
     .await
     .map_err(|error| CampaignError::Scenario(format!("promote_and_serve B: {error}")))?;
+    let b_loglet = b_session.generation().active_loglet_id.as_str().to_owned();
+    let b_session = b_session.with_observation(TraceRuntimeObserver::session(
+        run_id,
+        "scripture-b",
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+        Some(b_loglet),
+    ));
 
-    let successor_payload = b"committed-after-recovery";
-    let receipt = commit_session(&b_session, 1, successor_payload).await?;
-    emit_committed_ack(
-        &ActorTrace::new(
-            run,
-            ActorId::new("scripture-b"),
-            Arc::clone(&sink) as Arc<dyn TraceSink>,
-        ),
-        "wedged-b-1",
-        &receipt,
-        &b_session.generation().active_loglet_id,
-    );
+    commit_session(
+        &b_session,
+        producer_for(run_id, "scripture-b", 0),
+        0,
+        b"committed-after-recovery",
+    )
+    .await?;
 
     let final_root = membership_json(
         Arc::clone(&register),
