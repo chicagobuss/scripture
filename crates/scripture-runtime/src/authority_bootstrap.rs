@@ -1,16 +1,14 @@
 //! Durable authority-domain bootstrap via [`AuthorityCoordinator`].
 //!
-//! Protocol: CAS `Transitioning { Empty, … }` → publish v3 Foundation → CAS
-//! `Serving`. Crash between steps leaves a durable Transitioning intent that
-//! [`AuthorityCoordinator::reconcile`] can classify. Ordinary `scripture serve`
-//! never bootstraps.
+//! Empty path: foundation publishes membership + Serving in one root CAS.
+//! Ordinary `scripture serve` never bootstraps.
 
 use scripture::serving_authority::{
     AuthorityKey, FoundationPrecondition, ServingAuthorityRecord, WriterTerm,
 };
 use scripture_service::{AuthorityCoordinator, CoordinatorError, LocalServingEligibility};
 
-/// Bootstraps a brand-new authority domain through the durable Transitioning protocol.
+/// Bootstraps a brand-new authority domain through one-record Empty→Serving.
 pub async fn bootstrap_authority_domain(
     coordinator: &AuthorityCoordinator,
     key: AuthorityKey,

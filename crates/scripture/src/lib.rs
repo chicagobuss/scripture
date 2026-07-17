@@ -53,7 +53,8 @@ pub use model::{
 pub use sequencer_key::{sequencer_request_key_for_chunk, sequencer_request_key_for_submission};
 pub use serving_authority::{
     AuthorityKey, AuthorityState, JournalGenerationRef, RouteHint, ServingAuthorityError,
-    ServingAuthorityRecord, TransitionId, TransitionKind, WriterAuthority, WriterTerm,
+    ServingAuthorityRecord, ServingPublication, TransitionId, TransitionKind, WriterAuthority,
+    WriterTerm,
 };
 pub use spool::{
     FileSpoolStorage, FrameClassification, FrameKind, InMemorySpoolStorage, ProgressIdentity,

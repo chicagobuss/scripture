@@ -23,7 +23,8 @@ pub use ha_session::{
     system_clocks,
 };
 pub use holylog_foundation::{
-    DefaultFreshLogletIdPolicy, FreshLogletIdPolicy, HolylogJournalFoundation,
+    DefaultFreshLogletIdPolicy, FoundationTransitionCheckpoint, FoundationTransitionObserver,
+    FreshLogletIdPolicy, HolylogJournalFoundation, NoopFoundationTransitionObserver,
     owned_with_writer_term,
 };
 pub use ingress::{

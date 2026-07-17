@@ -43,10 +43,6 @@ pub struct HaConfig {
     /// `legacy` (default) or `serving-authority`.
     #[serde(default)]
     pub mode: HaMode,
-    /// ServingAuthorityStore backend selection. Kubernetes auth is in-cluster /
-    /// `KUBECONFIG` — never YAML secrets.
-    #[serde(default)]
-    pub authority_store: AuthorityStoreConfig,
 }
 
 /// Whether Serving Authority gates the serve path.
@@ -56,25 +52,8 @@ pub enum HaMode {
     /// Canon disposition only (existing non-HA product path).
     #[default]
     Legacy,
-    /// Require Serving Authority + v3 Canon agreement before committed ACKs.
+    /// Require one-record VirtualLog root Serving fence before committed ACKs.
     ServingAuthority,
-}
-
-/// Which ServingAuthorityStore implementation the process should assemble.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum AuthorityStoreConfig {
-    /// Process-local store — tests / in-process only. Refused by CLI fleet commands.
-    #[default]
-    Memory,
-    /// Namespaced `ServingAuthority` CRD conditional register.
-    Kubernetes {
-        /// Target namespace for the authority object.
-        namespace: String,
-        /// Optional override; must exactly equal the deterministic AuthorityKey name.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        object_name: Option<String>,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,24 +294,14 @@ metrics:
     }
 
     #[test]
-    fn accepts_kubernetes_authority_store() {
+    fn accepts_serving_authority_ha_mode() {
         let yaml = sample_yaml().to_owned()
             + r#"
 ha:
   mode: serving-authority
-  authority_store:
-    kind: kubernetes
-    namespace: scripture-lab
 "#;
         let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
         config.validate().expect("valid");
         assert_eq!(config.ha.mode, HaMode::ServingAuthority);
-        assert!(matches!(
-            config.ha.authority_store,
-            AuthorityStoreConfig::Kubernetes {
-                namespace,
-                object_name: None,
-            } if namespace == "scripture-lab"
-        ));
     }
 }
