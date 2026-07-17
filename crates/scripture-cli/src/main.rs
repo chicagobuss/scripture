@@ -259,19 +259,17 @@ Usage:
   scripture promote --config /path/to/scripture.yaml --candidate-term <N>
   scripture serve --config /path/to/scripture.yaml
 validate:  load + validate non-secret YAML; no network; no ownership.
-bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority +
-           authority_store.kind: kubernetes) long-lived bootstrap-and-serve.
+bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
+           long-lived bootstrap-and-serve (one-record VirtualLog root fence).
 replace:   legacy empty open-generation activation; exits; never opens ingress.
-promote:   long-lived promote-and-serve when HA kubernetes store is configured.
+promote:   long-lived promote-and-serve under ha.mode: serving-authority.
 serve:     long-running legacy Canon path; refused under Serving-Authority mode
            (writables cannot cross process exit — use bootstrap/promote).
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority
-    authority_store:
-      kind: kubernetes
-      namespace: scripture-lab
-Kubernetes auth is in-cluster / KUBECONFIG. kind: memory is refused by CLI.
+Authority is membership + Scripture fence on the Holylog VirtualLog root only.
+There is no separate ServingAuthorityStore / CRD backend.
 
 Non-secret settings come from the YAML file. Object-store credentials come from
 the process environment only:

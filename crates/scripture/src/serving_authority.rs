@@ -6,9 +6,9 @@
 
 use std::fmt;
 
-use holylog::virtual_log::{LogletId, VirtualLogState};
+use holylog::virtual_log::{ApplicationFence, LogletId, VirtualLogState};
 
-use crate::canon::{CanonFence, CanonOwner, OwnerId, VerseId};
+use crate::canon::{OwnerId, VerseId};
 use crate::model::JournalId;
 
 const MAGIC: &[u8; 4] = b"SCAR";
@@ -129,6 +129,80 @@ impl fmt::Display for WriterTerm {
     }
 }
 
+/// Typed successor publication: membership + Serving grant only.
+///
+/// Structurally impossible to construct with a Transitioning fence. Coordinators
+/// must pass this into foundation publish / final root CAS — never raw fence
+/// bytes with an arbitrary authority state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingPublication {
+    key: AuthorityKey,
+    authority: WriterAuthority,
+    route_hint: RouteHint,
+}
+
+impl ServingPublication {
+    /// Validates and constructs a Serving-only publication.
+    pub fn new(
+        key: AuthorityKey,
+        authority: WriterAuthority,
+        route_hint: RouteHint,
+    ) -> Result<Self, ServingAuthorityError> {
+        if authority.owner_id.as_bytes() == [0; 16] {
+            return Err(ServingAuthorityError::MalformedState {
+                message: "Serving publication requires a non-zero owner id".into(),
+            });
+        }
+        Ok(Self {
+            key,
+            authority,
+            route_hint,
+        })
+    }
+
+    /// Authority key for this domain.
+    #[must_use]
+    pub const fn key(&self) -> AuthorityKey {
+        self.key
+    }
+
+    /// Serving credentials being published.
+    #[must_use]
+    pub fn authority(&self) -> &WriterAuthority {
+        &self.authority
+    }
+
+    /// Advisory route.
+    #[must_use]
+    pub fn route_hint(&self) -> &RouteHint {
+        &self.route_hint
+    }
+
+    /// Materializes the Serving authority record for fence encoding.
+    #[must_use]
+    pub fn into_record(self) -> ServingAuthorityRecord {
+        ServingAuthorityRecord::new(
+            self.key,
+            AuthorityState::Serving {
+                authority: self.authority,
+                route_hint: self.route_hint,
+            },
+        )
+    }
+
+    /// Encodes as Holylog application-fence bytes (Serving only).
+    pub fn encode_application_fence(&self) -> Result<ApplicationFence, ServingAuthorityError> {
+        ServingAuthorityRecord::new(
+            self.key,
+            AuthorityState::Serving {
+                authority: self.authority.clone(),
+                route_hint: self.route_hint.clone(),
+            },
+        )
+        .encode_application_fence()
+    }
+}
+
 /// Durable, cryptographic reference to a specific VirtualLog generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalGenerationRef {
@@ -143,44 +217,44 @@ pub struct JournalGenerationRef {
 }
 
 impl JournalGenerationRef {
-    /// Decodes and binds the active Canon fence in `state`, returning its reference.
-    /// This succeeds for both v1/v2 legacy fences and v3 (Owned/Unowned), extracting the
-    /// active generation details and recording the exact observed fence bytes.
+    /// Binds the active generation in `state` without digesting application-fence
+    /// bytes. Membership binding is `(revision, active_loglet_id, active_start)`;
+    /// `canon_fence_digest` is BLAKE3 over those fields only so one-record Serving
+    /// fences can embed this ref without a circular self-digest.
     pub fn from_virtual_log_state(state: &VirtualLogState) -> Result<Self, ServingAuthorityError> {
-        // 1. Decode and validate the Canon fence from the opaque application_fence.
-        let fence = CanonFence::decode(&state.application_fence).map_err(|e| {
-            ServingAuthorityError::MalformedState {
-                message: format!("failed to decode application fence: {e}"),
-            }
-        })?;
-
-        // 2. Obtain the active generation descriptor.
         let active_desc = state
             .active()
             .ok_or_else(|| ServingAuthorityError::MalformedState {
                 message: "VirtualLogState has no active generation descriptor".to_string(),
             })?;
 
-        // 3. Require the fence revision to equal the state revision.
-        if fence.revision != state.revision {
-            return Err(ServingAuthorityError::MalformedState {
-                message: format!(
-                    "fence revision mismatch: state is {}, fence is {}",
-                    state.revision, fence.revision
-                ),
-            });
-        }
+        Ok(Self::from_active_generation(
+            state.revision,
+            active_desc.loglet_id.clone(),
+            active_desc.start,
+        ))
+    }
 
-        // 4. Digest the canonical ApplicationFence bytes (BLAKE3).
-        let hash = blake3::hash(state.application_fence.as_bytes());
-        let canon_fence_digest: [u8; 32] = hash.into();
-
-        Ok(Self {
-            virtual_log_revision: state.revision,
-            active_loglet_id: active_desc.loglet_id.clone(),
-            active_start: active_desc.start,
+    /// Constructs a generation binding and its membership digest.
+    #[must_use]
+    pub fn from_active_generation(
+        virtual_log_revision: u64,
+        active_loglet_id: LogletId,
+        active_start: u64,
+    ) -> Self {
+        let mut digest_input = Vec::with_capacity(8 + 2 + active_loglet_id.as_str().len() + 8);
+        digest_input.extend_from_slice(&virtual_log_revision.to_be_bytes());
+        let loglet_len = u16::try_from(active_loglet_id.as_str().len()).unwrap_or(u16::MAX);
+        digest_input.extend_from_slice(&loglet_len.to_be_bytes());
+        digest_input.extend_from_slice(active_loglet_id.as_str().as_bytes());
+        digest_input.extend_from_slice(&active_start.to_be_bytes());
+        let canon_fence_digest: [u8; 32] = blake3::hash(&digest_input).into();
+        Self {
+            virtual_log_revision,
+            active_loglet_id,
+            active_start,
             canon_fence_digest,
-        })
+        }
     }
 }
 
@@ -312,7 +386,11 @@ impl ServingAuthorityRecord {
         }
     }
 
-    /// Evaluates whether the local owner identity holds effective client-facing writer authority.
+    /// Evaluates whether the local owner holds effective client-facing writer authority.
+    ///
+    /// One-record rule: `self` must be the authority decoded from
+    /// `witnessed_state.application_fence`, in `Serving`, with exact owner/term/
+    /// generation binding, and the process must hold an unsealed writable.
     pub fn is_effective_writer(
         &self,
         witnessed_state: &VirtualLogState,
@@ -324,6 +402,14 @@ impl ServingAuthorityRecord {
             return false;
         }
 
+        let Ok(from_root) = Self::decode_application_fence(&witnessed_state.application_fence)
+        else {
+            return false;
+        };
+        if &from_root != self {
+            return false;
+        }
+
         let AuthorityState::Serving { authority, .. } = &self.state else {
             return false;
         };
@@ -332,7 +418,6 @@ impl ServingAuthorityRecord {
             return false;
         }
 
-        // 1. Build JournalGenerationRef from the current witnessed state
         let Ok(gen_ref) = JournalGenerationRef::from_virtual_log_state(witnessed_state) else {
             return false;
         };
@@ -341,33 +426,19 @@ impl ServingAuthorityRecord {
             return false;
         }
 
-        // 2. Decode the fence and ensure it matches the full identity exactly
-        let Ok(fence) = CanonFence::decode(&witnessed_state.application_fence) else {
-            return false;
-        };
-
-        if fence.journal_id != self.key.journal_id || fence.verse_id != self.key.verse_id {
-            return false;
-        }
-
-        let CanonOwner::Owned {
-            owner_id,
-            writer_term: Some(term),
-            ..
-        } = fence.owner
-        else {
-            return false;
-        };
-
-        if owner_id != local_owner_id {
-            return false;
-        }
-
-        if term != authority.writer_term {
-            return false;
-        }
-
         true
+    }
+
+    /// Encodes this record as Holylog opaque application-fence bytes.
+    pub fn encode_application_fence(&self) -> Result<ApplicationFence, ServingAuthorityError> {
+        Ok(ApplicationFence::new(self.encode()?))
+    }
+
+    /// Decodes a Serving Authority record from Holylog application-fence bytes.
+    pub fn decode_application_fence(
+        fence: &ApplicationFence,
+    ) -> Result<Self, ServingAuthorityError> {
+        Self::decode(fence.as_bytes())
     }
 
     /// Encodes this record into its canonical deterministic binary payload.

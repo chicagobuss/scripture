@@ -22,7 +22,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 scripture = { path = "../scripture" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service" }
-scripture-k8s-authority = { path = "../scripture-k8s-authority" }
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true

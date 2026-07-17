@@ -22,22 +22,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::assemble;
-use crate::config::{AuthorityStoreConfig, HaMode, ScriptureConfig};
+use crate::config::{HaMode, ScriptureConfig};
 
 pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
     if config.ha.mode == HaMode::ServingAuthority {
-        let store_hint = match &config.ha.authority_store {
-            AuthorityStoreConfig::Memory => "kind: memory (refused)",
-            AuthorityStoreConfig::Kubernetes { .. } => "kind: kubernetes",
-        };
-        return Err(format!(
-            "refusing plain `scripture serve` under ha.mode: serving-authority ({store_hint}) — \
+        return Err(
+            "refusing plain `scripture serve` under ha.mode: serving-authority — \
              Holylog open writables cannot cross process exit. Use long-lived \
              `scripture bootstrap --config …` (Empty→Serving) or \
-             `scripture promote --config … --candidate-term N` (promote-and-serve) with \
-             ha.authority_store.kind: kubernetes"
-        )
-        .into());
+             `scripture promote --config … --candidate-term N` (promote-and-serve). \
+             Authority is the VirtualLog root fence (no separate authority store)."
+                .into(),
+        );
     }
 
     let assembled = assemble::assemble_supervisor(&config)?;
