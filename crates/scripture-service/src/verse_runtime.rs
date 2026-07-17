@@ -18,6 +18,7 @@ use crate::canon_transition::{
     PublishedCanon, publish_canon_transition,
 };
 use crate::chunk_service::{ChunkJournalService, ChunkServiceError, DrainError};
+use crate::runtime_observation::RuntimeObservationSession;
 
 /// Stable configuration for one Verse runtime (same inputs as [`CanonNodeConfig`]).
 pub type VerseRuntimeConfig = CanonNodeConfig;
@@ -35,6 +36,7 @@ pub struct VerseRuntime {
     owner_id: OwnerId,
     virtual_log: VirtualLog,
     phase: VersePhase,
+    observation: Option<RuntimeObservationSession>,
 }
 
 enum VersePhase {
@@ -160,6 +162,7 @@ impl VerseRuntime {
                     owner_id,
                     virtual_log,
                     phase: VersePhase::Serving(service),
+                    observation: None,
                 })
             }
             CanonNodeStart::Standby { .. } => Ok(Self {
@@ -168,6 +171,7 @@ impl VerseRuntime {
                 owner_id,
                 virtual_log,
                 phase: VersePhase::Standby,
+                observation: None,
             }),
         }
     }
@@ -245,12 +249,51 @@ impl VerseRuntime {
         }
     }
 
+    /// Attaches a runtime observation session (campaign / test seam).
+    pub fn with_observation(mut self, session: RuntimeObservationSession) -> Self {
+        if self.is_serving() {
+            session.runtime_started();
+        }
+        self.observation = Some(session);
+        self
+    }
+
     /// Submits through the Canon-bound owner while Serving.
     pub async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, VerseAdmitError> {
         match &self.phase {
-            VersePhase::Serving(service) => Ok(service.submit(self.journal_id, submission).await?),
-            VersePhase::Standby => Err(VerseAdmitError::Unavailable(VerseUnavailable::Standby)),
+            VersePhase::Serving(service) => {
+                let ctx = self
+                    .observation
+                    .as_ref()
+                    .map(|session| session.next_operation_id("submit"));
+                match service.submit(self.journal_id, submission).await {
+                    Ok(receipt) => {
+                        if let (Some(session), Some(ctx)) = (&self.observation, ctx) {
+                            Ok(session.observe_receipt(ctx, receipt))
+                        } else {
+                            Ok(receipt)
+                        }
+                    }
+                    Err(error) => {
+                        if let (Some(session), Some(ctx)) = (&self.observation, ctx) {
+                            session.admission_denied(&ctx, &error.to_string());
+                        }
+                        Err(VerseAdmitError::Service(error))
+                    }
+                }
+            }
+            VersePhase::Standby => {
+                if let Some(session) = &self.observation {
+                    let ctx = session.next_operation_id("submit");
+                    session.admission_denied(&ctx, "standby");
+                }
+                Err(VerseAdmitError::Unavailable(VerseUnavailable::Standby))
+            }
             VersePhase::Terminal(_) => {
+                if let Some(session) = &self.observation {
+                    let ctx = session.next_operation_id("submit");
+                    session.admission_denied(&ctx, "terminal");
+                }
                 Err(VerseAdmitError::Unavailable(VerseUnavailable::Terminal))
             }
         }

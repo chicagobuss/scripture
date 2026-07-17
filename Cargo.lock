@@ -1542,6 +1542,7 @@ dependencies = [
  "scripture",
  "scripture-runtime",
  "scripture-service",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

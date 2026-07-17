@@ -20,6 +20,7 @@ mod canon_route;
 mod canon_transition;
 mod chunk_service;
 pub mod reconcile;
+pub mod runtime_observation;
 mod scripture_node;
 mod verse_runtime;
 
@@ -57,6 +58,10 @@ pub use reconcile::{
 pub use scripture_node::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError, ScriptureNodeHandoffError,
     ScriptureNodeStart, VerseKey,
+};
+pub use runtime_observation::{
+    EventSequencer, NoopRuntimeObserver, OperationContext, RuntimeObservationSession,
+    RuntimeObserver,
 };
 pub use verse_runtime::{
     VerseAdmitError, VerseHandoffError, VerseHandoffFailure, VerseHandoffRequest, VerseRuntime,

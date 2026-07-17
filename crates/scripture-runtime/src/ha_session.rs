@@ -11,8 +11,8 @@ use scripture::serving_authority::{
 };
 use scripture::{Clock, ReceiptFuture, Submission, SystemClock, SystemTimer, Timer};
 use scripture_service::{
-    AuthorityCoordinator, CoordinatorError, LocalServingEligibility, VerseRuntime,
-    VerseRuntimeConfig, VerseRuntimeStartError,
+    AuthorityCoordinator, CoordinatorError, LocalServingEligibility, RuntimeObservationSession,
+    VerseRuntime, VerseRuntimeConfig, VerseRuntimeStartError,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -108,6 +108,7 @@ pub struct HaServingSession {
     pub record: ServingAuthorityRecord,
     runtime: Arc<VerseRuntime>,
     admission: AuthorityAdmission,
+    observation: Option<RuntimeObservationSession>,
 }
 
 impl HaServingSession {
@@ -137,22 +138,53 @@ impl HaServingSession {
         self.runtime.is_serving() && self.admission.ensure_root_authority().await.is_ok()
     }
 
+    /// Attaches a runtime observation session for campaign / test evidence.
+    pub fn with_observation(mut self, session: RuntimeObservationSession) -> Self {
+        session.runtime_started();
+        self.observation = Some(session);
+        self
+    }
+
     /// Admits one submission only while this process is the current effective
     /// writer. The returned receipt rechecks authority before it can resolve
     /// successfully, so a Transitioning record cannot yield a committed ACK.
     pub async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, HaAdmissionError> {
         self.admission.ensure_root_authority().await?;
+        let ctx = self
+            .observation
+            .as_ref()
+            .map(|session| session.next_operation_id("submit"));
         let receipt = self.runtime.submit(submission).await?;
         let admission = self.admission.clone();
+        let observation = self.observation.clone();
         let (sender, receiver) = futures::channel::oneshot::channel();
         tokio::spawn(async move {
             let result = match receipt.await {
                 Ok(receipt) => match admission.ensure_root_authority().await {
                     Ok(()) => Ok(receipt),
-                    Err(_) => Err(scripture::DriverError::Unavailable),
+                    Err(HaAdmissionError::GateDenied { reason }) => {
+                        if let (Some(session), Some(ctx)) = (&observation, &ctx) {
+                            session.admission_denied(ctx, &format!("gate: {reason:?}"));
+                        }
+                        Err(scripture::DriverError::Unavailable)
+                    }
+                    Err(HaAdmissionError::Runtime(error)) => {
+                        if let (Some(session), Some(ctx)) = (&observation, &ctx) {
+                            session.admission_denied(ctx, &error.to_string());
+                        }
+                        Err(scripture::DriverError::Unavailable)
+                    }
                 },
-                Err(error) => Err(error),
+                Err(error) => {
+                    if let (Some(session), Some(ctx)) = (&observation, &ctx) {
+                        session.admission_denied(ctx, &error.to_string());
+                    }
+                    Err(error)
+                }
             };
+            if let (Ok(receipt), Some(session), Some(ctx)) = (&result, &observation, ctx) {
+                session.emit_committed_ack(&ctx, receipt);
+            }
             let _ = sender.send(result);
         });
         Ok(ReceiptFuture::from_receiver(receiver))
@@ -328,6 +360,7 @@ where
         },
         record,
         runtime: Arc::new(runtime),
+        observation: None,
     })
 }
 
