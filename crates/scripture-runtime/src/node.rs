@@ -1171,7 +1171,7 @@ mod tests {
     use holylog::provision::{
         ExclusiveClaimStore, InMemoryExclusiveClaimStore, OpenReattachError, resolve_read_seal,
     };
-    use holylog::virtual_log::{ConditionalRegister, InMemoryConditionalRegister, LogletId};
+    use holylog::virtual_log::{InMemoryConditionalRegister, LogletId};
     use scripture::{
         ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, SystemClock,
         VerseId, WriterId,
@@ -2060,7 +2060,13 @@ mod tests {
         let historical = resolve_read_seal(parts.open(&first).expect("open").components(2))
             .await
             .expect("seal");
-        assert!(!historical.observe_durable().await.expect("observe").sealed());
+        assert!(
+            !historical
+                .observe_durable()
+                .await
+                .expect("observe")
+                .sealed()
+        );
 
         // 4. Canon active generation is still first
         let observed_state = node
@@ -2075,4 +2081,3 @@ mod tests {
         );
     }
 }
-
