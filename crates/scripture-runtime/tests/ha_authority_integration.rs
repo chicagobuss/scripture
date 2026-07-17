@@ -3,6 +3,8 @@
 //! These tests exercise the real adapter, durable Transitioning bootstrap,
 //! in-process activate-and-serve, and committed ACK fencing. They do not claim
 //! live fleet HA.
+//!
+//! One-record HA: authority lives only in the VirtualLog root application fence.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -13,7 +15,8 @@ use holylog::drive::LogDrive;
 use holylog::memory::InMemoryLogDrive;
 use holylog::provision::{ExclusiveClaimStore, InMemoryExclusiveClaimStore};
 use holylog::virtual_log::{
-    ConditionalRegister, InMemoryConditionalRegister, LogletId, LogletResolver,
+    ConditionalRegister, FenceUpdate, InMemoryConditionalRegister, LogletId, LogletResolver,
+    VirtualLog,
 };
 use holylog_correctness::faults::{FaultableConditionalRegister, FaultableLogDrive, FaultableSeal};
 use holylog_correctness::{
@@ -34,9 +37,8 @@ use scripture_runtime::{
     bootstrap_and_serve, bootstrap_authority_domain, evaluate_authority_gate, promote_and_serve,
 };
 use scripture_service::{
-    AuthorityCoordinator, CasOutcome, DeterministicTransitionIdGenerator,
-    InMemoryServingAuthorityStore, JournalFoundationTransition, LocalServingEligibility,
-    ServingAuthorityStore, VerseRuntimeConfig,
+    AuthorityCoordinator, DeterministicTransitionIdGenerator, JournalFoundationTransition,
+    LocalServingEligibility, VerseRuntimeConfig,
 };
 
 fn journal() -> JournalId {
@@ -161,7 +163,6 @@ fn build_node<P>(
     register: Arc<dyn ConditionalRegister>,
     parts: Arc<P>,
     claims: Arc<dyn ExclusiveClaimStore>,
-    store: Arc<dyn ServingAuthorityStore>,
 ) -> NodeBundle
 where
     P: PartsFactory + 'static,
@@ -181,7 +182,8 @@ where
         2,
     ));
     let coordinator = AuthorityCoordinator::new(
-        Arc::clone(&store),
+        Arc::clone(&register),
+        Arc::clone(&resolver) as Arc<dyn LogletResolver>,
         Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
         Arc::new(DeterministicTransitionIdGenerator::new()),
         owner,
@@ -245,7 +247,6 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
     let register = Arc::new(InMemoryConditionalRegister::new());
     let parts = Arc::new(SharedMemoryPartsFactory::default());
     let claims = Arc::new(InMemoryExclusiveClaimStore::new());
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
 
     let a = build_node(
         owner_a(),
@@ -253,7 +254,6 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
     let b = build_node(
         owner_b(),
@@ -261,13 +261,11 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
 
     let session = bootstrap_and_serve(
         &a.coordinator,
         &a.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(1).expect("t1"),
         runtime_config(owner_a()),
@@ -289,7 +287,6 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
     assert!(ack.first_offset.get() < ack.next_offset.get());
 
     let b_gate = evaluate_authority_gate(
-        store.as_ref(),
         key(),
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&b.resolver) as Arc<dyn LogletResolver>,
@@ -303,11 +300,14 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
     // Promotion revokes client-facing authority before it seals the old
     // Foundation generation. The still-live A runtime must refuse a new
     // submission in that transition window rather than returning a later OK.
-    let snapshot = store
-        .observe(key())
+    let virtual_log = VirtualLog::new(
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&a.resolver) as Arc<dyn LogletResolver>,
+    );
+    let observed = virtual_log
+        .observe_membership()
         .await
-        .expect("observe")
-        .expect("record");
+        .expect("observe membership");
     let transitioning = ServingAuthorityRecord::new(
         key(),
         AuthorityState::Transitioning {
@@ -320,16 +320,22 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
             },
         },
     );
-    assert_eq!(
-        store
-            .compare_and_swap(key(), Some(snapshot.version), transitioning)
-            .await
-            .expect("transition CAS"),
-        CasOutcome::Applied
+    let fence = transitioning
+        .encode_application_fence()
+        .expect("encode Transitioning fence");
+    assert!(
+        matches!(
+            virtual_log
+                .update_application_fence(&observed, fence)
+                .await
+                .expect("Transitioning fence update"),
+            FenceUpdate::Applied { .. }
+        ),
+        "Transitioning injection must apply on the root fence"
     );
     assert!(
         !session.is_effective_writer().await,
-        "a Transitioning record must make the old process unready before Foundation sealing"
+        "a Transitioning fence must make the old process unready before Foundation sealing"
     );
     assert!(
         session
@@ -341,7 +347,7 @@ async fn bootstrap_and_serve_admits_only_owner_a() {
             })
             .await
             .is_err(),
-        "a Transitioning Serving Authority record must deny A before another admission"
+        "a Transitioning root fence must deny A before another admission"
     );
 }
 
@@ -350,7 +356,6 @@ async fn promote_and_serve_b_takes_committed_acks_and_denies_a() {
     let register = Arc::new(InMemoryConditionalRegister::new());
     let parts = Arc::new(SharedMemoryPartsFactory::default());
     let claims = Arc::new(InMemoryExclusiveClaimStore::new());
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
 
     let a = build_node(
         owner_a(),
@@ -358,7 +363,6 @@ async fn promote_and_serve_b_takes_committed_acks_and_denies_a() {
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
     let b = build_node(
         owner_b(),
@@ -366,13 +370,11 @@ async fn promote_and_serve_b_takes_committed_acks_and_denies_a() {
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
 
     let a_session = bootstrap_and_serve(
         &a.coordinator,
         &a.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(1).expect("t1"),
         runtime_config(owner_a()),
@@ -400,7 +402,6 @@ async fn promote_and_serve_b_takes_committed_acks_and_denies_a() {
     let b_session = promote_and_serve(
         &b.coordinator,
         &b.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(2).expect("t2"),
         expected.clone(),
@@ -425,7 +426,6 @@ async fn promote_and_serve_b_takes_committed_acks_and_denies_a() {
 
     // A cannot regain effective writer / committed ACKs after cutover.
     let a_gate = evaluate_authority_gate(
-        store.as_ref(),
         key(),
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&a.resolver) as Arc<dyn LogletResolver>,
@@ -456,14 +456,12 @@ async fn bootstrap_via_coordinator_leaves_empty_rev0_classifiable() {
     let register = Arc::new(InMemoryConditionalRegister::new());
     let parts = Arc::new(SharedMemoryPartsFactory::default());
     let claims = Arc::new(InMemoryExclusiveClaimStore::new());
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
     let a = build_node(
         owner_a(),
         "tcp://owner-a:9000",
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
 
     let record = bootstrap_authority_domain(&a.coordinator, key(), WriterTerm::new(1).expect("t1"))
@@ -482,14 +480,12 @@ async fn dense_offsets_continue_across_cutover() {
     let register = Arc::new(InMemoryConditionalRegister::new());
     let parts = Arc::new(SharedMemoryPartsFactory::default());
     let claims = Arc::new(InMemoryExclusiveClaimStore::new());
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
     let a = build_node(
         owner_a(),
         "tcp://owner-a:9000",
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
     let b = build_node(
         owner_b(),
@@ -497,13 +493,11 @@ async fn dense_offsets_continue_across_cutover() {
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
 
     let a_session = bootstrap_and_serve(
         &a.coordinator,
         &a.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(1).expect("t1"),
         runtime_config(owner_a()),
@@ -537,7 +531,6 @@ async fn dense_offsets_continue_across_cutover() {
     let b_session = promote_and_serve(
         &b.coordinator,
         &b.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(2).expect("t2"),
         expected,
@@ -593,7 +586,6 @@ async fn wedged_payload_is_never_acknowledged_and_ha_recovery_serves_successor()
         foundation_trace,
     ));
     let claims = Arc::new(InMemoryExclusiveClaimStore::new());
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
 
     let a = build_node(
         owner_a(),
@@ -601,7 +593,6 @@ async fn wedged_payload_is_never_acknowledged_and_ha_recovery_serves_successor()
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
     let b = build_node(
         owner_b(),
@@ -609,13 +600,11 @@ async fn wedged_payload_is_never_acknowledged_and_ha_recovery_serves_successor()
         Arc::clone(&register) as Arc<dyn ConditionalRegister>,
         Arc::clone(&parts),
         Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
-        Arc::clone(&store),
     );
 
     let a_session = bootstrap_and_serve(
         &a.coordinator,
         &a.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(1).expect("t1"),
         runtime_config(owner_a()),
@@ -689,7 +678,6 @@ async fn wedged_payload_is_never_acknowledged_and_ha_recovery_serves_successor()
     let b_session = promote_and_serve(
         &b.coordinator,
         &b.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(2).expect("t2"),
         expected,

@@ -363,7 +363,14 @@ impl CanonFence {
 
     /// Decodes this fence and verifies it is bound to exactly `state`'s
     /// register revision.
+    ///
+    /// One-record HA: when the application fence is a Scripture Serving Authority
+    /// record (`SCAR`), projects a synthetic Canon fence for recovery/startup.
+    /// Non-Serving SCAR states project as [`CanonOwner::Unowned`].
     pub fn from_virtual_log_state(state: &VirtualLogState) -> Result<Self, CanonFenceError> {
+        if state.application_fence.as_bytes().starts_with(b"SCAR") {
+            return Self::from_serving_authority_root(state);
+        }
         let fence = Self::decode(&state.application_fence)?;
         if fence.revision != state.revision {
             return Err(CanonFenceError::RevisionMismatch {
@@ -372,6 +379,80 @@ impl CanonFence {
             });
         }
         Ok(fence)
+    }
+
+    /// Projects a one-record Serving Authority root fence into a Canon fence.
+    ///
+    /// The projected fence is for local recovery/startup only; the durable bytes
+    /// remain the SCAR payload. Round-trip through [`Self::encode`] is not
+    /// expected to reproduce those bytes.
+    fn from_serving_authority_root(state: &VirtualLogState) -> Result<Self, CanonFenceError> {
+        use crate::serving_authority::{
+            AuthorityState, JournalGenerationRef, ServingAuthorityRecord,
+        };
+
+        let record = ServingAuthorityRecord::decode_application_fence(&state.application_fence)
+            .map_err(scar_to_canon_fence_error)?;
+
+        match record.state {
+            AuthorityState::Serving {
+                authority,
+                route_hint,
+            } => {
+                let generation = JournalGenerationRef::from_virtual_log_state(state)
+                    .map_err(scar_to_canon_fence_error)?;
+                if authority.generation_ref != generation {
+                    return Err(CanonFenceError::RevisionMismatch {
+                        fence_revision: authority.generation_ref.virtual_log_revision,
+                        state_revision: state.revision,
+                    });
+                }
+                let endpoint = OwnerEndpoint::new(route_hint.as_str())?;
+                Ok(Self::new(
+                    state.revision,
+                    record.key.journal_id,
+                    record.key.verse_id,
+                    CanonOwner::Owned {
+                        owner_id: authority.owner_id,
+                        endpoint,
+                        sequencer: None,
+                        writer_term: Some(authority.writer_term),
+                    },
+                ))
+            }
+            AuthorityState::Transitioning { .. }
+            | AuthorityState::Unassigned
+            | AuthorityState::ReconciliationRequired { .. } => Ok(Self::new(
+                state.revision,
+                record.key.journal_id,
+                record.key.verse_id,
+                CanonOwner::Unowned,
+            )),
+        }
+    }
+}
+
+/// Maps Serving Authority decode failures into Canon fence errors for projection.
+fn scar_to_canon_fence_error(
+    error: crate::serving_authority::ServingAuthorityError,
+) -> CanonFenceError {
+    use crate::serving_authority::ServingAuthorityError;
+    match error {
+        ServingAuthorityError::BadMagic => CanonFenceError::BadMagic,
+        ServingAuthorityError::Truncated | ServingAuthorityError::TrailingBytes => {
+            CanonFenceError::Truncated
+        }
+        ServingAuthorityError::UnsupportedVersion { actual, .. } => {
+            CanonFenceError::UnsupportedVersion {
+                version: u8::try_from(actual).unwrap_or(u8::MAX),
+            }
+        }
+        ServingAuthorityError::ControlCharacterInText
+        | ServingAuthorityError::StringTooLong { .. } => CanonFenceError::EmptyEndpoint,
+        ServingAuthorityError::InvalidWriterTerm => CanonFenceError::InvalidWriterTerm,
+        ServingAuthorityError::UnknownTag { tag } => CanonFenceError::UnknownOwnerTag { tag },
+        ServingAuthorityError::InvalidLogletId { .. }
+        | ServingAuthorityError::MalformedState { .. } => CanonFenceError::BadMagic,
     }
 }
 

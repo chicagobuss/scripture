@@ -20,9 +20,9 @@ use holylog::virtual_log::{
     ConditionalRegister, LogletId, LogletResolver, ReceiptReconfiguration, VersionedState,
     VirtualLog, VirtualLogError, VirtualLogState,
 };
-use scripture::canon::{CanonFence, CanonOwner};
 use scripture::serving_authority::{
-    AuthorityKey, FoundationPrecondition, JournalGenerationRef, TransitionIntent, WriterTerm,
+    AuthorityKey, AuthorityState, FoundationPrecondition, JournalGenerationRef,
+    ServingAuthorityRecord, ServingPublication, TransitionIntent, WriterAuthority, WriterTerm,
 };
 use scripture::{OwnerEndpoint, OwnerId};
 use scripture_service::{
@@ -32,6 +32,12 @@ use tokio::sync::Mutex;
 
 use crate::node::{DurableLogletParts, NodeIdentity, PartsFactory, ProcessLogletResolver};
 
+/// Membership identity for Expected matching: fence-only revision bumps must not
+/// invalidate a durable Transitioning intent's predecessor binding.
+fn same_active_membership(left: &JournalGenerationRef, right: &JournalGenerationRef) -> bool {
+    left.active_loglet_id == right.active_loglet_id && left.active_start == right.active_start
+}
+
 /// Policy for allocating the next exclusive Loglet ID during a Foundation transition.
 pub trait FreshLogletIdPolicy: Send + Sync {
     /// Deterministic, namespace-safe successor Loglet identifier.
@@ -40,6 +46,7 @@ pub trait FreshLogletIdPolicy: Send + Sync {
         next_revision: u64,
         next_term: WriterTerm,
         candidate: OwnerId,
+        attempt: u32,
     ) -> Result<LogletId, FoundationTransitionError>;
 }
 
@@ -53,6 +60,7 @@ impl FreshLogletIdPolicy for DefaultFreshLogletIdPolicy {
         next_revision: u64,
         next_term: WriterTerm,
         candidate: OwnerId,
+        attempt: u32,
     ) -> Result<LogletId, FoundationTransitionError> {
         let hex: String = candidate
             .as_bytes()
@@ -60,19 +68,81 @@ impl FreshLogletIdPolicy for DefaultFreshLogletIdPolicy {
             .take(4)
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let raw = format!("g{next_revision}-t{}-{hex}", next_term.get());
+        let raw = format!("g{next_revision}-t{}-{hex}-a{attempt}", next_term.get());
         LogletId::new(raw).map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))
     }
 }
 
-/// Owned v3 Canon owner binding carrying an explicit WriterTerm.
+/// Durable replacement boundaries reached after the root intent exists.
+///
+/// This is an observability/test seam, not an additional authority source. An
+/// interruption at any checkpoint leaves the root `Transitioning` and requires
+/// forward recovery; it can never restore predecessor Serving authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundationTransitionCheckpoint {
+    /// The predecessor seal is durable, before its authoritative tail is read.
+    PredecessorSealed,
+    /// The sealed predecessor's authoritative tail was read, before provision.
+    SealedTailObserved,
+    /// A successor and its single-use receipt exist, before the root CAS.
+    SuccessorProvisioned,
+}
+
+/// Observes an internal Foundation replacement boundary.
+pub trait FoundationTransitionObserver: Send + Sync {
+    /// Returning an error models interruption of the current process.
+    fn checkpoint(
+        &self,
+        checkpoint: FoundationTransitionCheckpoint,
+    ) -> Result<(), FoundationTransitionError>;
+}
+
+/// Production observer with no side effects.
+#[derive(Debug, Default)]
+pub struct NoopFoundationTransitionObserver;
+
+impl FoundationTransitionObserver for NoopFoundationTransitionObserver {
+    fn checkpoint(
+        &self,
+        _checkpoint: FoundationTransitionCheckpoint,
+    ) -> Result<(), FoundationTransitionError> {
+        Ok(())
+    }
+}
+
+/// Builds a Serving-only publication for the local candidate (route = advertise).
+pub(crate) fn serving_publication_for(
+    key: AuthorityKey,
+    owner_id: OwnerId,
+    endpoint: &OwnerEndpoint,
+    writer_term: WriterTerm,
+    generation_ref: JournalGenerationRef,
+) -> Result<ServingPublication, FoundationTransitionError> {
+    let route_hint = scripture::RouteHint::new(endpoint.as_str()).map_err(|error| {
+        FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(error.to_string())))
+    })?;
+    ServingPublication::new(
+        key,
+        WriterAuthority {
+            owner_id,
+            writer_term,
+            generation_ref,
+        },
+        route_hint,
+    )
+    .map_err(|error| {
+        FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(error.to_string())))
+    })
+}
+
+/// Owned v3 Canon owner binding carrying an explicit WriterTerm (legacy helper).
 #[must_use]
 pub fn owned_with_writer_term(
     owner_id: OwnerId,
     endpoint: OwnerEndpoint,
     writer_term: WriterTerm,
-) -> CanonOwner {
-    CanonOwner::Owned {
+) -> scripture::CanonOwner {
+    scripture::CanonOwner::Owned {
         owner_id,
         endpoint,
         sequencer: None,
@@ -89,6 +159,7 @@ pub struct HolylogJournalFoundation {
     parts: Arc<dyn PartsFactory>,
     authority: ProvisionAuthority,
     loglet_ids: Arc<dyn FreshLogletIdPolicy>,
+    observer: Arc<dyn FoundationTransitionObserver>,
     k: u64,
     control: Mutex<()>,
 }
@@ -118,6 +189,33 @@ impl HolylogJournalFoundation {
         loglet_ids: Arc<dyn FreshLogletIdPolicy>,
         k: u64,
     ) -> Self {
+        Self::new_with_transition_observer(
+            key,
+            identity,
+            register,
+            resolver,
+            parts,
+            claims,
+            loglet_ids,
+            Arc::new(NoopFoundationTransitionObserver),
+            k,
+        )
+    }
+
+    /// Builds a Foundation adapter with an explicit internal transition observer.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_transition_observer(
+        key: AuthorityKey,
+        identity: NodeIdentity,
+        register: Arc<dyn ConditionalRegister>,
+        resolver: Arc<ProcessLogletResolver>,
+        parts: Arc<dyn PartsFactory>,
+        claims: Arc<dyn ExclusiveClaimStore>,
+        loglet_ids: Arc<dyn FreshLogletIdPolicy>,
+        observer: Arc<dyn FoundationTransitionObserver>,
+        k: u64,
+    ) -> Self {
         let provisioner = ProvisionerId::new(format!("scripture-ha-{}", identity.owner_id));
         Self {
             key,
@@ -127,6 +225,7 @@ impl HolylogJournalFoundation {
             parts,
             authority: ProvisionAuthority::new(claims, provisioner),
             loglet_ids,
+            observer,
             k,
             control: Mutex::new(()),
         }
@@ -233,13 +332,15 @@ impl HolylogJournalFoundation {
                         message: "VirtualLog membership is present but has no generations".into(),
                     });
                 }
-                let fence =
-                    CanonFence::decode(&observed.state.application_fence).map_err(|error| {
-                        Self::map_unavailable(std::io::Error::other(error.to_string()))
-                    })?;
-                if fence.journal_id != self.key.journal_id || fence.verse_id != self.key.verse_id {
+                // One-record: authority lives in application_fence. Accept Serving or
+                // Transitioning records that name this key; reject foreign keys.
+                if let Ok(record) = ServingAuthorityRecord::decode_application_fence(
+                    &observed.state.application_fence,
+                ) && record.key != self.key
+                {
                     return Err(FoundationTransitionError::Conflict {
-                        message: "Canon fence journal/verse disagree with AuthorityKey".into(),
+                        message: "root authority fence journal/verse disagree with AuthorityKey"
+                            .into(),
                     });
                 }
                 let generation = Self::generation_ref_from_state(&observed.state)?;
@@ -274,9 +375,11 @@ impl HolylogJournalFoundation {
 
     async fn provision_successor_uninstalled(
         &self,
-        successor: &LogletId,
+        next_revision: u64,
+        next_term: WriterTerm,
     ) -> Result<
         (
+            LogletId,
             DurableLogletParts,
             holylog::provision::FreshWritableProvisionReceipt,
             Arc<holylog::provision::WritableLoglet>,
@@ -284,37 +387,73 @@ impl HolylogJournalFoundation {
         ),
         FoundationTransitionError,
     > {
-        let parts = self
-            .parts
-            .fresh(successor)
-            .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
-        let namespaces = self
-            .parts
-            .namespaces(successor)
-            .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
-        let bind = Self::bind_for(successor);
-        let (receipt, writable) = self
-            .authority
-            .provision_fresh(
-                successor.clone(),
-                namespaces,
-                bind.clone(),
-                parts.components(self.k),
-            )
-            .await
-            .map_err(Self::map_unavailable)?;
-        Ok((parts, receipt, Arc::new(writable), bind))
+        // A crash after fresh provision loses the linear, single-use receipt.
+        // It cannot be reconstructed, so recovery must abandon that unreachable
+        // candidate and try a distinct suffix. The bounded loop is fail-closed.
+        const MAX_CANDIDATE_ATTEMPTS: u32 = 8;
+        let mut last_error = None;
+        for attempt in 0..MAX_CANDIDATE_ATTEMPTS {
+            let successor = self.loglet_ids.next_loglet_id(
+                next_revision,
+                next_term,
+                self.identity.owner_id,
+                attempt,
+            )?;
+            let parts = match self.parts.fresh(&successor) {
+                Ok(parts) => parts,
+                Err(error) => {
+                    // A retained candidate after a process crash is expected to
+                    // collide here for in-memory/test factories. Moving to a new
+                    // namespace is safer than attempting to forge its receipt.
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            let namespaces = self
+                .parts
+                .namespaces(&successor)
+                .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
+            let bind = Self::bind_for(&successor);
+            match self
+                .authority
+                .provision_fresh(
+                    successor.clone(),
+                    namespaces,
+                    bind.clone(),
+                    parts.components(self.k),
+                )
+                .await
+            {
+                Ok((receipt, writable)) => {
+                    return Ok((successor, parts, receipt, Arc::new(writable), bind));
+                }
+                Err(holylog::provision::ProvisionError::NamespaceAlreadyClaimed { .. }) => {
+                    last_error = Some("candidate namespace already claimed".into());
+                }
+                Err(error) => return Err(Self::map_unavailable(error)),
+            }
+        }
+        Err(FoundationTransitionError::Unavailable(Box::new(
+            std::io::Error::other(format!(
+                "could not provision a fresh successor after {MAX_CANDIDATE_ATTEMPTS} attempts: {}",
+                last_error.unwrap_or_else(|| "no candidate error".into())
+            )),
+        )))
     }
 
     async fn drive_locked(
         &self,
         key: AuthorityKey,
-        target_owner_id: OwnerId,
-        next_term: WriterTerm,
+        publication: ServingPublication,
         precondition: FoundationPrecondition,
     ) -> Result<JournalGenerationRef, FoundationTransitionError> {
         self.require_configured_key(key)?;
-        self.require_local_candidate(target_owner_id)?;
+        self.require_local_candidate(publication.authority().owner_id)?;
+        if publication.key() != key {
+            return Err(FoundationTransitionError::Conflict {
+                message: "ServingPublication key disagrees with Foundation key".into(),
+            });
+        }
 
         let live = self.observe_live().await?;
         match (&precondition, &live) {
@@ -330,7 +469,7 @@ impl HolylogJournalFoundation {
                 });
             }
             (FoundationPrecondition::Expected(expected), Some((_, generation))) => {
-                if generation != expected {
+                if !same_active_membership(generation, expected) {
                     return Err(FoundationTransitionError::Conflict {
                         message: "precondition Expected generation does not match live Foundation"
                             .into(),
@@ -340,51 +479,49 @@ impl HolylogJournalFoundation {
         }
 
         match precondition {
-            FoundationPrecondition::Empty => self.bootstrap_empty(next_term).await,
+            FoundationPrecondition::Empty => self.bootstrap_empty(publication).await,
             FoundationPrecondition::Expected(_) => {
                 let (observed, _) = live.expect("checked");
-                self.replace_expected(observed, next_term).await
+                self.replace_expected(observed, publication).await
             }
         }
     }
 
     async fn bootstrap_empty(
         &self,
-        next_term: WriterTerm,
+        publication: ServingPublication,
     ) -> Result<JournalGenerationRef, FoundationTransitionError> {
-        let successor = self
-            .loglet_ids
-            .next_loglet_id(0, next_term, self.identity.owner_id)?;
-        let (_parts, receipt, writable, bind) =
-            self.provision_successor_uninstalled(&successor).await?;
-        let fence = CanonFence::new(
-            0,
-            self.key.journal_id,
-            self.key.verse_id,
-            owned_with_writer_term(
-                self.identity.owner_id,
-                self.identity.endpoint.clone(),
-                next_term,
-            ),
-        );
+        let next_term = publication.authority().writer_term;
+        let (successor, _parts, receipt, writable, bind) =
+            self.provision_successor_uninstalled(0, next_term).await?;
+
+        // Build Serving fence with the generation binding we are about to publish.
+        let generation_ref = JournalGenerationRef::from_active_generation(0, successor.clone(), 0);
+        let publish = serving_publication_for(
+            self.key,
+            publication.authority().owner_id,
+            &self.identity.endpoint,
+            next_term,
+            generation_ref,
+        )?;
+        let fence = publish
+            .encode_application_fence()
+            .map_err(|error| Self::map_unavailable(std::io::Error::other(error.to_string())))?;
+
         match self
             .virtual_log()
-            .bootstrap_with_receipt(receipt, writable.as_ref(), &bind, fence.encode())
+            .bootstrap_with_receipt(receipt, writable.as_ref(), &bind, fence)
             .await
         {
             Ok(()) => {
-                // Install writable only after Applied/bootstrap success so a
-                // crash mid-path cannot expose an unpublished soft sequencer.
                 self.resolver
                     .insert_writable(successor.clone(), Arc::clone(&writable));
             }
             Err(error) => {
-                // Bootstrap moved the receipt; Holylog does not hand it back.
                 return Err(Self::map_indeterminate(error));
             }
         }
 
-        // Fresh observe — never predict revision/digest.
         let (_observed, generation) = self.observe_live().await?.ok_or_else(|| {
             FoundationTransitionError::Indeterminate(Box::new(std::io::Error::other(
                 "bootstrap Applied but VirtualLog observe reports uninitialized",
@@ -396,8 +533,9 @@ impl HolylogJournalFoundation {
     async fn replace_expected(
         &self,
         observed: VersionedState,
-        next_term: WriterTerm,
+        publication: ServingPublication,
     ) -> Result<JournalGenerationRef, FoundationTransitionError> {
+        let next_term = publication.authority().writer_term;
         let predecessor = observed
             .state
             .active()
@@ -408,37 +546,44 @@ impl HolylogJournalFoundation {
             .clone();
 
         self.ensure_predecessor_sealed(&predecessor).await?;
+        self.observer
+            .checkpoint(FoundationTransitionCheckpoint::PredecessorSealed)?;
 
+        // Successor start = sealed predecessor contiguous tail (Holylog sets this
+        // on reconfigure; we bind the Serving fence to the post-publish observe).
         let next_revision = observed.state.revision.checked_add(1).ok_or_else(|| {
             FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
                 "VirtualLog revision overflow",
             )))
         })?;
-        let successor =
-            self.loglet_ids
-                .next_loglet_id(next_revision, next_term, self.identity.owner_id)?;
-        let (_parts, receipt, writable, bind) =
-            self.provision_successor_uninstalled(&successor).await?;
-
-        let fence = CanonFence::new(
-            next_revision,
-            self.key.journal_id,
-            self.key.verse_id,
-            owned_with_writer_term(
-                self.identity.owner_id,
-                self.identity.endpoint.clone(),
-                next_term,
-            ),
-        );
+        let start = self.sealed_predecessor_start(&predecessor).await?;
+        self.observer
+            .checkpoint(FoundationTransitionCheckpoint::SealedTailObserved)?;
+        let (successor, _parts, receipt, writable, bind) = self
+            .provision_successor_uninstalled(next_revision, next_term)
+            .await?;
+        self.observer
+            .checkpoint(FoundationTransitionCheckpoint::SuccessorProvisioned)?;
+        let generation_ref =
+            JournalGenerationRef::from_active_generation(next_revision, successor.clone(), start);
+        let publish = serving_publication_for(
+            self.key,
+            publication.authority().owner_id,
+            &self.identity.endpoint,
+            next_term,
+            generation_ref,
+        )?;
+        let fence = publish
+            .encode_application_fence()
+            .map_err(|error| Self::map_unavailable(std::io::Error::other(error.to_string())))?;
 
         let outcome = match self
             .virtual_log()
-            .reconfigure_with_receipt(&observed, receipt, writable.as_ref(), &bind, fence.encode())
+            .reconfigure_with_receipt(&observed, receipt, writable.as_ref(), &bind, fence)
             .await
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                // Receipt was moved into Holylog; outcome is indeterminate.
                 return Err(Self::map_indeterminate(error));
             }
         };
@@ -449,7 +594,6 @@ impl HolylogJournalFoundation {
                     .insert_writable(successor.clone(), Arc::clone(&writable));
             }
             ReceiptReconfiguration::Conflict { .. } => {
-                // Receipt retained by Holylog conflict path; do not install writable.
                 return Err(FoundationTransitionError::Conflict {
                     message: "VirtualLog reconfigure CAS conflict; candidate retained for inspect"
                         .into(),
@@ -465,6 +609,24 @@ impl HolylogJournalFoundation {
         Ok(generation)
     }
 
+    async fn sealed_predecessor_start(
+        &self,
+        predecessor: &LogletId,
+    ) -> Result<u64, FoundationTransitionError> {
+        let parts = self
+            .parts
+            .open(predecessor)
+            .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
+        let historical = resolve_read_seal(parts.components(self.k))
+            .await
+            .map_err(Self::map_unavailable)?;
+        let durable = historical
+            .observe_durable()
+            .await
+            .map_err(Self::map_unavailable)?;
+        Ok(durable.non_contiguous_tail())
+    }
+
     async fn classify_locked(
         &self,
         key: AuthorityKey,
@@ -477,7 +639,7 @@ impl HolylogJournalFoundation {
             FoundationPrecondition::Empty => live.is_none(),
             FoundationPrecondition::Expected(expected) => live
                 .as_ref()
-                .is_some_and(|(_, generation)| generation == expected),
+                .is_some_and(|(_, generation)| same_active_membership(generation, expected)),
         };
         if matches_precondition {
             return Ok(TransitionClassification::StillPredecessor);
@@ -492,10 +654,13 @@ impl HolylogJournalFoundation {
         // Empty → initial Foundation may publish at revision zero. A successful
         // empty transition is an intended successor whenever the live fence
         // matches the candidate/term; do not treat rev==0 as divergent.
+        // Expected: fence-only revision bumps keep the same membership and are
+        // StillPredecessor above; a real cutover changes active loglet/start.
         let is_successor = match &intent.precondition {
             FoundationPrecondition::Empty => true,
             FoundationPrecondition::Expected(expected) => {
-                generation.virtual_log_revision > expected.virtual_log_revision
+                !same_active_membership(&generation, expected)
+                    && generation.virtual_log_revision > expected.virtual_log_revision
             }
         };
         if !is_successor {
@@ -504,19 +669,19 @@ impl HolylogJournalFoundation {
             });
         }
 
-        let fence = CanonFence::decode(&observed.state.application_fence)
-            .map_err(|error| Self::map_unavailable(std::io::Error::other(error.to_string())))?;
-        if fence.journal_id != key.journal_id || fence.verse_id != key.verse_id {
+        let fence_record =
+            ServingAuthorityRecord::decode_application_fence(&observed.state.application_fence)
+                .map_err(|error| Self::map_unavailable(std::io::Error::other(error.to_string())))?;
+        if fence_record.key != key {
             return Ok(TransitionClassification::Divergent {
                 observed_generation: Some(generation),
             });
         }
-        match fence.owner {
-            CanonOwner::Owned {
-                owner_id,
-                writer_term: Some(term),
-                ..
-            } if owner_id == intent.candidate_owner_id && term == intent.next_writer_term => {
+        match fence_record.state {
+            AuthorityState::Serving { authority, .. }
+                if authority.owner_id == intent.candidate_owner_id
+                    && authority.writer_term == intent.next_writer_term =>
+            {
                 Ok(TransitionClassification::IntendedSuccessor { generation })
             }
             _ => Ok(TransitionClassification::Divergent {
@@ -525,22 +690,38 @@ impl HolylogJournalFoundation {
         }
     }
 
-    /// One-shot brand-new authority-domain Foundation bootstrap (v3 fence).
+    /// One-shot brand-new authority-domain Foundation bootstrap with Serving fence.
     ///
-    /// Publishes Canon only. Callers must separately establish the matching
-    /// Serving Authority record; no runtime is started here.
+    /// Publishes membership + Serving in one root CAS. No separate authority store.
+    pub async fn bootstrap_foundation_serving(
+        &self,
+        initial_term: WriterTerm,
+    ) -> Result<JournalGenerationRef, FoundationTransitionError> {
+        let publication = serving_publication_for(
+            self.key,
+            self.identity.owner_id,
+            &self.identity.endpoint,
+            initial_term,
+            JournalGenerationRef::from_active_generation(
+                0,
+                LogletId::new("bootstrap-placeholder").map_err(|error| {
+                    Self::map_unavailable(std::io::Error::other(error.to_string()))
+                })?,
+                0,
+            ),
+        )?;
+        let _guard = self.control.lock().await;
+        self.drive_locked(self.key, publication, FoundationPrecondition::Empty)
+            .await
+    }
+
+    /// Deprecated name retained for call-site migration; prefer
+    /// [`Self::bootstrap_foundation_serving`].
     pub async fn bootstrap_foundation_v3(
         &self,
         initial_term: WriterTerm,
     ) -> Result<JournalGenerationRef, FoundationTransitionError> {
-        let _guard = self.control.lock().await;
-        self.drive_locked(
-            self.key,
-            self.identity.owner_id,
-            initial_term,
-            FoundationPrecondition::Empty,
-        )
-        .await
+        self.bootstrap_foundation_serving(initial_term).await
     }
 }
 
@@ -548,8 +729,7 @@ impl JournalFoundationTransition for HolylogJournalFoundation {
     fn drive_foundation_transition(
         &self,
         key: AuthorityKey,
-        target_owner_id: OwnerId,
-        next_term: WriterTerm,
+        publication: ServingPublication,
         precondition: FoundationPrecondition,
     ) -> Pin<
         Box<
@@ -560,8 +740,7 @@ impl JournalFoundationTransition for HolylogJournalFoundation {
     > {
         Box::pin(async move {
             let _guard = self.control.lock().await;
-            self.drive_locked(key, target_owner_id, next_term, precondition)
-                .await
+            self.drive_locked(key, publication, precondition).await
         })
     }
 

@@ -4,9 +4,6 @@
 //! exit. Therefore promotion and initial Serving must complete inside the
 //! process that will admit committed work.
 
-use std::sync::Arc;
-
-use holylog::atomic::SealStatus;
 use holylog::virtual_log::{ConditionalRegister, LogletResolver, VirtualLog};
 use scripture::serving_authority::{
     AuthorityKey, AuthorityState, FoundationPrecondition, JournalGenerationRef,
@@ -14,9 +11,10 @@ use scripture::serving_authority::{
 };
 use scripture::{Clock, ReceiptFuture, Submission, SystemClock, SystemTimer, Timer};
 use scripture_service::{
-    AuthorityCoordinator, CoordinatorError, LocalServingEligibility, ServingAuthorityStore,
-    VerseRuntime, VerseRuntimeConfig, VerseRuntimeStartError,
+    AuthorityCoordinator, CoordinatorError, LocalServingEligibility, VerseRuntime,
+    VerseRuntimeConfig, VerseRuntimeStartError,
 };
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::authority_gate::{AuthorityGateDecision, AuthorityGateDenial, evaluate_authority_gate};
@@ -66,7 +64,6 @@ pub enum HaAdmissionError {
 
 #[derive(Clone)]
 struct AuthorityAdmission {
-    store: Arc<dyn ServingAuthorityStore>,
     key: AuthorityKey,
     register: Arc<dyn ConditionalRegister>,
     resolver: Arc<ProcessLogletResolver>,
@@ -75,26 +72,25 @@ struct AuthorityAdmission {
 }
 
 impl AuthorityAdmission {
-    async fn ensure_effective(&self) -> Result<(), HaAdmissionError> {
-        let virtual_log = VirtualLog::new(
-            Arc::clone(&self.register),
-            Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
-        );
-        // Any inability to establish that the local active generation remains
-        // open is a sealed fact for admission purposes. The subsequent current
-        // gate observation also rejects any Foundation mismatch.
-        let is_sealed = !matches!(
-            virtual_log.check_tail().await,
-            Ok(tail) if tail.seal_status != SealStatus::Sealed
-        );
+    /// Confirms that the current VirtualLog root still grants this process the
+    /// Serving role and that the locally held capability names that generation.
+    ///
+    /// This deliberately does *not* issue a separate durable seal probe. The
+    /// root is the authority fence, while the actual `AtomicLog::append` in
+    /// `VerseRuntime` checks its durable seal after writing and before it can
+    /// return a successful receipt. Requiring an additional remote seal read
+    /// on every probe/admission adds an unbounded object-store round trip but
+    /// does not strengthen the committed-ACK boundary: a concurrent seal is
+    /// already rejected by that append path. The root is checked once before
+    /// submission and again before forwarding a successful receipt.
+    async fn ensure_root_authority(&self) -> Result<(), HaAdmissionError> {
         let decision = evaluate_authority_gate(
-            self.store.as_ref(),
             self.key,
             Arc::clone(&self.register),
             Arc::clone(&self.resolver) as Arc<dyn LogletResolver>,
             self.owner_id,
             self.resolver.is_writable(&self.generation.active_loglet_id),
-            is_sealed,
+            false,
         )
         .await;
         match decision {
@@ -131,24 +127,27 @@ impl HaServingSession {
         self.runtime.is_serving()
     }
 
-    /// Returns whether this live process is still the current effective writer.
+    /// Returns whether this live process still holds the root-granted Serving
+    /// role and its matching local writable capability. Actual committed ACKs
+    /// additionally pass through `AtomicLog`'s durable seal check.
+    ///
     /// Readiness and every admission path must use this rather than treating a
     /// live runtime as authority.
     pub async fn is_effective_writer(&self) -> bool {
-        self.runtime.is_serving() && self.admission.ensure_effective().await.is_ok()
+        self.runtime.is_serving() && self.admission.ensure_root_authority().await.is_ok()
     }
 
     /// Admits one submission only while this process is the current effective
     /// writer. The returned receipt rechecks authority before it can resolve
     /// successfully, so a Transitioning record cannot yield a committed ACK.
     pub async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, HaAdmissionError> {
-        self.admission.ensure_effective().await?;
+        self.admission.ensure_root_authority().await?;
         let receipt = self.runtime.submit(submission).await?;
         let admission = self.admission.clone();
         let (sender, receiver) = futures::channel::oneshot::channel();
         tokio::spawn(async move {
             let result = match receipt.await {
-                Ok(receipt) => match admission.ensure_effective().await {
+                Ok(receipt) => match admission.ensure_root_authority().await {
                     Ok(()) => Ok(receipt),
                     Err(_) => Err(scripture::DriverError::Unavailable),
                 },
@@ -161,7 +160,7 @@ impl HaServingSession {
 
     /// Flushes only while this process remains the current effective writer.
     pub async fn flush(&self) -> Result<(), HaAdmissionError> {
-        self.admission.ensure_effective().await?;
+        self.admission.ensure_root_authority().await?;
         self.runtime.flush().await?;
         Ok(())
     }
@@ -172,7 +171,6 @@ impl HaServingSession {
 pub async fn bootstrap_and_serve<C, T>(
     coordinator: &AuthorityCoordinator,
     foundation: &HolylogJournalFoundation,
-    store: Arc<dyn ServingAuthorityStore>,
     key: AuthorityKey,
     initial_term: WriterTerm,
     runtime_config: VerseRuntimeConfig,
@@ -198,7 +196,6 @@ where
         .await?;
     activate_after_serving_cas(
         foundation,
-        store,
         key,
         record,
         runtime_config,
@@ -215,7 +212,6 @@ where
 pub async fn promote_and_serve<C, T>(
     coordinator: &AuthorityCoordinator,
     foundation: &HolylogJournalFoundation,
-    store: Arc<dyn ServingAuthorityStore>,
     key: AuthorityKey,
     candidate_term: WriterTerm,
     expected: JournalGenerationRef,
@@ -242,7 +238,6 @@ where
         .await?;
     activate_after_serving_cas(
         foundation,
-        store,
         key,
         record,
         runtime_config,
@@ -257,7 +252,6 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn activate_after_serving_cas<C, T>(
     _foundation: &HolylogJournalFoundation,
-    store: Arc<dyn ServingAuthorityStore>,
     key: AuthorityKey,
     record: ServingAuthorityRecord,
     runtime_config: VerseRuntimeConfig,
@@ -283,7 +277,6 @@ where
     }
 
     let gate = evaluate_authority_gate(
-        store.as_ref(),
         key,
         Arc::clone(&register),
         Arc::clone(&resolver) as Arc<dyn LogletResolver>,
@@ -310,7 +303,6 @@ where
 
     // Fresh gate after runtime install.
     let gate = evaluate_authority_gate(
-        store.as_ref(),
         key,
         Arc::clone(&register),
         Arc::clone(&resolver) as Arc<dyn LogletResolver>,
@@ -328,7 +320,6 @@ where
 
     Ok(HaServingSession {
         admission: AuthorityAdmission {
-            store,
             key,
             register,
             resolver,

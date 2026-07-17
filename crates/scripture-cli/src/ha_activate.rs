@@ -2,51 +2,26 @@
 //!
 //! Holylog soft-sequencer writables cannot cross process exit, so bootstrap /
 //! promote under `ha.mode: serving-authority` remain in-process and then open
-//! ingress on the same process.
+//! ingress on the same process. Authority is the VirtualLog root fence only.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use holylog::virtual_log::LogletResolver;
 use scripture::serving_authority::{AuthorityKey, JournalGenerationRef, RouteHint, WriterTerm};
-use scripture_k8s_authority::{KubernetesServingAuthorityStore, into_shared_store};
 use scripture_runtime::{
     HaServingSession, HolylogJournalFoundation, NodeIdentity, RawLinesConfig, bootstrap_and_serve,
     promote_and_serve, serve_ha_raw_lines_connection, status_body, system_clocks,
 };
 use scripture_service::{
     AuthorityCoordinator, JournalFoundationTransition, SecureTransitionIdGenerator,
-    ServingAuthorityStore,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::assemble::{self, AssembledNode};
-use crate::config::{AuthorityStoreConfig, ScriptureConfig};
-
-/// Builds the durable Kubernetes store selected by config.
-pub async fn assemble_authority_store(
-    config: &ScriptureConfig,
-) -> Result<Arc<dyn ServingAuthorityStore>, Box<dyn Error>> {
-    match &config.ha.authority_store {
-        AuthorityStoreConfig::Memory => Err(
-            "ha.authority_store.kind: memory is test/in-process only; CLI Serving-Authority mode \
-             requires kind: kubernetes"
-                .into(),
-        ),
-        AuthorityStoreConfig::Kubernetes {
-            namespace,
-            object_name,
-        } => {
-            let store = KubernetesServingAuthorityStore::try_default(
-                namespace.clone(),
-                object_name.clone(),
-            )
-            .await?;
-            Ok(into_shared_store(store))
-        }
-    }
-}
+use crate::config::ScriptureConfig;
 
 fn authority_key(config: &ScriptureConfig) -> Result<AuthorityKey, Box<dyn Error>> {
     let verse = config.verse_runtime_config()?;
@@ -87,12 +62,12 @@ pub async fn bootstrap_and_serve_cli(
     config: ScriptureConfig,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let store = assemble_authority_store(&config).await?;
     let assembled = assemble::assemble_supervisor(&config)?;
     let key = authority_key(&config)?;
     let foundation = Arc::new(build_foundation(&assembled, key));
     let coordinator = AuthorityCoordinator::new(
-        Arc::clone(&store),
+        Arc::clone(&assembled.register),
+        Arc::clone(&assembled.resolver) as Arc<dyn LogletResolver>,
         Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
         Arc::new(SecureTransitionIdGenerator::new()),
         assembled.node.identity().owner_id,
@@ -103,7 +78,6 @@ pub async fn bootstrap_and_serve_cli(
     let session = bootstrap_and_serve(
         &coordinator,
         foundation.as_ref(),
-        store,
         key,
         term,
         config.verse_runtime_config()?,
@@ -129,13 +103,13 @@ pub async fn promote_and_serve_cli(
     config: ScriptureConfig,
     candidate_term: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let store = assemble_authority_store(&config).await?;
     let assembled = assemble::assemble_supervisor(&config)?;
     let key = authority_key(&config)?;
     let expected = observe_expected_generation(&assembled).await?;
     let foundation = Arc::new(build_foundation(&assembled, key));
     let coordinator = AuthorityCoordinator::new(
-        Arc::clone(&store),
+        Arc::clone(&assembled.register),
+        Arc::clone(&assembled.resolver) as Arc<dyn LogletResolver>,
         Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
         Arc::new(SecureTransitionIdGenerator::new()),
         assembled.node.identity().owner_id,
@@ -146,7 +120,6 @@ pub async fn promote_and_serve_cli(
     let session = promote_and_serve(
         &coordinator,
         foundation.as_ref(),
-        store,
         key,
         term,
         expected,
