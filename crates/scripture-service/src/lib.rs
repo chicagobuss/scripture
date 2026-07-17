@@ -20,6 +20,7 @@ mod canon_route;
 mod canon_transition;
 mod chunk_service;
 pub mod reconcile;
+pub mod runtime_observation;
 mod scripture_node;
 mod verse_runtime;
 
@@ -53,6 +54,10 @@ pub use chunk_service::{
 pub use reconcile::{
     OperatorQuestion, PlannedAction, ReconciliationState, RecoveryAction, RecoveryConfidence,
     RecoveryFacts, RecoveryFinding, RecoveryMode, RecoveryPlan, plan as plan_recovery,
+};
+pub use runtime_observation::{
+    EventSequencer, NoopRuntimeObserver, OperationContext, RuntimeObservationSession,
+    RuntimeObserver,
 };
 pub use scripture_node::{
     ScriptureNode, ScriptureNodeConfigError, ScriptureNodeError, ScriptureNodeHandoffError,

@@ -13,6 +13,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+blake3.workspace = true
 bytes.workspace = true
 futures.workspace = true
 holylog.workspace = true
@@ -24,6 +25,7 @@ scripture = { path = "../scripture" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
 serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
