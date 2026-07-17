@@ -16,7 +16,8 @@ holylog.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+futures.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
