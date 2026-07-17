@@ -36,13 +36,11 @@ fn writer_term() -> WriterTerm {
 }
 
 fn sample_gen_ref() -> JournalGenerationRef {
-    let loglet_id = LogletId::new("active-loglet-id").expect("id");
-    JournalGenerationRef {
-        virtual_log_revision: 5,
-        active_loglet_id: loglet_id,
-        active_start: 100,
-        canon_fence_digest: [7u8; 32],
-    }
+    JournalGenerationRef::from_active_generation(
+        5,
+        LogletId::new("active-loglet-id").expect("id"),
+        100,
+    )
 }
 
 fn sample_intent() -> TransitionIntent {
@@ -143,29 +141,15 @@ fn test_effective_writer_predicate_and_adversarial_mismatches() {
         verse_id: verse(),
     };
 
-    let owned = CanonOwner::Owned {
-        owner_id: owner(),
-        endpoint: endpoint(),
-        sequencer: None,
-        writer_term: Some(writer_term()),
-    };
-    let fence = CanonFence::new(5, journal(), verse(), owned);
-    let app_fence = fence.encode();
-
-    let state = VirtualLogState {
-        revision: 5,
-        generations: vec![GenerationDescriptor {
-            loglet_id: LogletId::new("active-loglet-id").expect("id"),
-            start: 100,
-        }],
-        application_fence: app_fence,
-    };
-
-    let gen_ref = JournalGenerationRef::from_virtual_log_state(&state).expect("build ref");
+    let gen_ref = JournalGenerationRef::from_active_generation(
+        5,
+        LogletId::new("active-loglet-id").expect("id"),
+        100,
+    );
     let auth = WriterAuthority {
         owner_id: owner(),
         writer_term: writer_term(),
-        generation_ref: gen_ref,
+        generation_ref: gen_ref.clone(),
     };
 
     let record = ServingAuthorityRecord::new(
@@ -175,6 +159,16 @@ fn test_effective_writer_predicate_and_adversarial_mismatches() {
             route_hint: route_hint(),
         },
     );
+    let app_fence = record.encode_application_fence().expect("fence");
+
+    let state = VirtualLogState {
+        revision: 5,
+        generations: vec![GenerationDescriptor {
+            loglet_id: LogletId::new("active-loglet-id").expect("id"),
+            start: 100,
+        }],
+        application_fence: app_fence,
+    };
 
     // Active matches and writable, should be true
     assert!(record.is_effective_writer(&state, owner(), true, false));
@@ -189,74 +183,117 @@ fn test_effective_writer_predicate_and_adversarial_mismatches() {
     let other_owner = OwnerId::from_bytes(*b"other-owner-id!!");
     assert!(!record.is_effective_writer(&state, other_owner, true, false));
 
-    // mismatched journal_id in fence
-    let bad_j_fence = CanonFence::new(
-        5,
-        JournalId::from_bytes(*b"other-journal-id"),
-        verse(),
-        CanonOwner::Owned {
-            owner_id: owner(),
-            endpoint: endpoint(),
-            sequencer: None,
-            writer_term: Some(writer_term()),
+    // mismatched journal_id in root fence
+    let bad_key = AuthorityKey {
+        journal_id: JournalId::from_bytes(*b"other-journal-id"),
+        verse_id: verse(),
+    };
+    let bad_j_record = ServingAuthorityRecord::new(
+        bad_key,
+        AuthorityState::Serving {
+            authority: WriterAuthority {
+                owner_id: owner(),
+                writer_term: writer_term(),
+                generation_ref: gen_ref.clone(),
+            },
+            route_hint: route_hint(),
         },
     );
     let bad_j_state = VirtualLogState {
-        application_fence: bad_j_fence.encode(),
+        application_fence: bad_j_record.encode_application_fence().expect("fence"),
         ..state.clone()
     };
     assert!(!record.is_effective_writer(&bad_j_state, owner(), true, false));
 
-    // mismatched verse_id in fence
-    let bad_v_fence = CanonFence::new(
-        5,
-        journal(),
-        VerseId::from_bytes(*b"other-verse-id!!"),
-        CanonOwner::Owned {
-            owner_id: owner(),
-            endpoint: endpoint(),
-            sequencer: None,
-            writer_term: Some(writer_term()),
+    // mismatched verse_id in root fence
+    let bad_v_key = AuthorityKey {
+        journal_id: journal(),
+        verse_id: VerseId::from_bytes(*b"other-verse-id!!"),
+    };
+    let bad_v_record = ServingAuthorityRecord::new(
+        bad_v_key,
+        AuthorityState::Serving {
+            authority: WriterAuthority {
+                owner_id: owner(),
+                writer_term: writer_term(),
+                generation_ref: gen_ref.clone(),
+            },
+            route_hint: route_hint(),
         },
     );
     let bad_v_state = VirtualLogState {
-        application_fence: bad_v_fence.encode(),
+        application_fence: bad_v_record.encode_application_fence().expect("fence"),
         ..state.clone()
     };
     assert!(!record.is_effective_writer(&bad_v_state, owner(), true, false));
 
-    // stale revision, should be false
+    // stale revision ⇒ generation binding mismatch
     let mut stale_state = state.clone();
     stale_state.revision = 6;
     assert!(!record.is_effective_writer(&stale_state, owner(), true, false));
 
-    // adversarial term mismatch
-    let bad_term_fence = CanonFence::new(
-        5,
-        journal(),
-        verse(),
-        CanonOwner::Owned {
-            owner_id: owner(),
-            endpoint: endpoint(),
-            sequencer: None,
-            writer_term: Some(WriterTerm::new(99).expect("valid term")),
+    // adversarial term mismatch in root fence
+    let bad_term_record = ServingAuthorityRecord::new(
+        key,
+        AuthorityState::Serving {
+            authority: WriterAuthority {
+                owner_id: owner(),
+                writer_term: WriterTerm::new(99).expect("valid term"),
+                generation_ref: gen_ref,
+            },
+            route_hint: route_hint(),
         },
     );
     let bad_term_state = VirtualLogState {
-        application_fence: bad_term_fence.encode(),
+        application_fence: bad_term_record.encode_application_fence().expect("fence"),
         ..state.clone()
     };
     assert!(!record.is_effective_writer(&bad_term_state, owner(), true, false));
+
+    // Transitioning grants no ACK entitlement
+    let transitioning = ServingAuthorityRecord::new(
+        key,
+        AuthorityState::Transitioning {
+            intent: sample_intent(),
+        },
+    );
+    let transitioning_state = VirtualLogState {
+        application_fence: transitioning.encode_application_fence().expect("fence"),
+        ..state.clone()
+    };
+    assert!(!transitioning.is_effective_writer(&transitioning_state, owner(), true, false));
 
     // active_start mismatch
     let bad_start_state = VirtualLogState {
         generations: vec![GenerationDescriptor {
             loglet_id: LogletId::new("active-loglet-id").expect("id"),
-            start: 999, // mismatched active_start
+            start: 999,
         }],
         ..state.clone()
     };
     assert!(!record.is_effective_writer(&bad_start_state, owner(), true, false));
+}
+
+#[test]
+fn serving_publication_rejects_transitioning_bytes_for_successor() {
+    // Typed API is Serving-only; Transitioning cannot be constructed as ServingPublication.
+    let key = AuthorityKey {
+        journal_id: journal(),
+        verse_id: verse(),
+    };
+    let publication = scripture::ServingPublication::new(
+        key,
+        WriterAuthority {
+            owner_id: owner(),
+            writer_term: writer_term(),
+            generation_ref: sample_gen_ref(),
+        },
+        route_hint(),
+    )
+    .expect("serving");
+    let fence = publication.encode_application_fence().expect("encode");
+    let decoded = ServingAuthorityRecord::decode_application_fence(&fence).expect("decode");
+    assert!(matches!(decoded.state, AuthorityState::Serving { .. }));
 }
 
 #[test]

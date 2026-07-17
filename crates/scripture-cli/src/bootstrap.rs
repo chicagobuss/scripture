@@ -1,7 +1,7 @@
 //! `scripture bootstrap` — greenfield publication.
 //!
 //! Legacy mode: one-shot Canon publication, then exit.
-//! Serving-Authority + kubernetes: long-lived `bootstrap_and_serve` in-process.
+//! Serving-Authority mode: long-lived `bootstrap_and_serve` in-process (root fence).
 
 use std::error::Error;
 
@@ -9,7 +9,7 @@ use holylog::virtual_log::LogletId;
 use scripture_runtime::SupervisorError;
 
 use crate::assemble;
-use crate::config::{AuthorityStoreConfig, HaMode, ScriptureConfig};
+use crate::config::{HaMode, ScriptureConfig};
 use crate::ha_activate;
 
 pub async fn bootstrap(
@@ -18,18 +18,7 @@ pub async fn bootstrap(
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
     if config.ha.mode == HaMode::ServingAuthority {
-        match &config.ha.authority_store {
-            AuthorityStoreConfig::Kubernetes { .. } => {
-                return ha_activate::bootstrap_and_serve_cli(config, initial_term).await;
-            }
-            AuthorityStoreConfig::Memory => {
-                return Err(
-                    "refusing bootstrap under ha.mode: serving-authority with kind: memory — \
-                     CLI requires ha.authority_store.kind: kubernetes"
-                        .into(),
-                );
-            }
-        }
+        return ha_activate::bootstrap_and_serve_cli(config, initial_term).await;
     }
 
     let loglet_id = loglet_id.ok_or("bootstrap requires --loglet-id ID in legacy mode")?;

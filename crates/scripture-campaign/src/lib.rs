@@ -44,7 +44,9 @@ use holylog_object_store::{ObjectStoreExclusiveClaim, ObjectStoreMetrics, WriteP
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::ObjectStore;
 use object_store::path::Path;
-use scripture::serving_authority::{AuthorityKey, AuthorityState, RouteHint, WriterTerm};
+use scripture::serving_authority::{
+    AuthorityKey, AuthorityState, RouteHint, ServingAuthorityRecord, WriterTerm,
+};
 use scripture::{
     CanonFence, CanonOwner, ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId,
     Receipt, Record, RecoveryBound, Submission, SystemClock, SystemTimer, VerseId, WriterId,
@@ -52,8 +54,7 @@ use scripture::{
 use scripture_service::virtuallog_test_support::VirtualLogHarness;
 use scripture_service::{
     AuthorityCoordinator, CanonTransitionOutcome, DeterministicTransitionIdGenerator,
-    InMemoryServingAuthorityStore, JournalFoundationTransition, ServingAuthorityStore,
-    VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig,
+    JournalFoundationTransition, VerseHandoffRequest, VerseRuntime, VerseRuntimeConfig,
 };
 
 use scripture_runtime::{
@@ -549,17 +550,32 @@ async fn membership_json(
     }
 }
 
-async fn authority_json(store: &Arc<dyn ServingAuthorityStore>) -> serde_json::Value {
-    match store.observe(key()).await {
-        Ok(Some(snapshot)) => match &snapshot.record.state {
-            AuthorityState::Serving { authority, .. } => serde_json::json!({
-                "state": "serving",
-                "generation_revision": authority.generation_ref.virtual_log_revision,
-            }),
-            AuthorityState::Transitioning { .. } => serde_json::json!({ "state": "transitioning" }),
-            other => serde_json::json!({ "state": format!("{other:?}") }),
-        },
-        Ok(None) => serde_json::json!({ "state": "absent" }),
+async fn authority_json(
+    register: Arc<dyn ConditionalRegister>,
+    resolver: Arc<dyn LogletResolver>,
+) -> serde_json::Value {
+    let log = VirtualLog::new(register, resolver);
+    match log.observe_membership().await {
+        Ok(observed) => {
+            if observed.state.application_fence.as_bytes().is_empty() {
+                return serde_json::json!({ "state": "absent" });
+            }
+            match ServingAuthorityRecord::decode_application_fence(
+                &observed.state.application_fence,
+            ) {
+                Ok(record) => match &record.state {
+                    AuthorityState::Serving { authority, .. } => serde_json::json!({
+                        "state": "serving",
+                        "generation_revision": authority.generation_ref.virtual_log_revision,
+                    }),
+                    AuthorityState::Transitioning { .. } => {
+                        serde_json::json!({ "state": "transitioning" })
+                    }
+                    other => serde_json::json!({ "state": format!("{other:?}") }),
+                },
+                Err(error) => serde_json::json!({ "error": error.to_string() }),
+            }
+        }
         Err(error) => serde_json::json!({ "error": error.to_string() }),
     }
 }
@@ -836,7 +852,6 @@ fn build_node(
     register: Arc<dyn ConditionalRegister>,
     parts: Arc<dyn PartsFactory>,
     claims: Arc<dyn ExclusiveClaimStore>,
-    store: Arc<dyn ServingAuthorityStore>,
 ) -> Result<NodeBundle, CampaignError> {
     let identity = NodeIdentity {
         owner_id: owner,
@@ -854,7 +869,8 @@ fn build_node(
         FOUNDATION_K,
     ));
     let coordinator = AuthorityCoordinator::new(
-        Arc::clone(&store),
+        Arc::clone(&register),
+        Arc::clone(&resolver) as Arc<dyn LogletResolver>,
         Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
         Arc::new(DeterministicTransitionIdGenerator::new()),
         owner,
@@ -888,7 +904,6 @@ async fn run_wedged_payload(
     let writer_faults = Arc::new(FaultController::new());
     let parts = backend.tracing_parts_factory(Arc::clone(&writer_faults), foundation_trace);
     let claims = backend.claims()?;
-    let store: Arc<dyn ServingAuthorityStore> = Arc::new(InMemoryServingAuthorityStore::default());
 
     let a = build_node(
         owner_a(),
@@ -896,7 +911,6 @@ async fn run_wedged_payload(
         Arc::clone(&register),
         Arc::clone(&parts),
         Arc::clone(&claims),
-        Arc::clone(&store),
     )?;
     let b = build_node(
         owner_b(),
@@ -904,13 +918,11 @@ async fn run_wedged_payload(
         Arc::clone(&register),
         Arc::clone(&parts),
         Arc::clone(&claims),
-        Arc::clone(&store),
     )?;
 
     let a_session = bootstrap_and_serve(
         &a.coordinator,
         &a.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(1).map_err(|error| CampaignError::Scenario(format!("term: {error}")))?,
         config(owner_a()),
@@ -975,7 +987,6 @@ async fn run_wedged_payload(
     let b_session = promote_and_serve(
         &b.coordinator,
         &b.foundation,
-        Arc::clone(&store),
         key(),
         WriterTerm::new(2).map_err(|error| CampaignError::Scenario(format!("term: {error}")))?,
         expected,
@@ -1006,6 +1017,10 @@ async fn run_wedged_payload(
         Arc::clone(&b.resolver) as Arc<dyn LogletResolver>,
     )
     .await;
-    let final_authority = authority_json(&store).await;
+    let final_authority = authority_json(
+        Arc::clone(&register),
+        Arc::clone(&b.resolver) as Arc<dyn LogletResolver>,
+    )
+    .await;
     Ok((sink.events(), final_root, final_authority))
 }

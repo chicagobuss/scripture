@@ -1,19 +1,18 @@
-//! Asynchronous transport-neutral `AuthorityCoordinator` and recovery model.
+//! One-record `AuthorityCoordinator`: VirtualLog root fence is the only durable authority.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use holylog::virtual_log::{
+    ConditionalRegister, FenceUpdate, LogletResolver, VirtualLog, VirtualLogError,
+};
 use scripture::canon::OwnerId;
 use scripture::serving_authority::{
     AuthorityKey, AuthorityState, FoundationPrecondition, JournalGenerationRef, RouteHint,
     ServingAuthorityRecord, TransitionId, TransitionIntent, TransitionKind, WriterAuthority,
     WriterTerm,
-};
-
-use crate::serving_authority_store::{
-    CasOutcome, ServingAuthorityStore, ServingAuthorityStoreError,
 };
 
 pub type CoordinatorFuture<'a, T> =
@@ -37,7 +36,6 @@ pub enum TransitionIdGenerationError {
 }
 
 /// A cryptographically secure, collision-resistant TransitionId generator.
-/// Uses the platform's secure operating-system randomness source.
 #[derive(Debug, Default)]
 pub struct SecureTransitionIdGenerator;
 
@@ -134,20 +132,13 @@ pub enum TransitionClassification {
 
 /// Fault ports for driving the Journal Foundation during cutover.
 pub trait JournalFoundationTransition: Send + Sync {
-    /// Drives the transition on the Journal Foundation:
-    /// - seals the current active generation loglet
-    /// - provisions the new loglet
-    /// - publishes the new VirtualLog state containing the matching v3 CanonFence.
+    /// Drives seal → provision → one root CAS of membership + typed Serving fence.
     ///
-    /// # Safety and Precondition
-    ///
-    /// The transition MUST atomically validate that the current Foundation state matches `precondition`
-    /// before publishing the successor generation.
+    /// `publication` is Serving-only — Transitioning cannot be published here.
     fn drive_foundation_transition(
         &self,
         key: AuthorityKey,
-        target_owner_id: OwnerId,
-        next_term: WriterTerm,
+        publication: scripture::ServingPublication,
         precondition: FoundationPrecondition,
     ) -> Pin<
         Box<
@@ -174,9 +165,9 @@ pub trait JournalFoundationTransition: Send + Sync {
 /// Errors exposed by the `AuthorityCoordinator` promotion and recovery loop.
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
-    /// The ServingAuthorityStore returned a CAS conflict or read failure.
-    #[error("ServingAuthorityStore error: {0}")]
-    Store(#[from] ServingAuthorityStoreError),
+    /// The VirtualLog root register could not be observed or updated.
+    #[error("VirtualLog root error: {0}")]
+    Root(#[from] VirtualLogError),
 
     /// A secure transition identity could not be created before starting a transition.
     #[error(transparent)]
@@ -209,9 +200,24 @@ pub enum CoordinatorError {
     },
 }
 
-/// Transport-neutral coordinator that orchestrates the Serving Authority lifecycle.
+/// Observed root authority decoded from the VirtualLog application fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservedRootAuthority {
+    /// Register is uninitialized (no membership).
+    Uninitialized,
+    /// Membership exists but fence bytes are empty / undecodable as Scripture authority.
+    AbsentOrMalformed {
+        /// Optional decode failure detail.
+        message: Option<String>,
+    },
+    /// Decoded Scripture authority record from the root fence.
+    Record(Box<ServingAuthorityRecord>),
+}
+
+/// Transport-neutral coordinator that orchestrates one-record Serving Authority.
 pub struct AuthorityCoordinator {
-    store: Arc<dyn ServingAuthorityStore>,
+    register: Arc<dyn ConditionalRegister>,
+    resolver: Arc<dyn LogletResolver>,
     foundation: Arc<dyn JournalFoundationTransition>,
     id_generator: Arc<dyn TransitionIdGenerator>,
     local_owner_id: OwnerId,
@@ -229,17 +235,19 @@ impl std::fmt::Debug for AuthorityCoordinator {
 }
 
 impl AuthorityCoordinator {
-    /// Constructs an AuthorityCoordinator.
+    /// Constructs an AuthorityCoordinator bound to one VirtualLog root register.
     #[must_use]
     pub fn new(
-        store: Arc<dyn ServingAuthorityStore>,
+        register: Arc<dyn ConditionalRegister>,
+        resolver: Arc<dyn LogletResolver>,
         foundation: Arc<dyn JournalFoundationTransition>,
         id_generator: Arc<dyn TransitionIdGenerator>,
         local_owner_id: OwnerId,
         route_hint: RouteHint,
     ) -> Self {
         Self {
-            store,
+            register,
+            resolver,
             foundation,
             id_generator,
             local_owner_id,
@@ -247,7 +255,35 @@ impl AuthorityCoordinator {
         }
     }
 
+    fn virtual_log(&self) -> VirtualLog {
+        VirtualLog::new(Arc::clone(&self.register), Arc::clone(&self.resolver))
+    }
+
+    /// Freshly observes and decodes the root application fence.
+    pub async fn observe_root_authority(&self) -> Result<ObservedRootAuthority, CoordinatorError> {
+        match self.virtual_log().observe_membership().await {
+            Err(VirtualLogError::Uninitialized) => Ok(ObservedRootAuthority::Uninitialized),
+            Err(error) => Err(CoordinatorError::Root(error)),
+            Ok(observed) => {
+                if observed.state.application_fence.as_bytes().is_empty() {
+                    return Ok(ObservedRootAuthority::AbsentOrMalformed { message: None });
+                }
+                match ServingAuthorityRecord::decode_application_fence(
+                    &observed.state.application_fence,
+                ) {
+                    Ok(record) => Ok(ObservedRootAuthority::Record(Box::new(record))),
+                    Err(error) => Ok(ObservedRootAuthority::AbsentOrMalformed {
+                        message: Some(error.to_string()),
+                    }),
+                }
+            }
+        }
+    }
+
     /// Drives the operator-requested recovery-promotion flow.
+    ///
+    /// Empty: foundation bootstrap publishes membership + Serving in one root CAS.
+    /// Expected: intent fence CAS (Transitioning) → foundation seal/provision/Serving CAS.
     pub async fn promote(
         &self,
         key: AuthorityKey,
@@ -255,845 +291,410 @@ impl AuthorityCoordinator {
         precondition: FoundationPrecondition,
         eligibility: LocalServingEligibility,
     ) -> Result<ServingAuthorityRecord, CoordinatorError> {
-        // Validation: Local writable/sealed check
         if !eligibility.permits_serving() {
             return Err(CoordinatorError::Unwritable);
         }
 
-        // 1. Observe Serving Authority.
-        let snapshot_opt = self.store.observe(key).await?;
-
-        // 2. Validate current effective authority, expected JournalGenerationRef, and next WriterTerm.
-        let (expected_version, next_state) = match &snapshot_opt {
-            None => {
-                let intent = TransitionIntent {
-                    transition_id: self.id_generator.generate()?,
-                    kind: TransitionKind::RecoveryPromotion,
-                    precondition: precondition.clone(),
-                    candidate_owner_id: self.local_owner_id,
-                    next_writer_term: candidate_term,
-                };
-                let next_state = AuthorityState::Transitioning { intent };
-                (None, next_state)
+        match &precondition {
+            FoundationPrecondition::Empty => {
+                self.promote_empty(key, candidate_term, eligibility).await
             }
-            Some(snapshot) => {
-                match &snapshot.record.state {
-                    AuthorityState::Serving { authority, .. } => {
-                        if authority.writer_term.get() >= candidate_term.get() {
-                            return Err(CoordinatorError::InvalidInput {
-                                message: format!(
-                                    "candidate term {candidate_term} is not strictly greater than serving term {}",
-                                    authority.writer_term
-                                ),
-                            });
-                        }
-                        match &precondition {
-                            FoundationPrecondition::Empty => {
-                                return Err(CoordinatorError::InvalidInput {
-                                    message: "cannot use Empty precondition when replacing an active Serving state".to_string(),
-                                });
-                            }
-                            FoundationPrecondition::Expected(expected_ref) => {
-                                if &authority.generation_ref != expected_ref {
-                                    return Err(CoordinatorError::InvalidInput {
-                                        message: "current serving generation ref does not match expected precondition facts".to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    AuthorityState::Transitioning { .. } => {
-                        return Err(CoordinatorError::Conflict {
-                            message: "a live transition is already in progress".to_string(),
-                        });
-                    }
-                    AuthorityState::ReconciliationRequired { .. } => {
-                        return Err(CoordinatorError::Conflict {
-                            message: "record is in ReconciliationRequired state and requires manual reconciliation".to_string(),
-                        });
-                    }
-                    AuthorityState::Unassigned => {}
-                }
-
-                let intent = TransitionIntent {
-                    transition_id: self.id_generator.generate()?,
-                    kind: TransitionKind::RecoveryPromotion,
-                    precondition: precondition.clone(),
-                    candidate_owner_id: self.local_owner_id,
-                    next_writer_term: candidate_term,
-                };
-                let next_state = AuthorityState::Transitioning { intent };
-                (Some(snapshot.version.clone()), next_state)
+            FoundationPrecondition::Expected(_) => {
+                self.promote_expected(key, candidate_term, precondition, eligibility)
+                    .await
             }
-        };
-
-        let active_intent = match &next_state {
-            AuthorityState::Transitioning { intent } => intent.clone(),
-            _ => unreachable!(),
-        };
-
-        // 3. CAS the authority record to Transitioning. This halts client appends.
-        let next_record = ServingAuthorityRecord::new(key, next_state.clone());
-        let cas_trans_res = self
-            .store
-            .compare_and_swap(key, expected_version, next_record.clone())
-            .await;
-
-        let trans_snapshot_version = match cas_trans_res {
-            Ok(CasOutcome::Applied) => {
-                let snap =
-                    self.store
-                        .observe(key)
-                        .await?
-                        .ok_or_else(|| CoordinatorError::Conflict {
-                            message: "transitioning record vanished".to_string(),
-                        })?;
-
-                // Safety Reread check: Verify that the TransitionIntent is exactly ours!
-                if let AuthorityState::Transitioning { intent } = &snap.record.state {
-                    if *intent != active_intent {
-                        return Err(CoordinatorError::Conflict {
-                            message: "concurrent transition overrode intent immediately after CAS"
-                                .to_string(),
-                        });
-                    }
-                } else {
-                    return Err(CoordinatorError::Conflict {
-                        message: "concurrent update overrode intent immediately after CAS"
-                            .to_string(),
-                    });
-                }
-
-                snap.version
-            }
-            Ok(CasOutcome::Conflict) => {
-                return Err(CoordinatorError::Conflict {
-                    message: "CAS to Transitioning failed: concurrent update".to_string(),
-                });
-            }
-            Err(ServingAuthorityStoreError::Indeterminate(e)) => {
-                // Perform a linearizable read check
-                let snap = self.store.observe(key).await?;
-                if let Some(s) = snap {
-                    if let AuthorityState::Transitioning { intent } = &s.record.state {
-                        if *intent == active_intent {
-                            s.version
-                        } else {
-                            return Err(CoordinatorError::Conflict {
-                                message: format!(
-                                    "indeterminate CAS write did not establish planned transition: {e}"
-                                ),
-                            });
-                        }
-                    } else {
-                        return Err(CoordinatorError::Conflict {
-                            message: format!(
-                                "indeterminate CAS write did not establish planned transition: {e}"
-                            ),
-                        });
-                    }
-                } else {
-                    return Err(CoordinatorError::Conflict {
-                        message: format!(
-                            "indeterminate CAS write did not establish planned transition: {e}"
-                        ),
-                    });
-                }
-            }
-            Err(e) => return Err(CoordinatorError::Store(e)),
-        };
-
-        // 4. Drive the existing lawful Journal Foundation transition
-        let foundation_res = self
-            .foundation
-            .drive_foundation_transition(
-                key,
-                self.local_owner_id,
-                candidate_term,
-                precondition.clone(),
-            )
-            .await;
-
-        let successor_gen_ref = match foundation_res {
-            Ok(gen_ref) => gen_ref,
-            Err(e) => {
-                let rec_state = AuthorityState::ReconciliationRequired {
-                    intent: active_intent.clone(),
-                    observed_generation: None,
-                };
-                let rec_record = ServingAuthorityRecord::new(key, rec_state);
-                let _ = self
-                    .store
-                    .compare_and_swap(key, Some(trans_snapshot_version), rec_record)
-                    .await;
-                return Err(CoordinatorError::FoundationFailed(e));
-            }
-        };
-
-        // 5. Build Serving state
-        let auth = WriterAuthority {
-            owner_id: self.local_owner_id,
-            writer_term: candidate_term,
-            generation_ref: successor_gen_ref.clone(),
-        };
-        let serving_state = AuthorityState::Serving {
-            authority: auth,
-            route_hint: self.route_hint.clone(),
-        };
-        let final_record = ServingAuthorityRecord::new(key, serving_state);
-
-        // 6. CAS authority record to Serving
-        let cas_serving_res = self
-            .store
-            .compare_and_swap(key, Some(trans_snapshot_version), final_record.clone())
-            .await;
-
-        match cas_serving_res {
-            Ok(CasOutcome::Applied) => {}
-            Ok(CasOutcome::Conflict) => {
-                return Err(CoordinatorError::Conflict {
-                    message: "CAS to Serving failed: concurrent reconfigurer won".to_string(),
-                });
-            }
-            Err(ServingAuthorityStoreError::Indeterminate(e)) => {
-                let snap = self.store.observe(key).await?;
-                if let Some(s) = snap {
-                    if s.record == final_record {
-                        // Succeeded!
-                    } else {
-                        return Err(CoordinatorError::Conflict {
-                            message: format!(
-                                "indeterminate CAS write did not establish Serving state: {e}"
-                            ),
-                        });
-                    }
-                } else {
-                    return Err(CoordinatorError::Conflict {
-                        message: format!(
-                            "indeterminate CAS write did not establish Serving state: {e}"
-                        ),
-                    });
-                }
-            }
-            Err(e) => return Err(CoordinatorError::Store(e)),
         }
-
-        // 7. Require a final re-observation before we are officially serving
-        let final_snapshot =
-            self.store
-                .observe(key)
-                .await?
-                .ok_or_else(|| CoordinatorError::Conflict {
-                    message: "serving record vanished".to_string(),
-                })?;
-
-        if final_snapshot.record != final_record {
-            return Err(CoordinatorError::ContenderConflict);
-        }
-
-        Ok(final_snapshot.record)
     }
 
-    /// Reconciles an in-progress or failed transition by inspecting the durable
-    /// Foundation state and applying the correct fail-closed resolution.
+    async fn promote_empty(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+        _eligibility: LocalServingEligibility,
+    ) -> Result<ServingAuthorityRecord, CoordinatorError> {
+        match self.observe_root_authority().await? {
+            ObservedRootAuthority::Uninitialized => {}
+            ObservedRootAuthority::Record(record) => {
+                return Err(CoordinatorError::InvalidInput {
+                    message: format!(
+                        "Empty precondition requires uninitialized root; observed {:?}",
+                        state_tag(&record.state)
+                    ),
+                });
+            }
+            ObservedRootAuthority::AbsentOrMalformed { message } => {
+                return Err(CoordinatorError::InvalidInput {
+                    message: format!(
+                        "Empty precondition requires uninitialized root; fence present ({})",
+                        message.unwrap_or_else(|| "undecodable".into())
+                    ),
+                });
+            }
+        }
+
+        let publication = self.provisional_publication(key, candidate_term)?;
+        let generation = self
+            .foundation
+            .drive_foundation_transition(key, publication, FoundationPrecondition::Empty)
+            .await
+            .map_err(CoordinatorError::FoundationFailed)?;
+
+        self.require_local_serving(key, candidate_term, &generation)
+            .await
+    }
+
+    async fn promote_expected(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+        precondition: FoundationPrecondition,
+        _eligibility: LocalServingEligibility,
+    ) -> Result<ServingAuthorityRecord, CoordinatorError> {
+        let FoundationPrecondition::Expected(expected_ref) = &precondition else {
+            unreachable!("promote_expected only for Expected");
+        };
+
+        let virtual_log = self.virtual_log();
+        let observed = virtual_log.observe_membership().await?;
+
+        let current =
+            ServingAuthorityRecord::decode_application_fence(&observed.state.application_fence)
+                .map_err(|error| CoordinatorError::InvalidInput {
+                    message: format!("root fence is not a Scripture authority record: {error}"),
+                })?;
+
+        if current.key != key {
+            return Err(CoordinatorError::InvalidInput {
+                message: "root authority key does not match promote key".into(),
+            });
+        }
+
+        match &current.state {
+            AuthorityState::Serving { authority, .. } => {
+                if authority.writer_term.get() >= candidate_term.get() {
+                    return Err(CoordinatorError::InvalidInput {
+                        message: format!(
+                            "candidate term {candidate_term} is not strictly greater than serving term {}",
+                            authority.writer_term
+                        ),
+                    });
+                }
+                if &authority.generation_ref != expected_ref {
+                    return Err(CoordinatorError::InvalidInput {
+                        message:
+                            "current serving generation ref does not match expected precondition"
+                                .into(),
+                    });
+                }
+            }
+            AuthorityState::Transitioning { intent }
+                if intent.candidate_owner_id == self.local_owner_id
+                    && intent.next_writer_term == candidate_term
+                    && intent.precondition == precondition =>
+            {
+                // Durable intent already ours — continue forward-only from foundation.
+                return self
+                    .complete_after_intent(key, candidate_term, precondition, intent.clone())
+                    .await;
+            }
+            AuthorityState::Transitioning { .. } => {
+                return Err(CoordinatorError::Conflict {
+                    message: "a live transition is already in progress".into(),
+                });
+            }
+            AuthorityState::Unassigned | AuthorityState::ReconciliationRequired { .. } => {
+                return Err(CoordinatorError::Conflict {
+                    message: format!(
+                        "root fence is {:?}; promote requires Serving or our Transitioning",
+                        state_tag(&current.state)
+                    ),
+                });
+            }
+        }
+
+        let intent = TransitionIntent {
+            transition_id: self.id_generator.generate()?,
+            kind: TransitionKind::RecoveryPromotion,
+            precondition: precondition.clone(),
+            candidate_owner_id: self.local_owner_id,
+            next_writer_term: candidate_term,
+        };
+        let transitioning = ServingAuthorityRecord::new(
+            key,
+            AuthorityState::Transitioning {
+                intent: intent.clone(),
+            },
+        );
+        let fence = transitioning.encode_application_fence().map_err(|error| {
+            CoordinatorError::InvalidInput {
+                message: error.to_string(),
+            }
+        })?;
+
+        match virtual_log
+            .update_application_fence(&observed, fence)
+            .await?
+        {
+            FenceUpdate::Applied { .. } => {}
+            FenceUpdate::Conflict => {
+                // Reply-loss / race: resolve by fresh root read only.
+                return self
+                    .resolve_intent_after_uncertainty(key, candidate_term, &precondition, &intent)
+                    .await;
+            }
+        }
+
+        // Confirm our intent is durable (covers Applied + reply-loss that still wrote).
+        self.confirm_durable_intent(key, &intent).await?;
+
+        self.complete_after_intent(key, candidate_term, precondition, intent)
+            .await
+    }
+
+    async fn confirm_durable_intent(
+        &self,
+        key: AuthorityKey,
+        intent: &TransitionIntent,
+    ) -> Result<(), CoordinatorError> {
+        match self.observe_root_authority().await? {
+            ObservedRootAuthority::Record(record)
+                if record.key == key
+                    && matches!(
+                        &record.state,
+                        AuthorityState::Transitioning { intent: observed }
+                            if observed == intent
+                    ) =>
+            {
+                Ok(())
+            }
+            ObservedRootAuthority::Record(record)
+                if matches!(
+                    &record.state,
+                    AuthorityState::Serving { authority, .. }
+                        if authority.owner_id == intent.candidate_owner_id
+                            && authority.writer_term == intent.next_writer_term
+                ) =>
+            {
+                // Foundation raced ahead (or prior complete); treat as success path later.
+                Ok(())
+            }
+            other => Err(CoordinatorError::Conflict {
+                message: format!("intent CAS did not establish planned Transitioning: {other:?}"),
+            }),
+        }
+    }
+
+    async fn resolve_intent_after_uncertainty(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+        precondition: &FoundationPrecondition,
+        intent: &TransitionIntent,
+    ) -> Result<ServingAuthorityRecord, CoordinatorError> {
+        match self.observe_root_authority().await? {
+            ObservedRootAuthority::Record(record)
+                if record.key == key
+                    && matches!(
+                        &record.state,
+                        AuthorityState::Transitioning { intent: observed }
+                            if observed == intent
+                    ) =>
+            {
+                self.complete_after_intent(
+                    key,
+                    candidate_term,
+                    precondition.clone(),
+                    intent.clone(),
+                )
+                .await
+            }
+            ObservedRootAuthority::Record(record)
+                if matches!(
+                    &record.state,
+                    AuthorityState::Serving { authority, .. }
+                        if authority.owner_id == self.local_owner_id
+                            && authority.writer_term == candidate_term
+                ) =>
+            {
+                Ok(*record)
+            }
+            _ => Err(CoordinatorError::Conflict {
+                message: "CAS to Transitioning conflicted; fresh root is not our intent".into(),
+            }),
+        }
+    }
+
+    async fn complete_after_intent(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+        precondition: FoundationPrecondition,
+        intent: TransitionIntent,
+    ) -> Result<ServingAuthorityRecord, CoordinatorError> {
+        // If Serving already installed for this intent, return it (idempotent resume).
+        if let ObservedRootAuthority::Record(record) = self.observe_root_authority().await?
+            && let AuthorityState::Serving { authority, .. } = &record.state
+            && authority.owner_id == intent.candidate_owner_id
+            && authority.writer_term == intent.next_writer_term
+        {
+            return Ok(*record);
+        }
+
+        let publication = self.provisional_publication(key, candidate_term)?;
+        let foundation_res = self
+            .foundation
+            .drive_foundation_transition(key, publication, precondition)
+            .await;
+
+        let generation = match foundation_res {
+            Ok(generation) => generation,
+            Err(error) => {
+                // Forward-only: leave Transitioning on the root; do not restore predecessor.
+                return Err(CoordinatorError::FoundationFailed(error));
+            }
+        };
+
+        self.require_local_serving(key, candidate_term, &generation)
+            .await
+    }
+
+    fn provisional_publication(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+    ) -> Result<scripture::ServingPublication, CoordinatorError> {
+        let provisional = JournalGenerationRef::from_active_generation(
+            0,
+            holylog::virtual_log::LogletId::new("provisional").map_err(|error| {
+                CoordinatorError::InvalidInput {
+                    message: error.to_string(),
+                }
+            })?,
+            0,
+        );
+        scripture::ServingPublication::new(
+            key,
+            WriterAuthority {
+                owner_id: self.local_owner_id,
+                writer_term: candidate_term,
+                generation_ref: provisional,
+            },
+            self.route_hint.clone(),
+        )
+        .map_err(|error| CoordinatorError::InvalidInput {
+            message: error.to_string(),
+        })
+    }
+
+    async fn require_local_serving(
+        &self,
+        key: AuthorityKey,
+        candidate_term: WriterTerm,
+        generation: &JournalGenerationRef,
+    ) -> Result<ServingAuthorityRecord, CoordinatorError> {
+        match self.observe_root_authority().await? {
+            ObservedRootAuthority::Record(record)
+                if record.key == key
+                    && matches!(
+                        &record.state,
+                        AuthorityState::Serving { authority, .. }
+                            if authority.owner_id == self.local_owner_id
+                                && authority.writer_term == candidate_term
+                                && &authority.generation_ref == generation
+                    ) =>
+            {
+                Ok(*record)
+            }
+            ObservedRootAuthority::Record(record)
+                if matches!(&record.state, AuthorityState::Serving { .. }) =>
+            {
+                Err(CoordinatorError::ContenderConflict)
+            }
+            other => Err(CoordinatorError::Conflict {
+                message: format!(
+                    "foundation Applied but root is not local Serving for generation {generation:?}: {other:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Completes a durable Transitioning intent by inspecting Foundation and finishing forward-only.
     pub async fn reconcile(
         &self,
         key: AuthorityKey,
         eligibility: LocalServingEligibility,
     ) -> Result<ServingAuthorityRecord, CoordinatorError> {
-        let snap =
-            self.store
-                .observe(key)
-                .await?
-                .ok_or_else(|| CoordinatorError::InvalidInput {
-                    message: "reconcile failed: no record exists".to_string(),
-                })?;
-
-        let (intent, observed_ref_opt) = match &snap.record.state {
-            AuthorityState::Transitioning { intent } => (intent.clone(), None),
-            AuthorityState::ReconciliationRequired {
-                intent,
-                observed_generation,
-            } => (intent.clone(), observed_generation.clone()),
-            _ => {
-                return Ok(snap.record);
+        let record = match self.observe_root_authority().await? {
+            ObservedRootAuthority::Record(record) if record.key == key => *record,
+            ObservedRootAuthority::Uninitialized => {
+                return Err(CoordinatorError::InvalidInput {
+                    message: "reconcile failed: root uninitialized".into(),
+                });
+            }
+            other => {
+                return Err(CoordinatorError::InvalidInput {
+                    message: format!("reconcile failed: no authority record on root ({other:?})"),
+                });
             }
         };
 
-        // 2. Query live classified Foundation state
-        let classification = match self.foundation.classify_transition(key, &intent).await {
-            Ok(c) => c,
-            Err(e) => {
-                let rec_state = AuthorityState::ReconciliationRequired {
-                    intent: intent.clone(),
-                    observed_generation: observed_ref_opt,
-                };
-                let rec_record = ServingAuthorityRecord::new(key, rec_state);
-                let _ = self
-                    .store
-                    .compare_and_swap(key, Some(snap.version), rec_record)
-                    .await;
-                return Err(CoordinatorError::FoundationFailed(e));
+        let intent = match &record.state {
+            AuthorityState::Serving { .. } => return Ok(record),
+            AuthorityState::Transitioning { intent } => intent.clone(),
+            AuthorityState::Unassigned | AuthorityState::ReconciliationRequired { .. } => {
+                return Err(CoordinatorError::Conflict {
+                    message: format!(
+                        "reconcile requires Transitioning or Serving; observed {:?}",
+                        state_tag(&record.state)
+                    ),
+                });
             }
         };
 
-        let next_record = match classification {
-            TransitionClassification::StillPredecessor => {
-                ServingAuthorityRecord::new(key, AuthorityState::Unassigned)
-            }
+        if self.local_owner_id != intent.candidate_owner_id {
+            return Err(CoordinatorError::Conflict {
+                message: "non-candidate cannot complete another owner's transition".into(),
+            });
+        }
+        if !eligibility.permits_serving() {
+            return Err(CoordinatorError::Unwritable);
+        }
+
+        let classification = self
+            .foundation
+            .classify_transition(key, &intent)
+            .await
+            .map_err(CoordinatorError::FoundationFailed)?;
+
+        match classification {
             TransitionClassification::IntendedSuccessor { generation } => {
-                // Safety Guard: "Do not use the reconciling node's route for another owner."
-                // Only the actual candidate node is allowed to transition to Serving!
-                if self.local_owner_id == intent.candidate_owner_id && eligibility.permits_serving()
-                {
-                    let auth = WriterAuthority {
-                        owner_id: intent.candidate_owner_id,
-                        writer_term: intent.next_writer_term,
-                        generation_ref: generation,
-                    };
-                    ServingAuthorityRecord::new(
-                        key,
-                        AuthorityState::Serving {
-                            authority: auth,
-                            route_hint: self.route_hint.clone(),
-                        },
-                    )
-                } else {
-                    // A non-candidate or an ineligible candidate persists the observed generation
-                    // evidence but may not publish a client route.
-                    ServingAuthorityRecord::new(
-                        key,
-                        AuthorityState::ReconciliationRequired {
-                            intent: intent.clone(),
-                            observed_generation: Some(generation),
-                        },
-                    )
-                }
+                self.require_local_serving(key, intent.next_writer_term, &generation)
+                    .await
             }
-            TransitionClassification::Divergent {
-                observed_generation,
-            } => ServingAuthorityRecord::new(
-                key,
-                AuthorityState::ReconciliationRequired {
-                    intent: intent.clone(),
-                    observed_generation,
-                },
-            ),
-        };
-
-        let cas_res = self
-            .store
-            .compare_and_swap(key, Some(snap.version), next_record.clone())
-            .await;
-
-        match cas_res {
-            Ok(CasOutcome::Applied) => Ok(next_record),
-            Ok(CasOutcome::Conflict) => {
-                let final_snap =
-                    self.store
-                        .observe(key)
-                        .await?
-                        .ok_or_else(|| CoordinatorError::Conflict {
-                            message: "record vanished during reconciliation CAS".to_string(),
-                        })?;
-                Ok(final_snap.record)
+            TransitionClassification::StillPredecessor => {
+                // Forward-only: never restore predecessor Serving; complete replacement.
+                self.complete_after_intent(
+                    key,
+                    intent.next_writer_term,
+                    intent.precondition.clone(),
+                    intent,
+                )
+                .await
             }
-            Err(ServingAuthorityStoreError::Indeterminate(e)) => {
-                // Indeterminate CAS resolution on reconciliation
-                let snap2 = self.store.observe(key).await?;
-                if let Some(s) = snap2 {
-                    if s.record == next_record {
-                        Ok(next_record)
-                    } else {
-                        Err(CoordinatorError::Store(
-                            ServingAuthorityStoreError::Indeterminate(e),
-                        ))
-                    }
-                } else {
-                    Err(CoordinatorError::Store(
-                        ServingAuthorityStoreError::Indeterminate(e),
-                    ))
-                }
-            }
-            Err(e) => Err(CoordinatorError::Store(e)),
+            TransitionClassification::Divergent { .. } => Err(CoordinatorError::Conflict {
+                message:
+                    "foundation diverged from durable intent; remain fail-closed Transitioning"
+                        .into(),
+            }),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::InMemoryServingAuthorityStore;
-    use holylog::virtual_log::LogletId;
-    use scripture::canon::{CanonFence, CanonOwner, OwnerEndpoint, VerseId};
-    use scripture::model::JournalId;
-    use std::sync::Mutex;
-
-    fn journal() -> JournalId {
-        JournalId::from_bytes(*b"canon-journal-id")
-    }
-
-    fn verse() -> VerseId {
-        VerseId::from_bytes(*b"canon-line-id!!!")
-    }
-
-    fn owner() -> OwnerId {
-        OwnerId::from_bytes(*b"canon-owner-id!!")
-    }
-
-    fn route_hint() -> RouteHint {
-        RouteHint::new("tcp://scripture-hint.internal:9000").expect("route hint")
-    }
-
-    const ELIGIBLE: LocalServingEligibility = LocalServingEligibility {
-        is_writable: true,
-        is_sealed: false,
-    };
-
-    struct MockState {
-        current_ref: Option<JournalGenerationRef>,
-        // Track the current publisher details statefully
-        current_owner: Option<OwnerId>,
-        current_term: Option<WriterTerm>,
-    }
-
-    struct StatefulMockFoundation {
-        state: Mutex<MockState>,
-        should_fail: Mutex<Option<FoundationTransitionError>>,
-    }
-
-    impl StatefulMockFoundation {
-        fn new_empty() -> Self {
-            Self {
-                state: Mutex::new(MockState {
-                    current_ref: None,
-                    current_owner: None,
-                    current_term: None,
-                }),
-                should_fail: Mutex::new(None),
-            }
-        }
-
-        #[allow(dead_code)]
-        fn set_fail(&self, err: Option<FoundationTransitionError>) {
-            *self.should_fail.lock().expect("lock") = err;
-        }
-
-        // Test helper to simulate external concurrent foundation transition (e.g. Actor B terms in)
-        fn simulate_external_transition(&self, next_owner: OwnerId, next_term: WriterTerm) {
-            let mut guard = self.state.lock().expect("lock");
-            let next_rev = guard
-                .current_ref
-                .as_ref()
-                .map_or(1, |current| current.virtual_log_revision + 1);
-            let next_start = guard
-                .current_ref
-                .as_ref()
-                .map_or(0, |current| current.active_start + 100);
-            let loglet_str = format!("external-gen-{}", next_rev);
-
-            let owned = CanonOwner::Owned {
-                owner_id: next_owner,
-                endpoint: OwnerEndpoint::new("tcp://sequencer.internal:9000")
-                    .expect("valid endpoint"),
-                sequencer: None,
-                writer_term: Some(next_term),
-            };
-            let fence = CanonFence::new(next_rev, journal(), verse(), owned);
-            let encoded = fence.encode();
-            let digest: [u8; 32] = blake3::hash(encoded.as_bytes()).into();
-
-            guard.current_ref = Some(JournalGenerationRef {
-                virtual_log_revision: next_rev,
-                active_loglet_id: LogletId::new(loglet_str).expect("valid loglet"),
-                active_start: next_start,
-                canon_fence_digest: digest,
-            });
-            guard.current_owner = Some(next_owner);
-            guard.current_term = Some(next_term);
-        }
-    }
-
-    impl JournalFoundationTransition for StatefulMockFoundation {
-        fn drive_foundation_transition(
-            &self,
-            key: AuthorityKey,
-            target_owner_id: OwnerId,
-            next_term: WriterTerm,
-            precondition: FoundationPrecondition,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<JournalGenerationRef, FoundationTransitionError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            if let Some(err) = &*self.should_fail.lock().expect("lock") {
-                let e_clone = match err {
-                    FoundationTransitionError::Conflict { message } => {
-                        FoundationTransitionError::Conflict {
-                            message: message.clone(),
-                        }
-                    }
-                    FoundationTransitionError::Unavailable(_) => {
-                        FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
-                            "mock error",
-                        )))
-                    }
-                    FoundationTransitionError::Indeterminate(_) => {
-                        FoundationTransitionError::Indeterminate(Box::new(std::io::Error::other(
-                            "mock error",
-                        )))
-                    }
-                };
-                return Box::pin(async move { Err(e_clone) });
-            }
-
-            let mut guard = self.state.lock().expect("lock");
-
-            match &precondition {
-                FoundationPrecondition::Empty => {
-                    if guard.current_ref.is_some() {
-                        return Box::pin(async move {
-                            Err(FoundationTransitionError::Conflict {
-                                message: "precondition mismatch: expected empty".to_string(),
-                            })
-                        });
-                    }
-                }
-                FoundationPrecondition::Expected(expected) => {
-                    if guard.current_ref.as_ref() != Some(expected) {
-                        return Box::pin(async move {
-                            Err(FoundationTransitionError::Conflict {
-                                message: "precondition mismatch".to_string(),
-                            })
-                        });
-                    }
-                }
-            }
-
-            let next_rev = guard
-                .current_ref
-                .as_ref()
-                .map_or(1, |current| current.virtual_log_revision + 1);
-            let next_start = guard
-                .current_ref
-                .as_ref()
-                .map_or(0, |current| current.active_start + 100);
-            let loglet_str = format!("loglet-gen-{}", next_rev);
-
-            let owned = CanonOwner::Owned {
-                owner_id: target_owner_id,
-                endpoint: OwnerEndpoint::new("tcp://sequencer.internal:9000")
-                    .expect("valid endpoint"),
-                sequencer: None,
-                writer_term: Some(next_term),
-            };
-            let fence = CanonFence::new(next_rev, key.journal_id, key.verse_id, owned);
-            let encoded = fence.encode();
-            let digest: [u8; 32] = blake3::hash(encoded.as_bytes()).into();
-
-            let next_ref = JournalGenerationRef {
-                virtual_log_revision: next_rev,
-                active_loglet_id: LogletId::new(loglet_str).expect("valid loglet"),
-                active_start: next_start,
-                canon_fence_digest: digest,
-            };
-
-            guard.current_ref = Some(next_ref.clone());
-            guard.current_owner = Some(target_owner_id);
-            guard.current_term = Some(next_term);
-
-            Box::pin(async move { Ok(next_ref) })
-        }
-
-        fn classify_transition(
-            &self,
-            key: AuthorityKey,
-            intent: &TransitionIntent,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<TransitionClassification, FoundationTransitionError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let guard = self.state.lock().expect("lock");
-            let live_ref = guard.current_ref.clone();
-
-            // 1. Verify exact Precondition matches
-            let matches_precondition = match &intent.precondition {
-                FoundationPrecondition::Empty => live_ref.is_none(),
-                FoundationPrecondition::Expected(expected_ref) => {
-                    live_ref.as_ref() == Some(expected_ref)
-                }
-            };
-
-            if matches_precondition {
-                return Box::pin(async move { Ok(TransitionClassification::StillPredecessor) });
-            }
-
-            let Some(live_ref) = live_ref else {
-                return Box::pin(async move {
-                    Ok(TransitionClassification::Divergent {
-                        observed_generation: None,
-                    })
-                });
-            };
-
-            // 2. Verify Successor checks exact owner, term, key, and successor relation (strictly greater revision)
-            let prev_rev = match &intent.precondition {
-                FoundationPrecondition::Empty => 0,
-                FoundationPrecondition::Expected(expected_ref) => expected_ref.virtual_log_revision,
-            };
-
-            if live_ref.virtual_log_revision > prev_rev {
-                // Successor matches candidate owner & next writer term exactly
-                if guard.current_owner == Some(intent.candidate_owner_id)
-                    && guard.current_term == Some(intent.next_writer_term)
-                    && key
-                        == (AuthorityKey {
-                            journal_id: journal(),
-                            verse_id: verse(),
-                        })
-                {
-                    return Box::pin(async move {
-                        Ok(TransitionClassification::IntendedSuccessor {
-                            generation: live_ref,
-                        })
-                    });
-                }
-            }
-
-            // 3. Otherwise, Divergent
-            Box::pin(async move {
-                Ok(TransitionClassification::Divergent {
-                    observed_generation: Some(live_ref),
-                })
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn test_authority_coordinator_promotion_success() {
-        let store = Arc::new(InMemoryServingAuthorityStore::new());
-        let foundation = Arc::new(StatefulMockFoundation::new_empty());
-        let id_gen = Arc::new(DeterministicTransitionIdGenerator::new());
-
-        let coordinator = AuthorityCoordinator::new(
-            Arc::clone(&store) as Arc<dyn ServingAuthorityStore>,
-            Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
-            Arc::clone(&id_gen) as Arc<dyn TransitionIdGenerator>,
-            owner(),
-            route_hint(),
-        );
-
-        let key = AuthorityKey {
-            journal_id: journal(),
-            verse_id: verse(),
-        };
-
-        let term = WriterTerm::new(1).expect("valid term");
-
-        // 1. Promote Empty bootstrap
-        let record = coordinator
-            .promote(key, term, FoundationPrecondition::Empty, ELIGIBLE)
-            .await
-            .expect("promote success");
-
-        let AuthorityState::Serving { authority, .. } = &record.state else {
-            panic!("expected Serving state");
-        };
-
-        assert_eq!(authority.owner_id, owner());
-        assert_eq!(authority.writer_term, term);
-        assert_eq!(authority.generation_ref.virtual_log_revision, 1);
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_recounts_divergent_owner_or_term_reconciliation_required() {
-        let store = Arc::new(InMemoryServingAuthorityStore::new());
-        let foundation = Arc::new(StatefulMockFoundation::new_empty());
-        let id_gen = Arc::new(DeterministicTransitionIdGenerator::new());
-
-        let coordinator = AuthorityCoordinator::new(
-            Arc::clone(&store) as Arc<dyn ServingAuthorityStore>,
-            Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
-            Arc::clone(&id_gen) as Arc<dyn TransitionIdGenerator>,
-            owner(),
-            route_hint(),
-        );
-
-        let key = AuthorityKey {
-            journal_id: journal(),
-            verse_id: verse(),
-        };
-
-        let term = WriterTerm::new(1).expect("valid");
-
-        // Seed a pending Transitioning record
-        let intent = TransitionIntent {
-            transition_id: id_gen.generate().expect("valid"),
-            kind: TransitionKind::RecoveryPromotion,
-            precondition: FoundationPrecondition::Empty,
-            candidate_owner_id: owner(),
-            next_writer_term: term,
-        };
-        let rec = ServingAuthorityRecord::new(
-            key,
-            AuthorityState::Transitioning {
-                intent: intent.clone(),
-            },
-        );
-        store
-            .compare_and_swap(key, None, rec)
-            .await
-            .expect("seeded");
-
-        // Simulate a divergent external actor winning the foundation (different owner/term)
-        let other_owner = OwnerId::from_bytes(*b"other-owner-id!!");
-        let other_term = WriterTerm::new(10).expect("valid");
-        foundation.simulate_external_transition(other_owner, other_term);
-
-        // Reconcile must safely classify it as Divergent and CAS to ReconciliationRequired containing the observed divergent ref!
-        let reconciled = coordinator
-            .reconcile(key, ELIGIBLE)
-            .await
-            .expect("reconcile succeeds");
-        let AuthorityState::ReconciliationRequired {
-            observed_generation: Some(obs),
-            ..
-        } = reconciled.state
-        else {
-            panic!("Expected ReconciliationRequired with observed generation evidence");
-        };
-
-        assert_eq!(obs.virtual_log_revision, 1);
-        assert_eq!(obs.active_loglet_id.as_str(), "external-gen-1");
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_from_non_candidate_cannot_advertise_its_route() {
-        let store = Arc::new(InMemoryServingAuthorityStore::new());
-        let foundation = Arc::new(StatefulMockFoundation::new_empty());
-        let id_gen = Arc::new(DeterministicTransitionIdGenerator::new());
-
-        let key = AuthorityKey {
-            journal_id: journal(),
-            verse_id: verse(),
-        };
-
-        let term = WriterTerm::new(1).expect("valid");
-
-        // Transition intent targets "owner()"
-        let intent = TransitionIntent {
-            transition_id: id_gen.generate().expect("valid"),
-            kind: TransitionKind::RecoveryPromotion,
-            precondition: FoundationPrecondition::Empty,
-            candidate_owner_id: owner(), // candidate is owner A
-            next_writer_term: term,
-        };
-        let rec = ServingAuthorityRecord::new(
-            key,
-            AuthorityState::Transitioning {
-                intent: intent.clone(),
-            },
-        );
-        store
-            .compare_and_swap(key, None, rec)
-            .await
-            .expect("seeded");
-
-        // Foundation successfully transitioned to owner A
-        foundation
-            .drive_foundation_transition(key, owner(), term, FoundationPrecondition::Empty)
-            .await
-            .expect("drive success");
-
-        // Coordinator is owner B (non-candidate reconciling the record)
-        let other_owner = OwnerId::from_bytes(*b"other-owner-id!!");
-        let coord_b = AuthorityCoordinator::new(
-            Arc::clone(&store) as Arc<dyn ServingAuthorityStore>,
-            Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
-            Arc::clone(&id_gen) as Arc<dyn TransitionIdGenerator>,
-            other_owner,
-            route_hint(),
-        );
-
-        // Non-candidate B reconciles: must PERSIST divergence/successor evidence but must NOT transition to Serving
-        let reconciled = coord_b
-            .reconcile(key, ELIGIBLE)
-            .await
-            .expect("reconcile success");
-        let AuthorityState::ReconciliationRequired {
-            observed_generation: Some(obs),
-            ..
-        } = reconciled.state
-        else {
-            panic!(
-                "Expected ReconciliationRequired for non-candidate instead of Serving route publication"
-            );
-        };
-        assert_eq!(obs.virtual_log_revision, 1);
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_from_sealed_candidate_cannot_advertise_route() {
-        let store = Arc::new(InMemoryServingAuthorityStore::new());
-        let foundation = Arc::new(StatefulMockFoundation::new_empty());
-        let id_gen = Arc::new(DeterministicTransitionIdGenerator::new());
-        let key = AuthorityKey {
-            journal_id: journal(),
-            verse_id: verse(),
-        };
-        let term = WriterTerm::new(1).expect("valid");
-        let intent = TransitionIntent {
-            transition_id: id_gen.generate().expect("valid"),
-            kind: TransitionKind::RecoveryPromotion,
-            precondition: FoundationPrecondition::Empty,
-            candidate_owner_id: owner(),
-            next_writer_term: term,
-        };
-        store
-            .compare_and_swap(
-                key,
-                None,
-                ServingAuthorityRecord::new(
-                    key,
-                    AuthorityState::Transitioning {
-                        intent: intent.clone(),
-                    },
-                ),
-            )
-            .await
-            .expect("seeded");
-        foundation
-            .drive_foundation_transition(key, owner(), term, FoundationPrecondition::Empty)
-            .await
-            .expect("foundation successor");
-
-        let coordinator = AuthorityCoordinator::new(
-            Arc::clone(&store) as Arc<dyn ServingAuthorityStore>,
-            Arc::clone(&foundation) as Arc<dyn JournalFoundationTransition>,
-            Arc::clone(&id_gen) as Arc<dyn TransitionIdGenerator>,
-            owner(),
-            route_hint(),
-        );
-        let sealed = LocalServingEligibility {
-            is_writable: true,
-            is_sealed: true,
-        };
-
-        let reconciled = coordinator
-            .reconcile(key, sealed)
-            .await
-            .expect("reconcile succeeds without serving");
-        assert!(matches!(
-            reconciled.state,
-            AuthorityState::ReconciliationRequired {
-                observed_generation: Some(_),
-                ..
-            }
-        ));
+fn state_tag(state: &AuthorityState) -> &'static str {
+    match state {
+        AuthorityState::Unassigned => "Unassigned",
+        AuthorityState::Transitioning { .. } => "Transitioning",
+        AuthorityState::Serving { .. } => "Serving",
+        AuthorityState::ReconciliationRequired { .. } => "ReconciliationRequired",
     }
 }
