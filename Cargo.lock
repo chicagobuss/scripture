@@ -1535,6 +1535,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures",
+ "getrandom 0.3.4",
  "holylog",
  "holylog-correctness",
  "holylog-object-store",
@@ -1553,7 +1554,9 @@ dependencies = [
 name = "scripture-cli"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "holylog",
+ "holylog-correctness",
  "holylog-object-store",
  "holylog-object-store-register",
  "object_store",
@@ -1562,6 +1565,7 @@ dependencies = [
  "scripture-runtime",
  "scripture-service",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",

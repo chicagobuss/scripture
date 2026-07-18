@@ -5,13 +5,13 @@ use crate::Scenario;
 /// Named scenario suites for autonomous campaigns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Suite {
-    /// Core AtomicLog / VirtualLog scenarios (Slice 1 subset).
+    /// Core AtomicLog / VirtualLog / Scripture scenarios.
     Core,
-    /// Composition scenarios (Slice 2 — not yet wired).
+    /// Composition scenarios (striped / quorum / K-window AtomicLog).
     Composition,
-    /// Real backend / process resilience (Slice 3; not yet wired).
+    /// Real backend / process resilience (ephemeral in-namespace RustFS).
     Resilience,
-    /// All implemented scenarios.
+    /// All implemented scenarios for the active profile.
     All,
 }
 
@@ -34,12 +34,50 @@ impl Suite {
             Scenario::BaselineCommittedAck,
             Scenario::RootCasReplyLost,
             Scenario::WriterDiesAfterPayload,
+            Scenario::KWindowDelayedCompletion,
+            Scenario::KWindowPermanentWedgeSeal,
+        ];
+        let composition = vec![
+            Scenario::KWindowDelayedCompletion,
+            Scenario::KWindowPermanentWedgeSeal,
+            Scenario::PermanentWedgeSealSuccessor,
+            Scenario::SealTailRace,
+            Scenario::StripedModuloMapping,
+            Scenario::StripedLaggingScanReconstruction,
+            Scenario::QuorumPartialWriteNotGlobal,
+            Scenario::QuorumRepairUnavailability,
+            Scenario::NestedStripeQuorumSchedules,
+        ];
+        // WP06: full 12–17 band on the producer raw-lines A→B spine.
+        let resilience = vec![
+            Scenario::RawLinesBaseline,
+            Scenario::RawLinesAbCutover,
+            Scenario::RawLinesDieAfterPayload,
+            Scenario::RawLinesRootCasReplyLoss,
+            Scenario::RawLinesDirectionalLoss,
+            Scenario::RawLinesCredentialInvalidation,
         ];
         match self {
             Self::Core => core,
-            Self::Composition => Vec::new(),
-            Self::Resilience => Vec::new(),
-            Self::All => core,
+            Self::Composition => composition,
+            Self::Resilience => resilience,
+            Self::All => {
+                let mut all = core;
+                for scenario in [
+                    Scenario::PermanentWedgeSealSuccessor,
+                    Scenario::SealTailRace,
+                    Scenario::StripedModuloMapping,
+                    Scenario::StripedLaggingScanReconstruction,
+                    Scenario::QuorumPartialWriteNotGlobal,
+                    Scenario::QuorumRepairUnavailability,
+                    Scenario::NestedStripeQuorumSchedules,
+                ] {
+                    if !all.contains(&scenario) {
+                        all.push(scenario);
+                    }
+                }
+                all
+            }
         }
     }
 
@@ -47,10 +85,10 @@ impl Suite {
     #[must_use]
     pub fn schedule_label(self) -> &'static str {
         match self {
-            Self::Core => "core-slice1",
-            Self::Composition => "composition-not-implemented",
-            Self::Resilience => "resilience-not-implemented",
-            Self::All => "all-implemented-slice1",
+            Self::Core => "core-wp05",
+            Self::Composition => "composition-wp05",
+            Self::Resilience => "resilience-wp06-families-12-17",
+            Self::All => "all-implemented-wp05",
         }
     }
 
@@ -74,9 +112,9 @@ mod tests {
     use super::Suite;
 
     #[test]
-    fn unavailable_suites_are_not_reported_as_implemented() {
-        assert!(!Suite::Composition.is_implemented());
-        assert!(!Suite::Resilience.is_implemented());
+    fn resilience_is_implemented_after_wp05_v3() {
+        assert!(Suite::Composition.is_implemented());
+        assert!(Suite::Resilience.is_implemented());
         assert!(Suite::Core.is_implemented());
         assert!(Suite::All.is_implemented());
     }
