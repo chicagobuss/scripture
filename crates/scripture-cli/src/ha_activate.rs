@@ -11,12 +11,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use holylog::virtual_log::LogletResolver;
 use scripture::serving_authority::{AuthorityKey, JournalGenerationRef, RouteHint, WriterTerm};
 use scripture_runtime::{
-    HaServingSession, HolylogJournalFoundation, NodeIdentity, RawLinesConfig, bootstrap_and_serve,
-    promote_and_serve, serve_ha_raw_lines_connection, status_body, system_clocks,
+    HaActivationError, HaServingSession, HolylogJournalFoundation, NodeIdentity, RawLinesConfig,
+    bootstrap_and_serve, promote_and_serve, serve_ha_raw_lines_connection, status_body,
+    system_clocks,
 };
 use scripture_service::{
     AuthorityCoordinator, JournalFoundationTransition, SecureTransitionIdGenerator,
 };
+#[cfg(feature = "campaign-faults")]
+use scripture_service::{CoordinatorError, FoundationTransitionError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -62,7 +65,17 @@ pub async fn bootstrap_and_serve_cli(
     config: ScriptureConfig,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "campaign-faults")]
+    let (assembled, campaign) = {
+        let mut assembled = assemble::assemble_supervisor(&config)?;
+        let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+        (assembled, campaign)
+    };
+    #[cfg(not(feature = "campaign-faults"))]
     let assembled = assemble::assemble_supervisor(&config)?;
+    #[cfg(not(feature = "campaign-faults"))]
+    let campaign = Option::<()>::None;
+    let _ = &campaign;
     let key = authority_key(&config)?;
     let foundation = Arc::new(build_foundation(&assembled, key));
     let coordinator = AuthorityCoordinator::new(
@@ -87,6 +100,11 @@ pub async fn bootstrap_and_serve_cli(
         timer,
     )
     .await?;
+    #[cfg(feature = "campaign-faults")]
+    let session = match &campaign {
+        Some(ctx) => crate::campaign_faults::observe_session(session, ctx, &config.node.owner_id),
+        None => session,
+    };
     eprintln!(
         "scripture: ha_mode=serving-authority action=bootstrap-and-serve ready=true owner={} advertise={} bind={} backend={} prefix={}",
         config.node.owner_id,
@@ -103,7 +121,17 @@ pub async fn promote_and_serve_cli(
     config: ScriptureConfig,
     candidate_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "campaign-faults")]
+    let (assembled, campaign) = {
+        let mut assembled = assemble::assemble_supervisor(&config)?;
+        let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+        (assembled, campaign)
+    };
+    #[cfg(not(feature = "campaign-faults"))]
     let assembled = assemble::assemble_supervisor(&config)?;
+    #[cfg(not(feature = "campaign-faults"))]
+    let campaign = Option::<()>::None;
+    let _ = &campaign;
     let key = authority_key(&config)?;
     let expected = observe_expected_generation(&assembled).await?;
     let foundation = Arc::new(build_foundation(&assembled, key));
@@ -117,19 +145,51 @@ pub async fn promote_and_serve_cli(
     );
     let term = WriterTerm::new(candidate_term)?;
     let (clock, timer) = system_clocks();
-    let session = promote_and_serve(
+    let session = match promote_and_serve(
         &coordinator,
         foundation.as_ref(),
         key,
         term,
-        expected,
+        expected.clone(),
         config.verse_runtime_config()?,
         Arc::clone(&assembled.register),
         Arc::clone(&assembled.resolver),
-        clock,
-        timer,
+        clock.clone(),
+        timer.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(session) => session,
+        Err(error) if should_retry_promote_after_reply_loss(&campaign, &error) => {
+            // RootCasReplyLost (campaign seam): CAS applied, reply lost — either on the
+            // Transitioning intent fence (CoordinatorError::Root) or the Serving/membership
+            // CAS (Foundation Indeterminate). Resolve with one in-process promote retry
+            // using the *same* Expected precondition so durable Transitioning intent matches
+            // (fault is one-shot; resume uses complete_after_intent).
+            eprintln!(
+                "scripture: promote reply-loss after applied RootCasReplyLost ({error}); retrying once with same Expected precondition"
+            );
+            promote_and_serve(
+                &coordinator,
+                foundation.as_ref(),
+                key,
+                term,
+                expected,
+                config.verse_runtime_config()?,
+                Arc::clone(&assembled.register),
+                Arc::clone(&assembled.resolver),
+                clock,
+                timer,
+            )
+            .await?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(feature = "campaign-faults")]
+    let session = match &campaign {
+        Some(ctx) => crate::campaign_faults::observe_session(session, ctx, &config.node.owner_id),
+        None => session,
+    };
     eprintln!(
         "scripture: ha_mode=serving-authority action=promote-and-serve ready=true owner={} advertise={} bind={} backend={} prefix={} candidate_term={candidate_term}",
         config.node.owner_id,
@@ -246,4 +306,34 @@ async fn serve_probe_connection(
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+#[cfg(feature = "campaign-faults")]
+fn should_retry_promote_after_reply_loss(
+    campaign: &Option<crate::campaign_faults::CampaignFaultContext>,
+    error: &HaActivationError,
+) -> bool {
+    let Some(ctx) = campaign.as_ref() else {
+        return false;
+    };
+    // Retry only for an explicitly armed RootCasReplyLost that the harness
+    // evidenced as applied — never for an unrelated root/Indeterminate error
+    // merely because campaign tracing is enabled.
+    if !ctx.root_cas_reply_loss_armed() || !ctx.root_cas_reply_loss_applied() {
+        return false;
+    }
+    matches!(
+        error,
+        HaActivationError::Coordinator(CoordinatorError::FoundationFailed(
+            FoundationTransitionError::Indeterminate(_)
+        )) | HaActivationError::Coordinator(CoordinatorError::Root(_))
+    )
+}
+
+#[cfg(not(feature = "campaign-faults"))]
+fn should_retry_promote_after_reply_loss(
+    _campaign: &Option<()>,
+    _error: &HaActivationError,
+) -> bool {
+    false
 }

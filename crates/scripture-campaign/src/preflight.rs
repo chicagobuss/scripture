@@ -1,4 +1,4 @@
-//! Default-dry-run preflight for autonomous campaigns.
+//! Default-dry-run preflight for autonomous campaigns (WP05 v3).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -55,6 +55,28 @@ impl PreflightReport {
         let mut checks = BTreeMap::new();
         let mut notes = Vec::new();
 
+        match config.validate_isolation() {
+            Ok(()) => {
+                checks.insert(
+                    "isolation_topology".into(),
+                    CheckResult {
+                        ok: true,
+                        detail: "placement-only topology; no scripture-lab/Tracker store identity"
+                            .into(),
+                    },
+                );
+            }
+            Err(error) => {
+                checks.insert(
+                    "isolation_topology".into(),
+                    CheckResult {
+                        ok: false,
+                        detail: error.to_string(),
+                    },
+                );
+            }
+        }
+
         let context_ok = kubectl(&["config", "current-context"])
             .map(|output| output.trim() == config.kube_context)
             .unwrap_or(false);
@@ -104,67 +126,6 @@ impl PreflightReport {
             },
         );
 
-        let rustfs_svc = kubectl(&[
-            "--context",
-            &config.kube_context,
-            "-n",
-            &config.rustfs_namespace,
-            "get",
-            "svc",
-            &config.rustfs_service,
-            "--request-timeout=10s",
-        ]);
-        checks.insert(
-            "rustfs_service".into(),
-            CheckResult {
-                ok: rustfs_svc.is_ok(),
-                detail: format!(
-                    "svc/{}/{} in {}",
-                    config.rustfs_service, config.rustfs_namespace, config.rustfs_namespace
-                ),
-            },
-        );
-
-        let secret_exists = kubectl(&[
-            "--context",
-            &config.kube_context,
-            "-n",
-            &config.store_secret_namespace,
-            "get",
-            "secret",
-            &config.store_secret,
-            "--request-timeout=10s",
-        ])
-        .is_ok();
-        if !secret_exists && !for_execute {
-            notes.push(format!(
-                "secret {}/{} not found yet (expected before first --execute)",
-                config.store_secret_namespace, config.store_secret
-            ));
-        }
-        checks.insert(
-            "store_secret".into(),
-            CheckResult {
-                ok: secret_exists || !for_execute,
-                detail: if secret_exists {
-                    format!(
-                        "secret {}/{} present (values never read)",
-                        config.store_secret_namespace, config.store_secret
-                    )
-                } else if for_execute {
-                    format!(
-                        "secret {}/{} missing; required for --execute",
-                        config.store_secret_namespace, config.store_secret
-                    )
-                } else {
-                    format!(
-                        "secret {}/{} absent (advisory until first --execute)",
-                        config.store_secret_namespace, config.store_secret
-                    )
-                },
-            },
-        );
-
         let placement = [
             &config.writer_a_node,
             &config.writer_b_node,
@@ -175,18 +136,73 @@ impl PreflightReport {
             .iter()
             .collect::<std::collections::BTreeSet<_>>()
             .len()
-            == placement.len();
+            == placement.len()
+            && placement
+                .iter()
+                .all(|node| ready_nodes.iter().any(|ready| ready == *node));
         checks.insert(
             "placement".into(),
             CheckResult {
                 ok: placement_ok,
                 detail: format!(
-                    "A={} B={} checker={} rustfs={}",
+                    "A={} B={} checker={} rustfs(ephemeral)={}",
                     config.writer_a_node,
                     config.writer_b_node,
                     config.checker_node,
                     config.rustfs_node
                 ),
+            },
+        );
+
+        // Images are imported per-node (Never). Preflight records references only;
+        // execute proves availability by creating run-scoped pods.
+        checks.insert(
+            "images".into(),
+            CheckResult {
+                ok: !config.image.ends_with(":latest")
+                    && !config.scripture_image.ends_with(":latest"),
+                detail: format!(
+                    "campaign={} scripture={} (import attested at execute)",
+                    config.image, config.scripture_image
+                ),
+            },
+        );
+
+        notes.push(
+            "RustFS is created ephemeral inside scripture-correctness-<run-id>; Tracker RustFS is never targeted"
+                .into(),
+        );
+        notes.push("default-deny egress will allow only DNS + in-namespace RustFS Service".into());
+        if for_execute {
+            notes.push(
+                "execute will generate per-run credentials/bucket and delete only the run namespace"
+                    .into(),
+            );
+        }
+
+        // Explicitly refuse any leftover shared lab store as a campaign target.
+        let lab_present = kubectl(&[
+            "--context",
+            &config.kube_context,
+            "-n",
+            "scripture-lab",
+            "get",
+            "svc",
+            "rustfs",
+            "--request-timeout=5s",
+        ])
+        .is_ok();
+        if lab_present {
+            notes.push(
+                "scripture-lab/rustfs exists on cluster but must NOT be used; campaign creates its own store"
+                    .into(),
+            );
+        }
+        checks.insert(
+            "no_shared_lab_target".into(),
+            CheckResult {
+                ok: true,
+                detail: "campaign store is run-scoped; scripture-lab is never selected".into(),
             },
         );
 

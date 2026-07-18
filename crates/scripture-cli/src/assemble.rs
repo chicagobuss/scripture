@@ -18,13 +18,9 @@ use crate::config::ScriptureConfig;
 pub struct AssembledNode {
     pub node: VerseNodeSupervisor,
     /// Shared Holylog seams retained for a future durable HA composition root.
-    #[allow(dead_code)]
     pub register: Arc<dyn ConditionalRegister>,
-    #[allow(dead_code)]
     pub resolver: Arc<ProcessLogletResolver>,
-    #[allow(dead_code)]
     pub parts: Arc<dyn PartsFactory>,
-    #[allow(dead_code)]
     pub claims: Arc<dyn ExclusiveClaimStore>,
     pub backend: BackendProfile,
     pub store_root: String,
