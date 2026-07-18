@@ -17,7 +17,7 @@ RUN apt-get update \
 COPY . .
 # Home-lab builders are shared with correctness work; cap Rust parallelism so
 # an image build does not exhaust the host while compiling the Git dependency.
-RUN --mount=type=ssh CARGO_BUILD_JOBS=2 cargo build --release -p scripture-cli --locked
+RUN --mount=type=ssh CARGO_BUILD_JOBS=2 cargo build --release -p scripture-cli --features campaign-faults --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update \
