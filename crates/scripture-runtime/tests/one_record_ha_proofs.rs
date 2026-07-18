@@ -1290,3 +1290,623 @@ async fn runtime_ack_evidence_across_cutover() {
         "Holylog write events + ScriptureCommittedAck must Pass the checker: {events:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D. Family 20 — bounded named reconfiguration churn (three candidates)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn churn_intent_reply_loss_b_then_c_completes() {
+    let run = RunId::new("churn-intent-b-then-c");
+    let sink = RecordingSink::new().shared();
+    let foundation_trace = ActorTrace::new(
+        run,
+        ActorId::new("foundation"),
+        Arc::clone(&sink) as Arc<dyn TraceSink>,
+    );
+    let root_faults = Arc::new(FaultController::new());
+    let register = Arc::new(FaultableConditionalRegister::new(
+        Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&root_faults),
+        foundation_trace,
+    )) as Arc<dyn ConditionalRegister>;
+    let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+
+    let a = build_node(
+        owner_a(),
+        "tcp://owner-a:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let b = build_node(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let c = build_node(
+        owner_c(),
+        "tcp://owner-c:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+
+    let a_session = bootstrap_and_serve(
+        &a.coordinator,
+        &a.foundation,
+        key(),
+        WriterTerm::new(1).expect("t1"),
+        runtime_config(owner_a()),
+        Arc::clone(&register),
+        Arc::clone(&a.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await
+    .expect("A Serving");
+    let expected_a = a_session.generation().clone();
+    let a_active = expected_a.active_loglet_id.clone();
+    let receipt_a = commit_one(&a_session, 0, b"churn-a-0").await;
+    drop(a_session);
+    a.resolver.remove(&a_active);
+
+    // B dies at intent reply-loss; must not leave two writers.
+    root_faults.arm(ArmedFault::RootCasReplyLost);
+    let b_attempt = promote_and_serve(
+        &b.coordinator,
+        &b.foundation,
+        key(),
+        WriterTerm::new(2).expect("t2"),
+        expected_a.clone(),
+        runtime_config(owner_b()),
+        Arc::clone(&register),
+        Arc::clone(&b.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await;
+    assert_at_most_one_effective_writer(
+        &register,
+        &[
+            (&a, owner_a(), Some(&a_active)),
+            (&b, owner_b(), None),
+            (&c, owner_c(), None),
+        ],
+    )
+    .await;
+
+    // If B already reached Serving despite reply-loss, adopt it; else C finishes
+    // from Expected(A) or resumes durable Transitioning via promote.
+    let (serving_owner_id, serving_term, serving_active, serving_session) = match b_attempt {
+        Ok(session) => {
+            let generation = session.generation().clone();
+            (
+                owner_b(),
+                2_u64,
+                generation.active_loglet_id.clone(),
+                session,
+            )
+        }
+        Err(_) => {
+            // Clear one-shot fault; C promotes with term 3 from original Expected(A)
+            // if intent never applied, or reconciles if Transitioning for B remains.
+            let (_obs, mid) = observe_authority(
+                Arc::clone(&register),
+                Arc::clone(&c.resolver) as Arc<dyn LogletResolver>,
+            )
+            .await;
+            match &mid.state {
+                AuthorityState::Transitioning { intent }
+                    if intent.candidate_owner_id == owner_b() =>
+                {
+                    // Durable B intent: B must resume, not abandon.
+                    let b_session = promote_and_serve(
+                        &b.coordinator,
+                        &b.foundation,
+                        key(),
+                        WriterTerm::new(2).expect("t2"),
+                        expected_a.clone(),
+                        runtime_config(owner_b()),
+                        Arc::clone(&register),
+                        Arc::clone(&b.resolver),
+                        SystemClock::new(),
+                        SystemTimer::new(),
+                    )
+                    .await
+                    .expect("B resumes durable Transitioning");
+                    let generation = b_session.generation().clone();
+                    (
+                        owner_b(),
+                        2_u64,
+                        generation.active_loglet_id.clone(),
+                        b_session,
+                    )
+                }
+                AuthorityState::Serving { authority, .. } if authority.owner_id == owner_b() => {
+                    let b_session = promote_and_serve(
+                        &b.coordinator,
+                        &b.foundation,
+                        key(),
+                        WriterTerm::new(2).expect("t2"),
+                        expected_a.clone(),
+                        runtime_config(owner_b()),
+                        Arc::clone(&register),
+                        Arc::clone(&b.resolver),
+                        SystemClock::new(),
+                        SystemTimer::new(),
+                    )
+                    .await
+                    .expect("adopt B Serving");
+                    let generation = b_session.generation().clone();
+                    (
+                        owner_b(),
+                        2_u64,
+                        generation.active_loglet_id.clone(),
+                        b_session,
+                    )
+                }
+                _ => {
+                    // Intent never applied: C completes Expected(A) at term 3.
+                    let c_session = promote_and_serve(
+                        &c.coordinator,
+                        &c.foundation,
+                        key(),
+                        WriterTerm::new(3).expect("t3"),
+                        expected_a.clone(),
+                        runtime_config(owner_c()),
+                        Arc::clone(&register),
+                        Arc::clone(&c.resolver),
+                        SystemClock::new(),
+                        SystemTimer::new(),
+                    )
+                    .await
+                    .expect("C completes after B intent loss");
+                    let generation = c_session.generation().clone();
+                    (
+                        owner_c(),
+                        3_u64,
+                        generation.active_loglet_id.clone(),
+                        c_session,
+                    )
+                }
+            }
+        }
+    };
+
+    let (_obs, after) = observe_authority(
+        Arc::clone(&register),
+        Arc::clone(&a.resolver) as Arc<dyn LogletResolver>,
+    )
+    .await;
+    let (owner, term, _) = serving_owner(&after).expect("Serving after churn");
+    assert_eq!(owner, serving_owner_id);
+    assert_eq!(term.get(), serving_term);
+    assert!(term.get() > 1);
+
+    let receipt_post = commit_one(&serving_session, 1, b"churn-post-0").await;
+    assert!(
+        receipt_post.first_offset.get() >= receipt_a.next_offset.get(),
+        "post-cutover offsets must continue forward"
+    );
+
+    // Stale A cannot ACK.
+    let a_gate = gate(
+        Arc::clone(&register),
+        Arc::clone(&a.resolver),
+        owner_a(),
+        Some(&a_active),
+    )
+    .await;
+    assert!(matches!(a_gate, AuthorityGateDecision::Denied { .. }));
+
+    assert_exactly_one_effective_writer(
+        &register,
+        &[
+            (&a, owner_a(), Some(&a_active)),
+            (&b, owner_b(), Some(&serving_active)),
+            (&c, owner_c(), Some(&serving_active)),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn churn_seal_interrupt_then_c_recovers() {
+    let register = Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>;
+    let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+
+    let a = build_node(
+        owner_a(),
+        "tcp://owner-a:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let c = build_node(
+        owner_c(),
+        "tcp://owner-c:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+
+    let a_session = bootstrap_and_serve(
+        &a.coordinator,
+        &a.foundation,
+        key(),
+        WriterTerm::new(1).expect("t1"),
+        runtime_config(owner_a()),
+        Arc::clone(&register),
+        Arc::clone(&a.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await
+    .expect("A Serving");
+    let expected_a = a_session.generation().clone();
+    let predecessor = expected_a.active_loglet_id.clone();
+    let receipt_a = commit_one(&a_session, 0, b"seal-churn-a").await;
+
+    // B dies at sealed-tail; durable Transitioning remains for B.
+    let faulty_b = build_node_with_observer(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+        Some(Arc::new(InterruptAt::new(
+            FoundationTransitionCheckpoint::SealedTailObserved,
+        ))),
+    );
+    let failure = faulty_b
+        .coordinator
+        .promote(
+            key(),
+            WriterTerm::new(2).expect("t2"),
+            FoundationPrecondition::Expected(expected_a.clone()),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await;
+    assert!(matches!(
+        failure,
+        Err(CoordinatorError::FoundationFailed(
+            FoundationTransitionError::Indeterminate(_)
+        ))
+    ));
+    assert!(!a_session.is_effective_writer().await);
+
+    // Fresh candidate C cannot steal with stale Expected(A) while B's Transitioning
+    // is locked on the root.
+    let stale_c = c
+        .coordinator
+        .promote(
+            key(),
+            WriterTerm::new(3).expect("t3"),
+            FoundationPrecondition::Expected(expected_a),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await;
+    assert!(
+        stale_c.is_err(),
+        "C must not abandon B's durable Transitioning via stale Expected(A)"
+    );
+
+    // B recovers forward-only (same candidate identity, fresh process).
+    let recovered_b = build_node(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let serving = recovered_b
+        .coordinator
+        .reconcile(
+            key(),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await
+        .expect("B forward recovery after seal interrupt");
+    let (owner, term, generation) = serving_owner(&serving).expect("Serving");
+    assert_eq!(owner, owner_b());
+    assert_eq!(term.get(), 2);
+    assert_ne!(generation.active_loglet_id, predecessor);
+
+    // Activate via gate: reconcile already published Serving + writable for B.
+    let b_active = generation.active_loglet_id.clone();
+    drop(a_session);
+    a.resolver.remove(&predecessor);
+
+    let b_gate = gate(
+        Arc::clone(&register),
+        Arc::clone(&recovered_b.resolver),
+        owner_b(),
+        Some(&b_active),
+    )
+    .await;
+    assert!(
+        is_effective(&b_gate),
+        "recovered B must be effective writer after seal churn"
+    );
+    let c_gate = gate(
+        Arc::clone(&register),
+        Arc::clone(&c.resolver),
+        owner_c(),
+        Some(&b_active),
+    )
+    .await;
+    assert!(matches!(c_gate, AuthorityGateDecision::Denied { .. }));
+
+    assert_exactly_one_effective_writer(
+        &register,
+        &[
+            (&a, owner_a(), Some(&predecessor)),
+            (&recovered_b, owner_b(), Some(&b_active)),
+            (&c, owner_c(), Some(&b_active)),
+        ],
+    )
+    .await;
+    let _ = receipt_a;
+}
+
+#[tokio::test]
+async fn churn_successor_provisioned_then_finish_without_abandon() {
+    let register = Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>;
+    let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+    let (a, _b, session) = bootstrap_a(
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    )
+    .await;
+    let expected = session.generation().clone();
+    let predecessor = expected.active_loglet_id.clone();
+    let _ = commit_one(&session, 0, b"prov-churn-a").await;
+
+    let faulty_b = build_node_with_observer(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+        Some(Arc::new(InterruptAt::new(
+            FoundationTransitionCheckpoint::SuccessorProvisioned,
+        ))),
+    );
+    let failure = faulty_b
+        .coordinator
+        .promote(
+            key(),
+            WriterTerm::new(2).expect("t2"),
+            FoundationPrecondition::Expected(expected.clone()),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await;
+    assert!(matches!(
+        failure,
+        Err(CoordinatorError::FoundationFailed(
+            FoundationTransitionError::Indeterminate(_)
+        ))
+    ));
+
+    let recovered_b = build_node(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let serving = recovered_b
+        .coordinator
+        .reconcile(
+            key(),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await
+        .expect("resume after successor-provisioned interrupt — no unsafe abandon");
+    let (owner, term, generation) = serving_owner(&serving).expect("Serving");
+    assert_eq!(owner, owner_b());
+    assert_eq!(term.get(), 2);
+    assert_ne!(generation.active_loglet_id, predecessor);
+    assert!(
+        recovered_b
+            .resolver
+            .is_writable(&generation.active_loglet_id)
+    );
+
+    assert_at_most_one_effective_writer(
+        &register,
+        &[
+            (&a, owner_a(), Some(&predecessor)),
+            (&recovered_b, owner_b(), Some(&generation.active_loglet_id)),
+        ],
+    )
+    .await;
+    drop(session);
+}
+
+#[tokio::test]
+async fn churn_stale_a_cannot_ack_after_b_serving() {
+    let register = Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>;
+    let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+    let (a, b, a_session) = bootstrap_a(
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    )
+    .await;
+    let expected = a_session.generation().clone();
+    let a_active = expected.active_loglet_id.clone();
+    let receipt_a = commit_one(&a_session, 0, b"stale-deny-a").await;
+    drop(a_session);
+    a.resolver.remove(&a_active);
+
+    let b_session = promote_and_serve(
+        &b.coordinator,
+        &b.foundation,
+        key(),
+        WriterTerm::new(2).expect("t2"),
+        expected.clone(),
+        runtime_config(owner_b()),
+        Arc::clone(&register),
+        Arc::clone(&b.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await
+    .expect("B Serving");
+    let b_active = b_session.generation().active_loglet_id.clone();
+    let receipt_b = commit_one(&b_session, 1, b"stale-deny-b").await;
+    assert!(receipt_b.first_offset.get() >= receipt_a.next_offset.get());
+
+    let a_gate = gate(
+        Arc::clone(&register),
+        Arc::clone(&a.resolver),
+        owner_a(),
+        Some(&a_active),
+    )
+    .await;
+    assert!(matches!(a_gate, AuthorityGateDecision::Denied { .. }));
+
+    // Stale Expected(A) promote from A must fail.
+    let stale = a
+        .coordinator
+        .promote(
+            key(),
+            WriterTerm::new(3).expect("t3"),
+            FoundationPrecondition::Expected(expected),
+            LocalServingEligibility {
+                is_writable: true,
+                is_sealed: false,
+            },
+        )
+        .await;
+    assert!(stale.is_err(), "stale A promote must fail after B Serving");
+
+    assert_exactly_one_effective_writer(
+        &register,
+        &[
+            (&a, owner_a(), Some(&a_active)),
+            (&b, owner_b(), Some(&b_active)),
+        ],
+    )
+    .await;
+}
+
+mod churn_negative_controls {
+    use super::{
+        JournalGenerationRef, assert_generation_bound_to_membership, key, owner_a, serving_owner,
+    };
+    use holylog::virtual_log::LogletId;
+    use scripture::serving_authority::{
+        AuthorityState, RouteHint, ServingAuthorityRecord, WriterAuthority, WriterTerm,
+    };
+    use scripture::{JournalId, OwnerId, VerseId};
+
+    #[test]
+    fn trips_when_generation_ref_mismatches_membership_binding() {
+        let generation_ref = JournalGenerationRef::from_active_generation(
+            1,
+            LogletId::new("loglet-a").expect("id"),
+            0,
+        );
+        let record = ServingAuthorityRecord::new(
+            key(),
+            AuthorityState::Serving {
+                authority: WriterAuthority {
+                    owner_id: owner_a(),
+                    writer_term: WriterTerm::new(1).expect("t1"),
+                    generation_ref: generation_ref.clone(),
+                },
+                route_hint: RouteHint::new("tcp://a:9000").expect("route"),
+            },
+        );
+        let mut observed = holylog::virtual_log::VersionedState {
+            state: holylog::virtual_log::VirtualLogState {
+                revision: 1,
+                generations: vec![holylog::virtual_log::GenerationDescriptor {
+                    loglet_id: LogletId::new("loglet-a").expect("id"),
+                    start: 0,
+                }],
+                application_fence: record.encode_application_fence().expect("encode"),
+            },
+            token: holylog::virtual_log::CompareToken::from_revision(1),
+        };
+        // Intact binding must pass.
+        assert_generation_bound_to_membership(&observed, &record);
+
+        // Corrupt membership start so binding trips.
+        observed.state.generations[0].start = 99;
+        let from_membership =
+            JournalGenerationRef::from_virtual_log_state(&observed.state).expect("bind");
+        assert_ne!(
+            generation_ref, from_membership,
+            "negative control: intentional membership divergence must be visible"
+        );
+    }
+
+    #[test]
+    fn trips_when_serving_owner_term_regression_is_forced() {
+        let generation_ref = JournalGenerationRef::from_active_generation(
+            2,
+            LogletId::new("loglet-b").expect("id"),
+            1,
+        );
+        let newer = ServingAuthorityRecord::new(
+            key(),
+            AuthorityState::Serving {
+                authority: WriterAuthority {
+                    owner_id: OwnerId::from_bytes(*b"ha1rec-own-b!!!!"),
+                    writer_term: WriterTerm::new(2).expect("t2"),
+                    generation_ref: generation_ref.clone(),
+                },
+                route_hint: RouteHint::new("tcp://b:9000").expect("route"),
+            },
+        );
+        let older = ServingAuthorityRecord::new(
+            AuthorityKey {
+                journal_id: JournalId::from_bytes(*b"ha1rec-journal!!"),
+                verse_id: VerseId::from_bytes(*b"ha1rec-verse!!!!"),
+            },
+            AuthorityState::Serving {
+                authority: WriterAuthority {
+                    owner_id: owner_a(),
+                    writer_term: WriterTerm::new(1).expect("t1"),
+                    generation_ref,
+                },
+                route_hint: RouteHint::new("tcp://a:9000").expect("route"),
+            },
+        );
+        let (_, term_new, _) = serving_owner(&newer).expect("newer");
+        let (_, term_old, _) = serving_owner(&older).expect("older");
+        assert!(
+            term_new.get() > term_old.get(),
+            "negative control: forced term regression must be detectable"
+        );
+        let _ = older;
+    }
+
+    use scripture::serving_authority::AuthorityKey;
+}

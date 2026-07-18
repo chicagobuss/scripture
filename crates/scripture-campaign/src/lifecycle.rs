@@ -235,6 +235,7 @@ impl RunLifecycle {
                 ],
                 faults,
                 require_ready,
+                endpoint_override: None,
             },
         )
     }
@@ -261,6 +262,18 @@ impl RunLifecycle {
         scenario: &str,
         candidate_term: u64,
         faults: ActorFaultEnv,
+    ) -> Result<ActorPlacement, LifecycleError> {
+        self.deploy_actor_b_promote_with_endpoint(profile, scenario, candidate_term, faults, None)
+    }
+
+    /// Deploys promote actor B with an optional store endpoint override (family 16 Toxiproxy).
+    pub fn deploy_actor_b_promote_with_endpoint(
+        &self,
+        profile: &RustFsHomeFleetProfile,
+        scenario: &str,
+        candidate_term: u64,
+        faults: ActorFaultEnv,
+        endpoint_override: Option<&str>,
     ) -> Result<ActorPlacement, LifecycleError> {
         let term = candidate_term.to_string();
         let args_owned = [
@@ -290,6 +303,47 @@ impl RunLifecycle {
                 args: &args_ref,
                 faults,
                 require_ready,
+                endpoint_override,
+            },
+        )
+    }
+
+    /// Deploys promote actor C (family 16 recovery after B death).
+    pub fn deploy_actor_c_promote(
+        &self,
+        profile: &RustFsHomeFleetProfile,
+        scenario: &str,
+        candidate_term: u64,
+    ) -> Result<ActorPlacement, LifecycleError> {
+        let term = candidate_term.to_string();
+        let args_owned = [
+            "promote".to_owned(),
+            "--config".to_owned(),
+            "/etc/scripture/scripture.yaml".to_owned(),
+            "--candidate-term".to_owned(),
+            term,
+        ];
+        let args_ref = [
+            args_owned[0].as_str(),
+            args_owned[1].as_str(),
+            args_owned[2].as_str(),
+            args_owned[3].as_str(),
+            args_owned[4].as_str(),
+        ];
+        self.deploy_actor(
+            profile,
+            scenario,
+            ActorDeploy {
+                name: "scripture-actor-c",
+                role: "writer-c",
+                owner_id: "scripture-own-c!",
+                // Reuse B's node; distinct owner/pod prove process separation.
+                node: &profile.writer_b_node,
+                configmap: "scripture-actor-c-config",
+                args: &args_ref,
+                faults: ActorFaultEnv::default(),
+                require_ready: true,
+                endpoint_override: None,
             },
         )
     }
@@ -415,10 +469,13 @@ impl RunLifecycle {
         spec: ActorDeploy<'_>,
     ) -> Result<ActorPlacement, LifecycleError> {
         let advertise = format!("tcp://{}.{}:9000", spec.name, self.namespace);
+        let endpoint = spec
+            .endpoint_override
+            .unwrap_or(self.store.service_dns.as_str());
         let config = actor_config_yaml(
             spec.owner_id,
             &advertise,
-            &self.store.service_dns,
+            endpoint,
             &self.store.bucket,
             &self.ha_prefix(scenario),
         );
@@ -483,6 +540,232 @@ impl RunLifecycle {
     pub fn secret_key(&self) -> &str {
         &self.secret_key
     }
+
+    /// In-cluster Toxiproxy listen endpoint for B→RustFS (family 16).
+    #[must_use]
+    pub fn toxiproxy_listen_endpoint(&self) -> String {
+        format!("http://toxiproxy.{}:19000", self.namespace)
+    }
+
+    /// Deploys a pinned Toxiproxy Deployment+Service in this run namespace.
+    ///
+    /// Upstream is the run-owned RustFS Service. Control API is port 8474.
+    pub fn deploy_toxiproxy(&self) -> Result<ToxiproxyIdentity, LifecycleError> {
+        refuse_outside_namespace_mutations(&self.namespace)?;
+        apply_yaml(
+            &self.kube_context,
+            &toxiproxy_manifest(&self.namespace, &self.run_id),
+        )?;
+        wait_for_deployment(
+            &self.kube_context,
+            &self.namespace,
+            "toxiproxy",
+            Duration::from_secs(180),
+        )?;
+        Ok(ToxiproxyIdentity {
+            service: "toxiproxy".into(),
+            listen_endpoint: self.toxiproxy_listen_endpoint(),
+            upstream: format!("rustfs.{}:9000", self.namespace),
+            control_port: 8474,
+            listen_port: 19000,
+            image: TOXIPROXY_IMAGE.into(),
+        })
+    }
+
+    /// Creates the named proxy through the Toxiproxy control API (via local port-forward URL).
+    pub fn toxiproxy_ensure_proxy(
+        &self,
+        control_base: &str,
+        name: &str,
+        listen: &str,
+        upstream: &str,
+    ) -> Result<serde_json::Value, LifecycleError> {
+        let body = serde_json::json!({
+            "name": name,
+            "listen": listen,
+            "upstream": upstream,
+            "enabled": true,
+        });
+        curl_json(
+            "POST",
+            &format!("{}/proxies", control_base.trim_end_matches('/')),
+            Some(&body),
+        )
+    }
+
+    /// Enables or disables an existing Toxiproxy proxy (directional cut).
+    pub fn toxiproxy_set_enabled(
+        &self,
+        control_base: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<serde_json::Value, LifecycleError> {
+        let body = serde_json::json!({ "enabled": enabled });
+        curl_json(
+            "PATCH",
+            &format!("{}/proxies/{}", control_base.trim_end_matches('/'), name),
+            Some(&body),
+        )
+    }
+
+    /// GETs one Toxiproxy proxy for evidence.
+    pub fn toxiproxy_get_proxy(
+        &self,
+        control_base: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, LifecycleError> {
+        curl_json(
+            "GET",
+            &format!("{}/proxies/{}", control_base.trim_end_matches('/'), name),
+            None,
+        )
+    }
+
+    /// Inventories redacted resource identities in this run namespace.
+    pub fn inventory_resources(&self) -> Result<NamespaceInventory, LifecycleError> {
+        refuse_outside_namespace_mutations(&self.namespace)?;
+        Ok(NamespaceInventory {
+            namespace: self.namespace.clone(),
+            pods: names_of(&self.kube_context, &self.namespace, "pods")?,
+            services: names_of(&self.kube_context, &self.namespace, "services")?,
+            configmaps: names_of(&self.kube_context, &self.namespace, "configmaps")?,
+            secrets: names_of(&self.kube_context, &self.namespace, "secrets")?,
+            jobs: names_of(&self.kube_context, &self.namespace, "jobs")?,
+            deployments: names_of(&self.kube_context, &self.namespace, "deployments")?,
+        })
+    }
+
+    /// Deletes the run namespace and waits until it is gone (bounded).
+    pub fn cleanup_and_wait(&mut self, limit: Duration) -> Result<(), LifecycleError> {
+        refuse_outside_namespace_mutations(&self.namespace)?;
+        let _ = kubectl(
+            &self.kube_context,
+            &["delete", "namespace", &self.namespace, "--wait=false"],
+        );
+        self.cleanup_on_drop = false;
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            let exists = kubectl(
+                &self.kube_context,
+                &["get", "namespace", &self.namespace, "-o", "name"],
+            );
+            if exists.is_err() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(LifecycleError::Timeout(format!(
+                    "namespace {} still present after {:?}",
+                    self.namespace, limit
+                )));
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+/// Proves a second scenario-owned namespace cleans up completely (family 21).
+///
+/// Creates `{parent_run_id}-c21`, optionally deploys Toxiproxy, inventories
+/// before/after, waits for namespace deletion, and confirms absence.
+pub(crate) fn prove_cleanup_independence(
+    profile: &RustFsHomeFleetProfile,
+    parent_run_id: &str,
+) -> Result<serde_json::Value, LifecycleError> {
+    let child_id = format!("{}-c21", crate::profile::sanitize_k8s_label(parent_run_id));
+    let child_ns = profile.run_namespace(&child_id);
+    refuse_outside_namespace_mutations(&child_ns)?;
+    // Ensure no leftover from a prior aborted attempt.
+    let _ = kubectl(
+        &profile.kube_context,
+        &["delete", "namespace", &child_ns, "--wait=false"],
+    );
+    wait_for_namespace_gone(&profile.kube_context, &child_ns, Duration::from_secs(180))?;
+
+    let mut child = RunLifecycle::create(profile, &child_id, false)?;
+    let inventory_before = child.inventory_resources()?;
+    let proxy = child.deploy_toxiproxy()?;
+    let actor = child.deploy_actor_a(profile, "raw-lines-resource-cleanup-child")?;
+    let inventory_with_proxy = child.inventory_resources()?;
+    if !inventory_with_proxy
+        .services
+        .iter()
+        .any(|name| name == "toxiproxy")
+        || !inventory_with_proxy
+            .services
+            .iter()
+            .any(|name| name == "scripture-actor-a")
+        || !inventory_with_proxy
+            .configmaps
+            .iter()
+            .any(|name| name == "scripture-actor-a-config")
+    {
+        return Err(LifecycleError::Isolation(
+            "second-run inventory is missing its Toxiproxy or Scripture actor resources".into(),
+        ));
+    }
+    child.cleanup_and_wait(Duration::from_secs(180))?;
+    Ok(serde_json::json!({
+        "child_run_id": child_id,
+        "child_namespace": child_ns,
+        "inventory_before": inventory_before,
+        "inventory_with_proxy": inventory_with_proxy,
+        "toxiproxy": proxy,
+        "actor": actor,
+        "namespace_gone_after_cleanup": true,
+        "second_run_independent": true,
+    }))
+}
+
+/// Pinned Toxiproxy image for family 16 (scenario-owned, not a framework).
+const TOXIPROXY_IMAGE: &str = "ghcr.io/shopify/toxiproxy:2.12.0";
+
+/// Redacted Toxiproxy placement facts for artifacts.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToxiproxyIdentity {
+    /// Service name inside the run namespace.
+    pub service: String,
+    /// Endpoint B must use (`http://toxiproxy.{ns}:19000`).
+    pub listen_endpoint: String,
+    /// Upstream RustFS host:port (no credentials).
+    pub upstream: String,
+    /// Control API container port.
+    pub control_port: u16,
+    /// Listen proxy container port.
+    pub listen_port: u16,
+    /// Pinned image reference.
+    pub image: String,
+}
+
+/// Redacted names of objects in a run namespace (never secret values).
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct NamespaceInventory {
+    /// Namespace name.
+    pub namespace: String,
+    /// Pod names.
+    pub pods: Vec<String>,
+    /// Service names.
+    pub services: Vec<String>,
+    /// ConfigMap names.
+    pub configmaps: Vec<String>,
+    /// Secret names (names only).
+    pub secrets: Vec<String>,
+    /// Job names.
+    pub jobs: Vec<String>,
+    /// Deployment names.
+    pub deployments: Vec<String>,
+}
+
+impl NamespaceInventory {
+    /// True when no inventory entries remain (namespace empty or gone).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pods.is_empty()
+            && self.services.is_empty()
+            && self.configmaps.is_empty()
+            && self.secrets.is_empty()
+            && self.jobs.is_empty()
+            && self.deployments.is_empty()
+    }
 }
 
 /// Optional campaign-fault environment for temporary actors (WP06).
@@ -542,6 +825,8 @@ struct ActorDeploy<'a> {
     args: &'a [&'a str],
     faults: ActorFaultEnv,
     require_ready: bool,
+    /// When set, actor `store.endpoint` points here instead of run-owned RustFS DNS.
+    endpoint_override: Option<&'a str>,
 }
 
 /// Lifecycle failures.
@@ -882,6 +1167,23 @@ fn wait_for_pod_gone(
     )))
 }
 
+fn wait_for_namespace_gone(
+    context: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> Result<(), LifecycleError> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if kubectl(context, &["get", "namespace", namespace, "-o", "name"]).is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Err(LifecycleError::Timeout(format!(
+        "namespace {namespace} still present after {timeout:?}"
+    )))
+}
+
 fn actor_placement(
     context: &str,
     namespace: &str,
@@ -1202,6 +1504,17 @@ spec:
       ports:
         - protocol: TCP
           port: 9000
+    # Scenario-owned Toxiproxy data port (family 16 directional fault).
+    # The control port is reached only through the local campaign-runner
+    # port-forward; actors must not be able to alter their own fault state.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: toxiproxy
+              scripture.dev/run-id: {run_id}
+      ports:
+        - protocol: TCP
+          port: 19000
 "#
     )
 }
@@ -1423,6 +1736,130 @@ struct ActorPodSpec<'a> {
     faults: &'a ActorFaultEnv,
 }
 
+fn toxiproxy_manifest(namespace: &str, run_id: &str) -> String {
+    format!(
+        r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: {namespace}
+  labels:
+    app.kubernetes.io/name: toxiproxy
+    scripture.dev/run-id: {run_id}
+    scripture.dev/component: directional-fault-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: toxiproxy
+      scripture.dev/run-id: {run_id}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: toxiproxy
+        scripture.dev/run-id: {run_id}
+        scripture.dev/component: directional-fault-proxy
+    spec:
+      containers:
+        - name: toxiproxy
+          image: {image}
+          args: ["-host", "0.0.0.0", "-port", "8474"]
+          ports:
+            - name: api
+              containerPort: 8474
+            - name: proxy
+              containerPort: 19000
+          readinessProbe:
+            tcpSocket:
+              port: api
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: toxiproxy
+  namespace: {namespace}
+  labels:
+    app.kubernetes.io/name: toxiproxy
+    scripture.dev/run-id: {run_id}
+spec:
+  selector:
+    app.kubernetes.io/name: toxiproxy
+    scripture.dev/run-id: {run_id}
+  ports:
+    - name: api
+      port: 8474
+      targetPort: api
+    - name: proxy
+      port: 19000
+      targetPort: proxy
+"#,
+        image = TOXIPROXY_IMAGE,
+    )
+}
+
+fn curl_json(
+    method: &str,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, LifecycleError> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-sS",
+        "-X",
+        method,
+        "-H",
+        "Content-Type: application/json",
+        "--max-time",
+        "15",
+    ]);
+    if let Some(body) = body {
+        command.args(["-d", &body.to_string()]);
+    }
+    command.arg(url);
+    let output = command
+        .output()
+        .map_err(|error| LifecycleError::Kubectl(format!("curl spawn: {error}")))?;
+    if !output.status.success() {
+        return Err(LifecycleError::Kubectl(format!(
+            "curl {method} {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(stdout.trim()).map_err(|error| {
+        LifecycleError::Kubectl(format!(
+            "curl {method} {url} JSON: {error}; body={}",
+            stdout.trim()
+        ))
+    })
+}
+
+fn names_of(context: &str, namespace: &str, resource: &str) -> Result<Vec<String>, LifecycleError> {
+    let raw = kubectl(
+        context,
+        &[
+            "-n",
+            namespace,
+            "get",
+            resource,
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
+        ],
+    )
+    .unwrap_or_default();
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{namespace_yaml, network_policy_yaml, refuse_outside_namespace_mutations};
@@ -1441,5 +1878,10 @@ mod tests {
         let np = network_policy_yaml("r1", "scripture-correctness-r1");
         assert!(np.contains("default-deny"));
         assert!(np.contains("app.kubernetes.io/name: rustfs"));
+        assert!(np.contains("port: 19000"));
+        assert!(
+            !np.contains("port: 8474"),
+            "actor egress must not reach the Toxiproxy control API"
+        );
     }
 }

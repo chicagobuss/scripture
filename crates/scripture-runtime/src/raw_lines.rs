@@ -482,7 +482,17 @@ async fn sleep_idle(idle: Option<Duration>) {
 
 #[cfg(test)]
 mod tests {
-    use super::allocate_connection_producer;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use futures::channel::oneshot;
+    use scripture::{AckLevel, ChunkId, JournalId, Receipt, ReceiptFuture, RecordOffset};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::{
+        RawLinesConfig, RawLinesConnectionMetrics, RawLinesSink, allocate_connection_producer,
+        serve_raw_lines_pipeline,
+    };
 
     #[test]
     fn connection_producers_are_fresh() {
@@ -492,5 +502,212 @@ mod tests {
             first, second,
             "distinct connections must not share dedup identity"
         );
+    }
+
+    /// Sink that holds every receipt until `release_all` — models wedged receipts.
+    struct WedgedSink {
+        held: Mutex<Vec<oneshot::Sender<Result<Receipt, scripture::DriverError>>>>,
+        admitted: Mutex<u64>,
+        flushes: Mutex<u64>,
+    }
+
+    impl WedgedSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                held: Mutex::new(Vec::new()),
+                admitted: Mutex::new(0),
+                flushes: Mutex::new(0),
+            })
+        }
+
+        fn admitted(&self) -> u64 {
+            *self.admitted.lock().expect("admitted")
+        }
+
+        fn held_count(&self) -> usize {
+            self.held.lock().expect("held").len()
+        }
+
+        fn release_all(&self) {
+            let senders = std::mem::take(&mut *self.held.lock().expect("held"));
+            for (index, sender) in senders.into_iter().enumerate() {
+                let offset = RecordOffset::new(index as u64);
+                let next = RecordOffset::new(index as u64 + 1);
+                let _ = sender.send(Ok(Receipt {
+                    level: AckLevel::Committed,
+                    journal_id: JournalId::from_bytes(*b"rawlines-bounds!"),
+                    first_offset: offset,
+                    next_offset: next,
+                    chunk_id: ChunkId::from_bytes(*b"rawlines-chunk!!"),
+                    slot: index as u64,
+                    canon_revision: 1,
+                    deduplicated: false,
+                }));
+            }
+        }
+    }
+
+    impl RawLinesSink for Arc<WedgedSink> {
+        async fn submit(
+            &self,
+            _submission: scripture::Submission,
+        ) -> Result<ReceiptFuture, String> {
+            let (tx, rx) = oneshot::channel();
+            self.held.lock().expect("held").push(tx);
+            *self.admitted.lock().expect("admitted") += 1;
+            Ok(ReceiptFuture::from_receiver(rx))
+        }
+
+        async fn flush(&self) -> Result<(), String> {
+            *self.flushes.lock().expect("flushes") += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_record_cap_under_wedged_receipts_bounds_admission_and_oks() {
+        let sink = WedgedSink::new();
+        let metrics = Arc::new(RawLinesConnectionMetrics::default());
+        let config = RawLinesConfig {
+            max_line_bytes: 64,
+            max_pending_records: 2,
+            max_pending_bytes: 256,
+            idle_flush: None,
+            attributes: Default::default(),
+        };
+
+        let (mut client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let pipeline = {
+            let sink = Arc::clone(&sink);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(async move {
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+            })
+        };
+
+        // Three lines: two fill the pending cap; the third waits for a head receipt.
+        client.write_all(b"one\ntwo\nthree\n").await.expect("write");
+        // Give the pipeline time to admit up to the cap while receipts stay wedged.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            sink.admitted(),
+            2,
+            "must stop admitting at max_pending_records"
+        );
+        assert_eq!(sink.held_count(), 2);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.committed_ok, 0, "no OK while receipts are wedged");
+        assert!(snap.peak_pending <= 2);
+
+        sink.release_all();
+        // After release, the third line can admit; send EOF to drain.
+        client.shutdown().await.expect("shutdown write");
+        // Unblock any remaining held receipts created after release for line three.
+        for _ in 0..10 {
+            if sink.held_count() == 0 && pipeline.is_finished() {
+                break;
+            }
+            sink.release_all();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut response = String::new();
+        let mut reader = tokio::io::BufReader::new(client);
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut response).await;
+        let ok_count = response
+            .lines()
+            .filter(|line| line.starts_with("OK "))
+            .count();
+        assert!(
+            ok_count <= sink.admitted() as usize,
+            "committed OK count ({ok_count}) must not exceed admitted ({})",
+            sink.admitted()
+        );
+        assert!(
+            ok_count >= 2,
+            "at least the capped admissions should commit after release; got {ok_count} from {response:?}"
+        );
+        let _ = pipeline.await;
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_rejected_without_committed_ok() {
+        let sink = WedgedSink::new();
+        let metrics = Arc::new(RawLinesConnectionMetrics::default());
+        let config = RawLinesConfig {
+            max_line_bytes: 4,
+            max_pending_records: 8,
+            max_pending_bytes: 64,
+            idle_flush: None,
+            attributes: Default::default(),
+        };
+        let (mut client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let pipeline = {
+            let sink = Arc::clone(&sink);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(async move {
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+            })
+        };
+        client.write_all(b"toolong\n").await.expect("write");
+        client.shutdown().await.expect("shutdown");
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("ERR"),
+            "oversized line must fail-closed with ERR; got {text:?}"
+        );
+        assert_eq!(sink.admitted(), 0);
+        assert_eq!(metrics.snapshot().committed_ok, 0);
+        let _ = pipeline.await;
+    }
+
+    #[tokio::test]
+    async fn pending_byte_cap_reserves_one_max_line() {
+        let sink = WedgedSink::new();
+        let metrics = Arc::new(RawLinesConnectionMetrics::default());
+        // max_pending_bytes=16, max_line_bytes=8 → admit while pending_bytes <= 8.
+        // First 6-byte line leaves room; second fills past the reserve.
+        let config = RawLinesConfig {
+            max_line_bytes: 8,
+            max_pending_records: 32,
+            max_pending_bytes: 16,
+            idle_flush: None,
+            attributes: Default::default(),
+        };
+        let (mut client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let pipeline = {
+            let sink = Arc::clone(&sink);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(async move {
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+            })
+        };
+        client
+            .write_all(b"abcdef\nghijkl\nmnopqr\n")
+            .await
+            .expect("write");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            sink.admitted(),
+            2,
+            "byte cap with max-line reserve must stop after the second line"
+        );
+        assert_eq!(metrics.snapshot().committed_ok, 0);
+        sink.release_all();
+        client.shutdown().await.expect("shutdown");
+        for _ in 0..10 {
+            if pipeline.is_finished() {
+                break;
+            }
+            sink.release_all();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = pipeline.await;
+        assert!(sink.admitted() <= 3);
+        assert!(metrics.snapshot().committed_ok <= sink.admitted());
     }
 }
