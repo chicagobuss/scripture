@@ -36,7 +36,9 @@ fi
 registry_configured() {
   [[ -n "${CARGO_REGISTRIES_FLEET_INDEX:-}" ]] && return 0
   local cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-  [[ -f "$cargo_home/config.toml" ]] && grep -q '\[registries.fleet\]' "$cargo_home/config.toml"
+  [[ -f "$cargo_home/config.toml" ]] && grep -q '\[registries.fleet\]' "$cargo_home/config.toml" && return 0
+  # Repo-local ignored operator config (see .gitignore /.cargo/config.toml).
+  [[ -f "$root/.cargo/config.toml" ]] && grep -q '\[registries.fleet\]' "$root/.cargo/config.toml"
 }
 
 attempt_package() {

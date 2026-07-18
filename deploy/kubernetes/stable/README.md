@@ -26,6 +26,16 @@ the gitignored overlay `config/local/scripture-stable/` — never in this tree.
 - Publishable crates use `publish = ["fleet"]` (never crates.io).
 - No live `kubectl apply` until Joshua approves the exact command sequence from the release-drill runner.
 
+## Runner
+
+```bash
+./deploy/release/run-release-drill.sh
+# default: contract checks + render + kubectl client-dry-run → config/local/scripture-stable/runs/<run-id>/
+# live: --execute --joshua-approved + APPROVAL file line "APPROVED <run-id>"
+```
+
+Four verdict classes are written to `verdicts.json` and never upgraded into each other.
+
 ## Overlay
 
 Copy `config/local/scripture-stable/overlay.example.env` to an ignored
