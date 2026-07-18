@@ -67,14 +67,22 @@ impl RawLinesConfig {
 }
 
 /// Allocates a fresh producer identity for one accepted connection.
-#[must_use]
-pub(crate) fn allocate_connection_producer() -> ProducerId {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+///
+/// The temporary raw-lines transport has no client-supplied producer identity.
+/// It must therefore never derive an identity from a process-local counter:
+/// that counter resets after an HA cutover, which would turn a new connection
+/// to the promoted process into an apparent retry of a connection to the dead
+/// process. A random identity deliberately gives this temporary transport
+/// at-most-once admission per connection rather than inventing retry semantics
+/// it cannot faithfully provide.
+pub(crate) fn allocate_connection_producer() -> io::Result<ProducerId> {
     let mut bytes = [0_u8; 16];
-    bytes[0..8].copy_from_slice(b"rawline\0");
-    bytes[8..16].copy_from_slice(&n.to_be_bytes());
-    ProducerId::from_bytes(bytes)
+    getrandom::fill(&mut bytes).map_err(|error| {
+        io::Error::other(format!(
+            "cannot allocate raw-lines producer identity: {error}"
+        ))
+    })?;
+    Ok(ProducerId::from_bytes(bytes))
 }
 
 /// Advances a producer sequence after it has been used in a submission.
@@ -178,7 +186,7 @@ where
     W: AsyncWrite + Unpin,
     S: RawLinesSink,
 {
-    let producer_id = allocate_connection_producer();
+    let producer_id = allocate_connection_producer()?;
     let mut reader = BufReader::new(reader);
     let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut pending_bytes = 0_usize;
@@ -469,5 +477,20 @@ async fn sleep_idle(idle: Option<Duration>) {
         tokio::time::sleep(duration).await;
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allocate_connection_producer;
+
+    #[test]
+    fn connection_producers_are_fresh() {
+        let first = allocate_connection_producer().expect("allocate first producer");
+        let second = allocate_connection_producer().expect("allocate second producer");
+        assert_ne!(
+            first, second,
+            "distinct connections must not share dedup identity"
+        );
     }
 }
