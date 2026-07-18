@@ -21,6 +21,7 @@ the gitignored overlay `config/local/scripture-stable/` — never in this tree.
 - Liveness → `/livez`; readiness → `/readyz` (standby must be unready).
 - Owner advertise DNS must resolve via per-owner Services `scripture-actor-a` / `scripture-actor-b` (not the producer Service).
 - Producer ingress only from pods labeled `scripture.dev/client: producer`; admin ingress only from `scripture.dev/client: admin`.
+- Those client labels are **NetworkPolicy selectors, not authentication**. Acceptable for this isolated drill only while the run namespace does not admit untrusted workload creators; stronger admin boundaries need namespace/RBAC separation later.
 - No literal Secret data in tracked YAML.
 - Release image must be built **without** `campaign-faults`.
 - Publishable crates use `publish = ["fleet"]` (never crates.io).
@@ -30,8 +31,10 @@ the gitignored overlay `config/local/scripture-stable/` — never in this tree.
 
 ```bash
 ./deploy/release/run-release-drill.sh
-# default: contract checks + render + kubectl client-dry-run → config/local/scripture-stable/runs/<run-id>/
+# default: contract checks + render + kubectl client-dry-run (syntax/render only)
+#          → config/local/scripture-stable/runs/<run-id>/
 # live: --execute --joshua-approved + APPROVAL file line "APPROVED <run-id>"
+#       requires attested RC provenance first; installs cleanup trap; no partial apply mode
 ```
 
 Four verdict classes are written to `verdicts.json` and never upgraded into each other.

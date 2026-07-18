@@ -100,6 +100,89 @@ spec:
         - protocol: TCP
           port: 9200
 ---
+# Producer clients may reach the producer Service (and owner routes for stale probes).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: producer-client-egress
+  namespace: scripture-stable-REPLACE_RUN_ID
+spec:
+  podSelector:
+    matchLabels:
+      scripture.dev/client: producer
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: scripture
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# Admin clients may reach B's admin port only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admin-client-egress
+  namespace: scripture-stable-REPLACE_RUN_ID
+spec:
+  podSelector:
+    matchLabels:
+      scripture.dev/client: admin
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              scripture.dev/owner: b
+      ports:
+        - protocol: TCP
+          port: 9200
+---
+# Reachability probes: egress only. Without scripture.dev/client=producer,
+# producer ingress must still deny (proves NP is not egress-only theater).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: probe-producer-egress
+  namespace: scripture-stable-REPLACE_RUN_ID
+spec:
+  podSelector:
+    matchLabels:
+      scripture.dev/probe: producer-reach
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: scripture
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# Bucket init + Holylog oracle helpers may talk to the dedicated RustFS only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: store-helper-egress
+  namespace: scripture-stable-REPLACE_RUN_ID
+spec:
+  podSelector:
+    matchExpressions:
+      - key: scripture.dev/role
+        operator: In
+        values: ["bucket-init", "holylog-oracle"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: rustfs
+      ports:
+        - protocol: TCP
+          port: 9000
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -115,6 +198,11 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: scripture
+        - podSelector:
+            matchExpressions:
+              - key: scripture.dev/role
+                operator: In
+                values: ["bucket-init", "holylog-oracle"]
       ports:
         - protocol: TCP
           port: 9000

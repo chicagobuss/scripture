@@ -32,6 +32,11 @@ async fn main() {
         }
         return;
     }
+    if arguments.peek().is_some_and(|arg| arg == "release-oracle") {
+        arguments.next();
+        scripture_campaign::release_oracle_main(&mut arguments).await;
+        return;
+    }
     if let Err(error) = run_legacy(&mut arguments).await {
         exit_with_error(error, 1);
     }

@@ -33,11 +33,14 @@ mod preflight;
 mod producer_identity;
 mod profile;
 mod raw_lines_client;
+mod release_oracle;
 mod resilience;
 mod run;
 mod scenario;
 mod scripted_drive;
 mod trace_observer;
+
+pub use release_oracle::main as release_oracle_main;
 
 pub use artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
 pub use coverage::{CoverageRow, CoverageStatus, family_catalog, merge_executed};

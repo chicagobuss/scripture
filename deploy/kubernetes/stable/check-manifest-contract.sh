@@ -19,6 +19,9 @@ require "$stable/configmaps.yaml" 'advertise: "tcp://scripture-actor-a:9000"' "A
 require "$stable/configmaps.yaml" 'advertise: "tcp://scripture-actor-b:9000"' "B advertise uses owner Service DNS"
 require "$stable/networkpolicies.yaml" 'scripture.dev/client: producer' "producer NetworkPolicy from-selector"
 require "$stable/networkpolicies.yaml" 'scripture.dev/client: admin' "admin NetworkPolicy from-selector"
+require "$stable/networkpolicies.yaml" 'name: producer-client-egress' "producer client egress policy"
+require "$stable/networkpolicies.yaml" 'name: admin-client-egress' "admin client egress policy"
+require "$stable/networkpolicies.yaml" 'name: probe-producer-egress' "probe egress for unlabeled deny test"
 if grep -A20 'name: producer-from-client' "$stable/networkpolicies.yaml" | grep -q 'port: 9200'; then
   echo "producer policy must not open admin port" >&2
   failed=1
