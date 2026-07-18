@@ -34,7 +34,8 @@ the gitignored overlay `config/local/scripture-stable/` — never in this tree.
 # default: contract checks + render + kubectl client-dry-run (syntax/render only)
 #          → config/local/scripture-stable/runs/<run-id>/
 # live: --execute --joshua-approved + APPROVAL file line "APPROVED <run-id>"
-#       requires attested RC provenance first; installs cleanup trap; no partial apply mode
+#       requires registry-only attestation + node import verify; installs cleanup trap
+#       promotion schedule: stale term=1 reject, then concurrent term-2 while B standby
 ```
 
 Four verdict classes are written to `verdicts.json` and never upgraded into each other.

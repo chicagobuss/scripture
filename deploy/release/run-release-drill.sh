@@ -111,7 +111,7 @@ parse_overlay() {
     key="${line%%=*}"
     val="${line#*=}"
     case "$key" in
-      KUBE_CONTEXT|RUN_ID|SCRIPTURE_IMAGE|RUSTFS_NODE|WRITER_A_NODE|WRITER_B_NODE|BUCKET) ;;
+      KUBE_CONTEXT|RUN_ID|SCRIPTURE_IMAGE|RUSTFS_NODE|WRITER_A_NODE|WRITER_B_NODE|BUCKET|RUSTFS_IMAGE|BUSYBOX_IMAGE|CURL_IMAGE|AWS_CLI_IMAGE) ;;
       *) fail "overlay unknown key: $key" ;;
     esac
     if [[ "$val" =~ [\$\`\;\|\&\<\>\(\)\{\}] ]]; then
@@ -133,6 +133,10 @@ parse_overlay() {
   else
     BUCKET="scripture-stable-${RUN_ID}"
   fi
+  RUSTFS_IMAGE="${values[RUSTFS_IMAGE]:-rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3}"
+  BUSYBOX_IMAGE="${values[BUSYBOX_IMAGE]:-busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662}"
+  CURL_IMAGE="${values[CURL_IMAGE]:-curlimages/curl@sha256:08e466006f0860e54fc299378de998935333e0e130a15f6f98482e9f8dab3058}"
+  AWS_CLI_IMAGE="${values[AWS_CLI_IMAGE]:-amazon/aws-cli@sha256:82acb165ccdc3e3f420b3753787847481d2f835d54582402774ec51fdbdc19ab}"
 
   if [[ ! "$RUN_ID" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     fail "RUN_ID must be a DNS-1123 label (got $RUN_ID)"
@@ -153,6 +157,12 @@ parse_overlay() {
     if ! [[ "$SCRIPTURE_IMAGE" =~ ^[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]; then
       fail "SCRIPTURE_IMAGE must match name@sha256:<64 hex> for live"
     fi
+    for img_name in RUSTFS_IMAGE BUSYBOX_IMAGE CURL_IMAGE AWS_CLI_IMAGE; do
+      img_val="${!img_name}"
+      if ! [[ "$img_val" =~ @sha256:[a-f0-9]{64}$ ]]; then
+        fail "$img_name must be digest-pinned (@sha256:<64 hex>) for live"
+      fi
+    done
   elif [[ "$SCRIPTURE_IMAGE" == *REPLACE* ]] || ! [[ "$SCRIPTURE_IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]; then
     log "WARN: SCRIPTURE_IMAGE is not a final name@sha256:<64 hex>; provenance cannot pass"
   fi
@@ -205,12 +215,21 @@ run_package_preflight() {
 }
 
 run_rc_provenance() {
+  local errfile
+  errfile="$(mktemp "${TMPDIR:-/tmp}/rc-prov.XXXXXX")"
+  # Live execute always verifies containerd imports. Preflight skips ssh unless
+  # VERIFY_NODE_IMPORTS=1 is set explicitly.
+  local verify=0
+  if [[ "$execute" -eq 1 || "${VERIFY_NODE_IMPORTS:-0}" == "1" ]]; then
+    verify=1
+  fi
   set +e
   local status
-  status="$("$release/check-rc-provenance.sh" "$rc_manifest" "$SCRIPTURE_IMAGE" 2>/tmp/rc-prov.err)"
+  status="$(VERIFY_NODE_IMPORTS="$verify" "$release/check-rc-provenance.sh" "$rc_manifest" "$SCRIPTURE_IMAGE" 2>"$errfile")"
   local rc=$?
   set -e
-  cat /tmp/rc-prov.err >&2 || true
+  cat "$errfile" >&2 || true
+  rm -f "$errfile"
   if [[ "$rc" -eq 0 ]]; then
     echo "present"
   elif [[ "$status" == "absent" ]]; then
@@ -236,6 +255,7 @@ render_manifests() {
       -e "s/REPLACE_RUN_ID/${RUN_ID}/g" \
       -e "s/REPLACE_BUCKET/${BUCKET}/g" \
       -e "s|scripture:REPLACE_IMAGE_DIGEST_OR_TAG|${SCRIPTURE_IMAGE}|g" \
+      -e "s|REPLACE_RUSTFS_IMAGE|${RUSTFS_IMAGE}|g" \
       -e "s/kubernetes.io\/hostname: node-a/kubernetes.io\/hostname: ${WRITER_A_NODE}/g" \
       -e "s/kubernetes.io\/hostname: node-b/kubernetes.io\/hostname: ${WRITER_B_NODE}/g" \
       -e "s/kubernetes.io\/hostname: bignlittles/kubernetes.io\/hostname: ${RUSTFS_NODE}/g" \
@@ -254,7 +274,7 @@ render_manifests() {
   if [[ ! -s "$out_dir/clients.yaml" ]] || ! grep -q 'kind: ServiceAccount' "$out_dir/clients.yaml"; then
     fail "failed to render ServiceAccounts from clients.yaml"
   fi
-  if grep -qE 'REPLACE_BUCKET|REPLACE_RUN_ID|scripture-stable-REPLACE|REPLACE_IMAGE' "$out_dir"/*.yaml; then
+  if grep -qE 'REPLACE_BUCKET|REPLACE_RUN_ID|scripture-stable-REPLACE|REPLACE_IMAGE|REPLACE_RUSTFS' "$out_dir"/*.yaml; then
     fail "rendered manifests still contain unsubstituted REPLACE_* placeholders"
   fi
   {
@@ -313,7 +333,7 @@ write_verdicts() {
     provenance_detail="RC provenance identities disagree"
   elif [[ "$clean_status" == clean:* && "$package_rc" == "0" && "$rc_status" == "present" ]]; then
     provenance="pass"
-    provenance_detail="HEAD commit + lock hash + image digest + package checksums agree with RC manifest"
+    provenance_detail="registry-only attestation + RC identities + node containerd imports agree"
   else
     provenance="incomplete"
     provenance_detail="RC manifest and/or authenticated package attestation incomplete"
@@ -369,8 +389,11 @@ write_approval_commands() {
 # Review artifacts under: ${art}
 # Prerequisites (operator-local, never commit):
 #   - filled ${rc_manifest} matching HEAD + Cargo.lock + ${SCRIPTURE_IMAGE}
+#   - config/local/kellnr/registry-build-attestation.toml from a clean registry-only builder
+#     (no git/path Holylog sources; package checksums match Kellnr-resolved fleet sources)
 #   - authenticated fleet package preflight exit 0
-#   - image imported to ${WRITER_A_NODE}/${WRITER_B_NODE} at the RC digest
+#   - image imported to writer nodes; attestation node_imports digests match (runner re-checks via ssh/ctr)
+#   - digest-pinned helper images in overlay (RUSTFS/BUSYBOX/CURL/AWS_CLI)
 #   - export RUSTFS_ACCESS_KEY RUSTFS_SECRET_KEY SCRIPTURE_ADMIN_TOKEN (env only)
 #
 # Approval file (exact line):
@@ -477,7 +500,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: aws
-          image: amazon/aws-cli:2.35.5
+          image: ${AWS_CLI_IMAGE}
           imagePullPolicy: IfNotPresent
           env:
             - name: AWS_ACCESS_KEY_ID
@@ -513,11 +536,27 @@ EOF
 }
 
 # Run a one-shot labeled client Job; capture logs to a file. No secret argv.
+# mount_admin_token: yes|no — only lawful authorized admin Jobs may mount the Secret.
 run_client_job() {
   local name="$1" client_label="$2" image="$3" script="$4" logfile="$5"
+  local mount_admin_token="${6:-no}"
   ctx -n "$NAMESPACE" delete job "$name" --ignore-not-found=true >/dev/null
   local sa="scripture-producer-client"
   [[ "$client_label" == "admin" ]] && sa="scripture-admin-client"
+  local env_block=""
+  if [[ "$mount_admin_token" == "yes" ]]; then
+    env_block="$(cat <<'ENV'
+          env:
+            - name: SCRIPTURE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scripture-admin-token
+                  key: token
+ENV
+)"
+  else
+    env_block="          env: []"
+  fi
   local yaml
   yaml="$(cat <<EOF
 apiVersion: batch/v1
@@ -525,12 +564,16 @@ kind: Job
 metadata:
   name: ${name}
   namespace: ${NAMESPACE}
+  annotations:
+    scripture.dev/admin-token-mounted: "${mount_admin_token}"
 spec:
   backoffLimit: 1
   template:
     metadata:
       labels:
         scripture.dev/client: ${client_label}
+      annotations:
+        scripture.dev/admin-token-mounted: "${mount_admin_token}"
     spec:
       serviceAccountName: ${sa}
       restartPolicy: Never
@@ -538,13 +581,7 @@ spec:
         - name: client
           image: ${image}
           imagePullPolicy: IfNotPresent
-          env:
-            - name: SCRIPTURE_ADMIN_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: scripture-admin-token
-                  key: token
-                  optional: true
+${env_block}
           command: ["/bin/sh","-eu","-c"]
           args:
             - |
@@ -552,83 +589,104 @@ $(printf '%s\n' "$script" | sed 's/^/              /')
 EOF
 )"
   printf '%s\n' "$yaml" | ctx apply -f -
+  # Persist rendered Job for evidence (no secret values).
+  printf '%s\n' "$yaml" >"${logfile%.log}.job.yaml"
+}
+
+wait_client_job() {
+  local name="$1" logfile="$2" allow_fail="${3:-no}"
   local deadline=$((SECONDS + 120))
   while (( SECONDS < deadline )); do
-    local st
-    st="$(ctx -n "$NAMESPACE" get job "$name" -o jsonpath='{.status.succeeded}{.status.failed}' 2>/dev/null || true)"
-    if [[ "$st" == "1" || "$st" == "1"* ]]; then
-      break
-    fi
-    if [[ "$st" == *"1" && "$st" != "1" ]]; then
+    local succeeded failed
+    succeeded="$(ctx -n "$NAMESPACE" get job "$name" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+    failed="$(ctx -n "$NAMESPACE" get job "$name" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+    if [[ "$succeeded" == "1" ]]; then
       ctx -n "$NAMESPACE" logs "job/$name" >"$logfile" 2>&1 || true
+      return 0
+    fi
+    if [[ -n "$failed" && "$failed" != "0" ]]; then
+      ctx -n "$NAMESPACE" logs "job/$name" >"$logfile" 2>&1 || true
+      if [[ "$allow_fail" == "yes" ]]; then
+        return 1
+      fi
       fail "client job $name failed; see $logfile"
     fi
     sleep 2
   done
   ctx -n "$NAMESPACE" logs "job/$name" >"$logfile" 2>&1 || true
-  local succeeded
-  succeeded="$(ctx -n "$NAMESPACE" get job "$name" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
-  [[ "$succeeded" == "1" ]] || fail "client job $name did not succeed; see $logfile"
+  if [[ "$allow_fail" == "yes" ]]; then
+    return 1
+  fi
+  fail "client job $name timed out; see $logfile"
 }
 
 producer_exchange() {
-  local job_name="$1" payloads_csv="$2" logfile="$3"
-  # Busybox nc: send lines, read OK replies.
+  local job_name="$1" payloads_csv="$2" logfile="$3" target="${4:-scripture-producer}" expect_ok="${5:-yes}"
   local script
-  script="$(cat <<'EOS'
-target="scripture-producer"
+  script="$(cat <<EOS
+target="${target}"
 port=9000
-payloads='PAYLOADS_PLACEHOLDER'
-oldifs="$IFS"
+payloads='${payloads_csv}'
+oldifs="\$IFS"
 IFS=,
-set -- $payloads
-IFS="$oldifs"
-for p in "$@"; do
-  printf '%s\n' "$p"
-done | nc -w 30 "$target" "$port" | tee /tmp/out
-# Require one OK line per payload
-ok=$(grep -c '^OK ' /tmp/out || true)
-want=$#
-# recount payloads
+set -- \$payloads
+IFS="\$oldifs"
 n=0
-IFS=,
-for _ in $payloads; do n=$((n+1)); done
-IFS="$oldifs"
-if [ "$ok" -lt "$n" ]; then
-  echo "expected $n OK lines, got $ok" >&2
-  cat /tmp/out >&2
-  exit 1
+for _ in \$payloads; do n=\$((n+1)); done
+for p in "\$@"; do
+  printf '%s\\n' "\$p"
+done | nc -w 30 "\$target" "\$port" | tee /tmp/out || true
+ok=\$(grep -c '^OK ' /tmp/out || true)
+echo "ok_lines=\$ok want=\$n target=\$target"
+if [ "${expect_ok}" = "yes" ]; then
+  if [ "\$ok" -lt "\$n" ]; then
+    echo "expected \$n OK lines, got \$ok" >&2
+    cat /tmp/out >&2
+    exit 1
+  fi
+else
+  if [ "\$ok" -gt 0 ]; then
+    echo "unexpected committed OK from fenced/stale target" >&2
+    cat /tmp/out >&2
+    exit 1
+  fi
+  echo "no committed OK (fenced) ok"
 fi
 cat /tmp/out
 EOS
 )"
-  script="${script//PAYLOADS_PLACEHOLDER/$payloads_csv}"
-  run_client_job "$job_name" "producer" "busybox:1.36" "$script" "$logfile"
+  run_client_job "$job_name" "producer" "$BUSYBOX_IMAGE" "$script" "$logfile" "no"
+  wait_client_job "$job_name" "$logfile"
 }
 
 admin_promote() {
   local job_name="$1" term="$2" expect_ok="$3" logfile="$4" token_mode="$5"
+  local mount_token="no"
   local script
-  script="$(cat <<EOS
+  case "$token_mode" in
+    env)
+      mount_token="yes"
+      if [[ "$expect_ok" == "async" ]]; then
+        script="$(cat <<EOS
 set +e
-hdr_auth=""
-case "${token_mode}" in
-  env) hdr_auth="Authorization: Bearer \${SCRIPTURE_ADMIN_TOKEN}" ;;
-  wrong) hdr_auth="Authorization: Bearer wrong-token" ;;
-  missing) hdr_auth="" ;;
-esac
-if [ -n "\$hdr_auth" ]; then
-  code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
-    "http://scripture-admin-b:9200/v1/promote" \\
-    -H "Content-Type: application/json" \\
-    -H "\$hdr_auth" \\
-    -d '{"candidate_term":${term}}')
-else
-  code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
-    "http://scripture-admin-b:9200/v1/promote" \\
-    -H "Content-Type: application/json" \\
-    -d '{"candidate_term":${term}}')
-fi
+code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
+  "http://scripture-admin-b:9200/v1/promote" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer \${SCRIPTURE_ADMIN_TOKEN}" \\
+  -d '{"candidate_term":${term}}')
+echo "http_code=\$code"
+echo "body=\$(cat /tmp/body 2>/dev/null || true)"
+exit 0
+EOS
+)"
+      else
+        script="$(cat <<EOS
+set +e
+code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
+  "http://scripture-admin-b:9200/v1/promote" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer \${SCRIPTURE_ADMIN_TOKEN}" \\
+  -d '{"candidate_term":${term}}')
 set -e
 echo "http_code=\$code"
 echo "body=\$(cat /tmp/body 2>/dev/null || true)"
@@ -639,7 +697,103 @@ else
 fi
 EOS
 )"
-  run_client_job "$job_name" "admin" "curlimages/curl:8.5.0" "$script" "$logfile"
+      fi
+      ;;
+    wrong)
+      # Must NOT mount the real Secret; send an inline wrong bearer only.
+      mount_token="no"
+      script="$(cat <<EOS
+set +e
+code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
+  "http://scripture-admin-b:9200/v1/promote" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer wrong-token" \\
+  -d '{"candidate_term":${term}}')
+set -e
+echo "http_code=\$code"
+echo "body=\$(cat /tmp/body 2>/dev/null || true)"
+echo "admin_token_mounted=no"
+[ "\$code" = "200" ] && exit 1 || exit 0
+EOS
+)"
+      ;;
+    missing)
+      mount_token="no"
+      script="$(cat <<EOS
+set +e
+code=\$(curl -sS -o /tmp/body -w "%{http_code}" -X POST \\
+  "http://scripture-admin-b:9200/v1/promote" \\
+  -H "Content-Type: application/json" \\
+  -d '{"candidate_term":${term}}')
+set -e
+echo "http_code=\$code"
+echo "body=\$(cat /tmp/body 2>/dev/null || true)"
+echo "admin_token_mounted=no"
+[ "\$code" = "200" ] && exit 1 || exit 0
+EOS
+)"
+      ;;
+    *) fail "unknown token_mode: $token_mode" ;;
+  esac
+  run_client_job "$job_name" "admin" "$CURL_IMAGE" "$script" "$logfile" "$mount_token"
+  if [[ "$expect_ok" == "async" ]]; then
+    return 0
+  fi
+  wait_client_job "$job_name" "$logfile"
+}
+
+# Launch two authorized term-2 promotes while B is standby; require exactly one 200.
+concurrent_promote_term2() {
+  local art="$1"
+  admin_promote "promote-concurrent-a" 2 "async" "$art/promote-concurrent-a.log" "env"
+  admin_promote "promote-concurrent-b" 2 "async" "$art/promote-concurrent-b.log" "env"
+  wait_client_job "promote-concurrent-a" "$art/promote-concurrent-a.log"
+  wait_client_job "promote-concurrent-b" "$art/promote-concurrent-b.log"
+  local code_a code_b
+  code_a="$(grep -E '^http_code=' "$art/promote-concurrent-a.log" | tail -1 | cut -d= -f2 || true)"
+  code_b="$(grep -E '^http_code=' "$art/promote-concurrent-b.log" | tail -1 | cut -d= -f2 || true)"
+  {
+    echo "concurrent_a_http=${code_a}"
+    echo "concurrent_b_http=${code_b}"
+    echo "expected=exactly_one_200"
+  } >"$art/promote-concurrent-summary.txt"
+  local wins=0
+  [[ "$code_a" == "200" ]] && wins=$((wins + 1))
+  [[ "$code_b" == "200" ]] && wins=$((wins + 1))
+  if [[ "$wins" -ne 1 ]]; then
+    fail "concurrent promote expected exactly one HTTP 200, got a=${code_a} b=${code_b}"
+  fi
+  if [[ "$code_a" == "200" ]]; then
+    echo "winner=promote-concurrent-a term=2" >>"$art/promote-concurrent-summary.txt"
+  else
+    echo "winner=promote-concurrent-b term=2" >>"$art/promote-concurrent-summary.txt"
+  fi
+  log "concurrent promote: exactly one winner (a=${code_a} b=${code_b})"
+}
+
+prove_stale_a_fenced() {
+  local art="$1"
+  log "waiting for restarted A to exist and remain unready/fenced"
+  local deadline=$((SECONDS + 180))
+  local a_ready="" a_phase=""
+  while (( SECONDS < deadline )); do
+    a_phase="$(ctx -n "$NAMESPACE" get pod -l scripture.dev/owner=a \
+      -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)"
+    a_ready="$(ctx -n "$NAMESPACE" get pod -l scripture.dev/owner=a \
+      -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo false)"
+    if [[ -n "$a_phase" && "$a_phase" != "Pending" && "$a_ready" == "false" ]]; then
+      break
+    fi
+    sleep 3
+  done
+  {
+    echo "a_phase=${a_phase}"
+    echo "a_ready=${a_ready}"
+  } >"$art/stale-a-status.txt"
+  [[ "$a_ready" == "false" ]] || fail "restarted A unexpectedly ready (fencing not proven)"
+  # Owner-route probe: must not yield a committed ACK.
+  producer_exchange "producer-stale-a" "stale-a-probe" "$art/producer-stale-a.log" "scripture-actor-a" "no"
+  echo "stale_a_owner_route_no_ack=true" >>"$art/stale-a-status.txt"
 }
 
 run_holylog_oracle() {
@@ -759,7 +913,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: client
-          image: busybox:1.36
+          image: ${BUSYBOX_IMAGE}
           command: ["/bin/sh","-eu","-c"]
           args:
             - |
@@ -787,13 +941,21 @@ EOF
   owners="$(producer_endpoints_owners | tr '\n' ' ')"
   [[ "$owners" != *a* ]] || fail "producer still lists A after kill: $owners"
 
-  log "LIVE step9: fail-closed promote attempts"
+  log "LIVE step9: fail-closed promotes while B still standby"
+  # Unauthenticated / wrong-token Jobs must not mount the real admin Secret.
   admin_promote "promote-unauth" 2 "no" "$art/promote-unauth.log" "missing"
+  grep -q 'admin-token-mounted: "no"' "$art/promote-unauth.job.yaml" \
+    || fail "unauth job must not mount admin token"
   admin_promote "promote-wrong-token" 2 "no" "$art/promote-wrong-token.log" "wrong"
-  admin_promote "promote-wrong-term" 99 "no" "$art/promote-wrong-term.log" "env"
+  grep -q 'admin-token-mounted: "no"' "$art/promote-wrong-token.job.yaml" \
+    || fail "wrong-token job must not mount admin token"
+  # Stale term 1 (A's term) — not a future lawful term like 99.
+  admin_promote "promote-stale-term" 1 "no" "$art/promote-stale-term.log" "env"
+  grep -q 'admin-token-mounted: "yes"' "$art/promote-stale-term.job.yaml" \
+    || fail "stale-term job should mount token (auth ok, term rejected)"
 
-  log "LIVE step10: lawful B promote term=2"
-  admin_promote "promote-b" 2 "yes" "$art/promote-b.log" "env"
+  log "LIVE step10: concurrent lawful term-2 promotes while B standby"
+  concurrent_promote_term2 "$art"
 
   log "LIVE step11: wait B ready sole producer endpoint"
   deadline=$((SECONDS + 180))
@@ -811,8 +973,8 @@ EOF
   log "LIVE step12: producer continuation on B"
   producer_exchange "producer-phase-b" "drill-b-c0,drill-b-c1" "$art/producer-phase-b.log"
 
-  log "LIVE step13: concurrent promote must fail closed"
-  admin_promote "promote-concurrent" 3 "no" "$art/promote-concurrent.log" "env"
+  log "LIVE step13: prove restarted A is fenced (not only Endpoint absence)"
+  prove_stale_a_fenced "$art"
 
   log "LIVE step14: Holylog durable oracle"
   run_holylog_oracle "$art"
@@ -890,7 +1052,7 @@ if [[ "$execute" -eq 1 ]]; then
   if [[ "$clean_status" != clean:* || "$package_rc" != "0" || "$rc_status" != "present" ]]; then
     write_verdicts "$art" "$clean_status" "$package_rc" "$rc_status" true "refused"
     log "LIVE REFUSED before any cluster mutation: provenance not fully attested"
-    log "need clean tree + package preflight 0 + RC provenance present"
+    log "need clean tree + package preflight 0 + registry-only attestation + node import verify"
     exit 2
   fi
   if [[ "$skip_kubectl" -eq 1 ]]; then

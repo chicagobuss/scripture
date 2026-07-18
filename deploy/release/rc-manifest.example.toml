@@ -20,6 +20,11 @@ holylog_correctness_version = "0.1.0"
 # Prefer Kellnr when available:
 # holylog = { version = "0.2.2", registry = "fleet", checksum = "sha256:..." }
 
+# Operator-local registry-only build attestation (required for provenance pass):
+# attestation_path is informational; runner defaults to
+# config/local/kellnr/registry-build-attestation.toml
+attestation_path = "config/local/kellnr/registry-build-attestation.toml"
+
 [cargo]
 lockfile_hash = "sha256:REPLACE"
 target_triple = "x86_64-unknown-linux-gnu"

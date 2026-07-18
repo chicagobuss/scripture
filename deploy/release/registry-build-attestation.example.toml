@@ -1,0 +1,33 @@
+# Example clean-builder / registry-only release attestation (WP09).
+# Copy to ignored config/local/kellnr/registry-build-attestation.json after a
+# clean consumer build that resolved packages only from the fleet registry.
+# Never commit tokens. Never claim pass from a Git/path Holylog checkout.
+
+schema_version = 1
+attestation_kind = "clean-registry-only"
+source_commit = "REPLACE_WITH_CLEAN_COMMIT"
+
+[builder]
+# Must all be true for provenance pass.
+no_path_overrides = true
+no_git_dependency_sources = true
+no_local_holylog_checkout = true
+cargo_registries = ["fleet"]
+
+[resolved_packages]
+# Each publishable crate + Holylog deps must declare registry+fleet source.
+# scripture = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# scripture-service = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# scripture-runtime = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# scripture-cli = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog = { version = "0.2.2", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog-correctness = { version = "0.1.0", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+
+[image]
+digest = "sha256:REPLACE"
+build_recipe = "release-cli-no-campaign-faults"
+
+[node_imports]
+# Filled after operator-local containerd import; runner also re-checks via ssh/ctr.
+# node-a = { imported_digest = "sha256:REPLACE", host = "node-a" }
+# node-b = { imported_digest = "sha256:REPLACE", host = "node-b" }

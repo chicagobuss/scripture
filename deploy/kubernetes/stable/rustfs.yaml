@@ -20,7 +20,7 @@ spec:
         kubernetes.io/hostname: bignlittles
       containers:
         - name: rustfs
-          image: rustfs/rustfs:1.0.0-beta.8
+          image: REPLACE_RUSTFS_IMAGE
           imagePullPolicy: IfNotPresent
           args: ["--server-domains", "rustfs"]
           ports:
