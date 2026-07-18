@@ -1,5 +1,5 @@
 {
-  "kube_context": "home-fleet",
+  "kube_context": "Default",
   "required_nodes": [
     "bignlittles",
     "node-a",
@@ -7,22 +7,16 @@
     "node-c"
   ],
   "rustfs_node": "bignlittles",
-  "rustfs_namespace": "scripture-lab",
-  "rustfs_service": "rustfs",
-  "rustfs_service_dns": "http://rustfs.scripture-lab.svc.cluster.local:9000",
-  "rustfs_bucket": "scripture-ha-lab",
-  "rustfs_region": "us-east-1",
-  "driver_node": "node-a",
+  "writer_a_node": "node-a",
+  "writer_b_node": "node-b",
+  "checker_node": "node-c",
   "image": "scripture-campaign:0.1.0",
-  "store_secret": "scripture-correctness-store",
-  "store_secret_namespace": "scripture-correctness",
-  "correctness_namespace": "scripture-correctness",
-  "load_namespace": "scripture-load",
-  "observe_namespace": "scripture-observe",
-  "ha_namespace": "scripture-ha",
+  "scripture_image": "scripture:0.1.0",
+  "correctness_namespace_prefix": "scripture-correctness",
   "notes": [
-    "Non-secret topology only. Credentials live in the named Secret keys RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY.",
-    "Persistent HA drill state (scripture-ha / existing scripture-lab HA C) must not share prefixes with campaigns.",
-    "Prefer a store Secret that reuses the same key material as rustfs-credentials without copying values into Git."
+    "Non-secret placement only. Credentials and buckets are generated per run inside scripture-correctness-<run-id>.",
+    "Never target Tracker RustFS, scripture-lab, or any shared durable lab store.",
+    "Preflight must verify the selected RustFS Service namespace/UID/labels/EndpointSlices belong to this run.",
+    "Default-deny egress for campaign pods: DNS + in-namespace RustFS Service only."
   ]
 }

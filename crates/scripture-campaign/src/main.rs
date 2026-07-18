@@ -15,6 +15,7 @@ struct RunArgs {
     artifact_dir: PathBuf,
     execute: bool,
     topology: Option<PathBuf>,
+    keep_failed: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -52,6 +53,7 @@ async fn run_campaign(
         run_id: args.run_id,
         artifact_dir: args.artifact_dir,
         execute: args.execute,
+        keep_failed: args.keep_failed,
     }
     .run()
     .await?;
@@ -83,6 +85,7 @@ fn parse_run_args(
     let mut artifact_dir = None;
     let mut execute = false;
     let mut topology = None;
+    let mut keep_failed = false;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -96,6 +99,7 @@ fn parse_run_args(
             }
             "--topology" => topology = Some(PathBuf::from(required(arguments, "--topology")?)),
             "--execute" => execute = true,
+            "--keep-failed" => keep_failed = true,
             "--help" | "-h" => {
                 print_run_help();
                 process::exit(0);
@@ -113,6 +117,7 @@ fn parse_run_args(
             .unwrap_or_else(|| repo_root.join("config/local/correctness-testing/runs")),
         execute,
         topology,
+        keep_failed,
     })
 }
 
@@ -137,16 +142,22 @@ Usage:
     [--run-id ID] \\
     [--artifact-dir PATH] \\
     [--topology PATH] \\
-    [--execute]
+    [--execute] \\
+    [--keep-failed]
 
 Default is dry-run preflight only (no cluster writes, no scenarios executed).
 `--execute` runs the selected suite after preflight passes.
+`--keep-failed` retains the run namespace after a failed execute.
 
 Exit codes (WP05):
   0  every selected scenario passed (or dry-run preflight ok)
   2  preflight or required capability missing; no test claim
   3  a scenario or checker failure
   4  runner/collection indeterminate; no success claim
+
+Isolation (rustfs-home-fleet):
+  Ephemeral RustFS only inside scripture-correctness-<run-id>.
+  Tracker RustFS / scripture-lab are never targeted.
 "
     );
 }

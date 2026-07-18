@@ -27,6 +27,7 @@ mod composition;
 mod coverage;
 mod kellnr;
 mod legacy;
+mod lifecycle;
 mod preflight;
 mod producer_identity;
 mod profile;
@@ -39,6 +40,7 @@ pub use artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts
 pub use coverage::{CoverageRow, CoverageStatus, family_catalog, merge_executed};
 pub use kellnr::{ReleaseAttestation, ReleaseClassification};
 pub use legacy::{legacy_main, print_campaign_help};
+pub use lifecycle::{ActorPlacement, IsolatedStoreIdentity, LifecycleError, RunLifecycle};
 pub use preflight::{PreflightReport, default_topology_path};
 pub use profile::{Profile, ProfileError, RustFsHomeFleetProfile};
 pub use run::{RunError, RunOptions, RunOutcome, detect_repo_root};
@@ -110,11 +112,21 @@ pub enum Scenario {
     StripedModuloMapping,
     /// Quorum: one replica is not a global write.
     QuorumPartialWriteNotGlobal,
+    /// Process-separated baseline against ephemeral in-namespace RustFS.
+    ProcessSeparatedBaseline,
+    /// Kill A, explicit lawful B promotion, dense continuation (temporary adapter).
+    KillAExplicitBPromotion,
+    /// Writer-death recovery across distinct A/B processes (temporary adapter).
+    WedgedPayloadProcessSeparated,
+    /// Directional loss of the run-owned RustFS path, then recovery.
+    DirectionalBackendLossRecovery,
+    /// Scoped credential invalidation against the run Secret, then recovery.
+    ScopedCredentialInvalidation,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 7] = [
+    pub const ALL: [&'static str; 12] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
@@ -122,6 +134,11 @@ impl Scenario {
         "k-window-permanent-wedge-seal",
         "striped-modulo-mapping",
         "quorum-partial-write-not-global",
+        "process-separated-baseline",
+        "kill-a-explicit-b-promotion",
+        "wedged-payload-process-separated",
+        "directional-backend-loss-recovery",
+        "scoped-credential-invalidation",
     ];
 
     /// Parses a scenario token.
@@ -134,6 +151,11 @@ impl Scenario {
             "k-window-permanent-wedge-seal" => Ok(Self::KWindowPermanentWedgeSeal),
             "striped-modulo-mapping" => Ok(Self::StripedModuloMapping),
             "quorum-partial-write-not-global" => Ok(Self::QuorumPartialWriteNotGlobal),
+            "process-separated-baseline" => Ok(Self::ProcessSeparatedBaseline),
+            "kill-a-explicit-b-promotion" => Ok(Self::KillAExplicitBPromotion),
+            "wedged-payload-process-separated" => Ok(Self::WedgedPayloadProcessSeparated),
+            "directional-backend-loss-recovery" => Ok(Self::DirectionalBackendLossRecovery),
+            "scoped-credential-invalidation" => Ok(Self::ScopedCredentialInvalidation),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -149,6 +171,11 @@ impl Scenario {
             Self::KWindowPermanentWedgeSeal => "k-window-permanent-wedge-seal",
             Self::StripedModuloMapping => "striped-modulo-mapping",
             Self::QuorumPartialWriteNotGlobal => "quorum-partial-write-not-global",
+            Self::ProcessSeparatedBaseline => "process-separated-baseline",
+            Self::KillAExplicitBPromotion => "kill-a-explicit-b-promotion",
+            Self::WedgedPayloadProcessSeparated => "wedged-payload-process-separated",
+            Self::DirectionalBackendLossRecovery => "directional-backend-loss-recovery",
+            Self::ScopedCredentialInvalidation => "scoped-credential-invalidation",
         }
     }
 
@@ -161,6 +188,19 @@ impl Scenario {
                 | Self::KWindowPermanentWedgeSeal
                 | Self::StripedModuloMapping
                 | Self::QuorumPartialWriteNotGlobal
+        )
+    }
+
+    /// Whether this scenario needs rustfs-home-fleet lifecycle orchestration.
+    #[must_use]
+    pub const fn needs_process_lifecycle(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessSeparatedBaseline
+                | Self::KillAExplicitBPromotion
+                | Self::WedgedPayloadProcessSeparated
+                | Self::DirectionalBackendLossRecovery
+                | Self::ScopedCredentialInvalidation
         )
     }
 }
@@ -512,6 +552,16 @@ pub async fn run_campaign(
         | Scenario::StripedModuloMapping
         | Scenario::QuorumPartialWriteNotGlobal => {
             unreachable!("composition scenarios handled above")
+        }
+        Scenario::ProcessSeparatedBaseline
+        | Scenario::KillAExplicitBPromotion
+        | Scenario::WedgedPayloadProcessSeparated
+        | Scenario::DirectionalBackendLossRecovery
+        | Scenario::ScopedCredentialInvalidation => {
+            return Err(CampaignError::Scenario(format!(
+                "{} requires rustfs-home-fleet lifecycle orchestration",
+                scenario.as_str()
+            )));
         }
     };
     let verdict = check_trace(&events);

@@ -9,9 +9,9 @@ pub enum Suite {
     Core,
     /// Composition scenarios (striped / quorum / K-window AtomicLog).
     Composition,
-    /// Real backend / process resilience (Slice 3; not yet wired).
+    /// Real backend / process resilience (ephemeral in-namespace RustFS).
     Resilience,
-    /// All implemented scenarios.
+    /// All implemented scenarios for the active profile.
     All,
 }
 
@@ -43,10 +43,17 @@ impl Suite {
             Scenario::StripedModuloMapping,
             Scenario::QuorumPartialWriteNotGlobal,
         ];
+        let resilience = vec![
+            Scenario::ProcessSeparatedBaseline,
+            Scenario::KillAExplicitBPromotion,
+            Scenario::WedgedPayloadProcessSeparated,
+            Scenario::DirectionalBackendLossRecovery,
+            Scenario::ScopedCredentialInvalidation,
+        ];
         match self {
             Self::Core => core,
             Self::Composition => composition,
-            Self::Resilience => Vec::new(),
+            Self::Resilience => resilience,
             Self::All => {
                 let mut all = core;
                 for scenario in [
@@ -68,7 +75,7 @@ impl Suite {
         match self {
             Self::Core => "core-wp05",
             Self::Composition => "composition-wp05",
-            Self::Resilience => "resilience-not-implemented",
+            Self::Resilience => "resilience-wp05-ephemeral-rustfs",
             Self::All => "all-implemented-wp05",
         }
     }
@@ -93,9 +100,9 @@ mod tests {
     use super::Suite;
 
     #[test]
-    fn composition_is_implemented_after_wp05_wiring() {
+    fn resilience_is_implemented_after_wp05_v3() {
         assert!(Suite::Composition.is_implemented());
-        assert!(!Suite::Resilience.is_implemented());
+        assert!(Suite::Resilience.is_implemented());
         assert!(Suite::Core.is_implemented());
         assert!(Suite::All.is_implemented());
     }

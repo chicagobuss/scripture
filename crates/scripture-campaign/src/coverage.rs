@@ -130,20 +130,22 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             12,
             "process-separated-baseline",
             CoverageLayer::Resilience,
-            None,
+            Some(Scenario::ProcessSeparatedBaseline),
         ),
         row(
             13,
             "kill-a-explicit-b-promotion",
             CoverageLayer::Resilience,
-            None,
+            Some(Scenario::KillAExplicitBPromotion),
         ),
         row(
             14,
             "wedged-payload-recovery-process-separated",
             CoverageLayer::Resilience,
-            None,
+            Some(Scenario::WedgedPayloadProcessSeparated),
         ),
+        // Family 14 process-recovery (force-delete ready A → promote B) is not a
+        // substitute for family 2's durable-payload/no-ACK wedge semantics.
         row(
             15,
             "root-cas-reply-loss-reread",
@@ -154,13 +156,13 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             16,
             "directional-backend-loss-recovery",
             CoverageLayer::Resilience,
-            None,
+            Some(Scenario::DirectionalBackendLossRecovery),
         ),
         row(
             17,
             "scoped-credential-invalidation",
             CoverageLayer::Resilience,
-            None,
+            Some(Scenario::ScopedCredentialInvalidation),
         ),
         row(
             18,
@@ -232,8 +234,13 @@ fn default_not_run_reason(family: u8) -> Option<String> {
         8 => "striped lagging-scan reconstruction pending bounded schedule port".into(),
         10 => "quorum repair/unavailability scenario pending campaign wiring".into(),
         11 => "nested stripe/quorum matrix pending campaign wiring".into(),
-        12..=17 => {
-            "process-separated RustFS lifecycle deferred until isolated namespace + A/B placement (temporary bootstrap/promote adapter allowed once lifecycle exists)".into()
+        13..=14 | 16..=17 => {
+            "process-separated family pending ephemeral in-namespace RustFS lifecycle execute"
+                .into()
+        }
+        15 => {
+            "root-CAS reply-loss fault injection is not available in the temporary bootstrap/promote adapter; family 6 covers in-process semantics"
+                .into()
         }
         18 => "R2/S3/GCS require Joshua's explicit approval of the exact command".into(),
         19 => "malformed identity suite not yet wired".into(),
