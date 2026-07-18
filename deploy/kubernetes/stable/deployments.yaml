@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scripture-actor-a
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: writer-a
+    scripture.dev/owner: a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scripture
+      scripture.dev/owner: a
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture
+        app.kubernetes.io/component: writer-a
+        scripture.dev/owner: a
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-a
+      containers:
+        - name: scripture
+          image: scripture:REPLACE_IMAGE_DIGEST_OR_TAG
+          imagePullPolicy: Never
+          args: ["serve", "--config", "/etc/scripture/scripture.yaml"]
+          ports:
+            - name: producer
+              containerPort: 9000
+            - name: status
+              containerPort: 9100
+          envFrom:
+            - secretRef:
+                name: rustfs-credentials
+          volumeMounts:
+            - name: config
+              mountPath: /etc/scripture
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: status
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: status
+            initialDelaySeconds: 3
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config
+          configMap:
+            name: scripture-config-a
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scripture-actor-b
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: writer-b
+    scripture.dev/owner: b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scripture
+      scripture.dev/owner: b
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture
+        app.kubernetes.io/component: writer-b
+        scripture.dev/owner: b
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: node-b
+      containers:
+        - name: scripture
+          image: scripture:REPLACE_IMAGE_DIGEST_OR_TAG
+          imagePullPolicy: Never
+          args: ["serve", "--config", "/etc/scripture/scripture.yaml"]
+          ports:
+            - name: producer
+              containerPort: 9000
+            - name: status
+              containerPort: 9100
+            - name: admin
+              containerPort: 9200
+          env:
+            - name: SCRIPTURE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scripture-admin-token
+                  key: token
+          envFrom:
+            - secretRef:
+                name: rustfs-credentials
+          volumeMounts:
+            - name: config
+              mountPath: /etc/scripture
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: status
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: status
+            initialDelaySeconds: 3
+            periodSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config
+          configMap:
+            name: scripture-config-b

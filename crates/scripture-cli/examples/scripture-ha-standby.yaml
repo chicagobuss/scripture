@@ -1,0 +1,25 @@
+# Example HA standby serve config (non-secret). Token: SCRIPTURE_ADMIN_TOKEN.
+version: 1
+node:
+  owner_id: "scripture-own-b!"
+  advertise: "tcp://scripture-owner-b:9000"
+listener:
+  bind: "0.0.0.0:9000"
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+store:
+  backend: rustfs
+  endpoint: "http://REPLACE_WITH_ENDPOINT:9000"
+  bucket: "REPLACE_WITH_BUCKET"
+  region: us-east-1
+  prefix: "scripture/deployments/REPLACE_WITH_PREFIX"
+metrics:
+  status_bind: "0.0.0.0:9100"
+ha:
+  mode: serving-authority
+  startup_role: standby
+admin:
+  bind: "0.0.0.0:9200"

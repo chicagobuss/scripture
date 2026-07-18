@@ -1514,7 +1514,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "scripture"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "scripture-cli"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "bytes",
  "holylog",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "scripture-runtime"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "bytes",
  "futures",
@@ -1592,7 +1592,7 @@ dependencies = [
 
 [[package]]
 name = "scripture-service"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "blake3",
  "bytes",

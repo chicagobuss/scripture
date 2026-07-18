@@ -260,16 +260,26 @@ Usage:
   scripture replace --config /path/to/scripture.yaml --successor-loglet-id <ID>
   scripture promote --config /path/to/scripture.yaml --candidate-term <N>
   scripture serve --config /path/to/scripture.yaml
+
 validate:  load + validate non-secret YAML; no network; no ownership.
 bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
            long-lived bootstrap-and-serve (one-record VirtualLog root fence).
 replace:   legacy empty open-generation activation; exits; never opens ingress.
 promote:   long-lived promote-and-serve under ha.mode: serving-authority.
-serve:     long-running legacy Canon path; refused under Serving-Authority mode
-           (writables cannot cross process exit — use bootstrap/promote).
+serve:     legacy Canon path, or Serving Authority via ha.startup_role:
+             bootstrap-if-empty — Empty→Serving then ingress in-process
+             standby — live/unready until authenticated admin promote
+
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority
+    startup_role: bootstrap-if-empty   # or standby
+    initial_term: 1
+  admin:
+    bind: \"127.0.0.1:9200\"            # required for standby
+Admin promote: POST /v1/promote with Authorization: Bearer $SCRIPTURE_ADMIN_TOKEN
+and JSON body candidate_term (integer). Token is environment-only.
+
 Authority is membership + Scripture fence on the Holylog VirtualLog root only.
 There is no separate ServingAuthorityStore / CRD backend.
 
@@ -282,7 +292,7 @@ Never from ConfigMap, argv, or logs.
 
 Probes (when metrics.status_bind is set):
   /livez   process alive
-  /readyz  HTTP 200 only when Serving
+  /readyz  HTTP 200 only when Serving (effective writer)
   /status  disposition report
 
 This command does not claim automatic failover, restart fencing, a public

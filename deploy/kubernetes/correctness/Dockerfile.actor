@@ -1,14 +1,10 @@
-# Release image for `scripture serve` (WP09).
+# Development/test-only Scripture actor image with campaign-faults.
+# NOT a release image. Do not use for WP09 stable / family-22 drills.
 #
-# Must NOT enable campaign-faults. Campaign/test actor images live under
-# deploy/kubernetes/correctness/.
-#
-# Until the Kellnr-resolved RC path is wired, BuildKit SSH is still required for
-# the pinned Holylog git tag dependency:
 #   DOCKER_BUILDKIT=1 docker build --ssh default \
-#     -f deploy/kubernetes/Dockerfile -t scripture:<version> .
+#     -f deploy/kubernetes/correctness/Dockerfile.actor \
+#     -t scripture:campaign-actor .
 #
-# No credentials or fleet topology are embedded in this image.
 # syntax=docker/dockerfile:1.7
 
 FROM rust:1.97-bookworm AS builder
@@ -19,8 +15,8 @@ RUN apt-get update \
     && mkdir -p -m 0700 /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
 COPY . .
-# Release binary: no campaign-faults feature.
-RUN --mount=type=ssh CARGO_BUILD_JOBS=2 cargo build --release -p scripture-cli --locked
+RUN --mount=type=ssh \
+    CARGO_BUILD_JOBS=2 cargo build --release -p scripture-cli --features campaign-faults --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update \

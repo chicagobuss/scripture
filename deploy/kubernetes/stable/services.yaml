@@ -1,0 +1,48 @@
+# Sole normal producer Service: endpoints require Ready pods only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scripture-producer
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/name: scripture
+    scripture.dev/role: producer
+spec:
+  selector:
+    app.kubernetes.io/name: scripture
+  ports:
+    - name: producer
+      port: 9000
+      targetPort: producer
+---
+# Dedicated admin path to B only — never through the producer Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: scripture-admin-b
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/name: scripture
+    scripture.dev/role: admin-b
+spec:
+  selector:
+    scripture.dev/owner: b
+  ports:
+    - name: admin
+      port: 9200
+      targetPort: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/name: rustfs
+spec:
+  selector:
+    app.kubernetes.io/name: rustfs
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3

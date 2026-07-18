@@ -1,11 +1,11 @@
 [package]
 name = "scripture"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition = "2024"
 rust-version = "1.97"
 description = "A correctness-first durable journal system over holylog"
 license = "MIT"
-publish = false
+publish = true
 
 [features]
 default = []

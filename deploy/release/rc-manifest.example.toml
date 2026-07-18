@@ -1,0 +1,36 @@
+# Non-secret RC identity template (WP09). Fill after Kellnr publish + OCI build.
+# Never put tokens, endpoints with credentials, or secret hashes here.
+
+schema_version = 1
+rc_version = "0.1.0-rc.1"
+source_commit = "REPLACE_WITH_CLEAN_COMMIT"
+clean_tree_required = true
+
+[packages]
+# scripture = { version = "0.1.0-rc.1", checksum = "sha256:..." }
+# scripture-service = { version = "0.1.0-rc.1", checksum = "sha256:..." }
+# scripture-runtime = { version = "0.1.0-rc.1", checksum = "sha256:..." }
+# scripture-cli = { version = "0.1.0-rc.1", checksum = "sha256:..." }
+
+[holylog]
+# Pin to validated package identities (not a source checkout).
+# holylog = { version = "0.2.2", checksum = "sha256:..." }
+# holylog-object-store = { version = "0.2.2", checksum = "sha256:..." }
+# holylog-object-store-register = { version = "0.2.2", checksum = "sha256:..." }
+
+[cargo]
+lockfile_hash = "sha256:REPLACE"
+target_triple = "x86_64-unknown-linux-gnu"
+
+[image]
+# Immutable digest after release Dockerfile build (no campaign-faults).
+name = "scripture"
+tag = "0.1.0-rc.1"
+digest = "sha256:REPLACE"
+dockerfile = "deploy/kubernetes/Dockerfile"
+build_recipe = "release-cli-no-campaign-faults"
+
+[distribution]
+# Per-node containerd import attestations (operator-local).
+# node-a = { imported_digest = "sha256:REPLACE", imported_at = "REPLACE" }
+# node-b = { imported_digest = "sha256:REPLACE", imported_at = "REPLACE" }

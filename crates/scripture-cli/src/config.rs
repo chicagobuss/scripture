@@ -34,15 +34,57 @@ pub struct ScriptureConfig {
     /// Optional HA / Serving Authority selection. Default is legacy (Canon-only).
     #[serde(default)]
     pub ha: HaConfig,
+    /// Optional authenticated admin bind (promotion only). Never secrets here.
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 /// Portable HA control-plane selection (no personal/backend secrets).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaConfig {
     /// `legacy` (default) or `serving-authority`.
     #[serde(default)]
     pub mode: HaMode,
+    /// Required under `serving-authority` for long-lived `scripture serve`.
+    #[serde(default)]
+    pub startup_role: Option<StartupRole>,
+    /// Initial writer term for `bootstrap-if-empty` (default 1).
+    #[serde(default = "default_initial_term")]
+    pub initial_term: u64,
+}
+
+impl Default for HaConfig {
+    fn default() -> Self {
+        Self {
+            mode: HaMode::Legacy,
+            startup_role: None,
+            initial_term: default_initial_term(),
+        }
+    }
+}
+
+fn default_initial_term() -> u64 {
+    1
+}
+
+/// How `scripture serve` enters Serving Authority mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupRole {
+    /// Empty → Serving bootstrap in this process, then serve.
+    BootstrapIfEmpty,
+    /// Live standby: probes up, producer refuses committed ACK until admin promote.
+    Standby,
+}
+
+/// Authenticated admin surface (promotion). Token comes from `SCRIPTURE_ADMIN_TOKEN`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Bind address for the admin listener (e.g. `127.0.0.1:9200`).
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 /// Whether Serving Authority gates the serve path.
@@ -162,6 +204,43 @@ impl ScriptureConfig {
         parse_fixed_id("verse.verse_id", &self.verse.verse_id)?;
         parse_fixed_id("verse.cohort_id", &self.verse.cohort_id)?;
         parse_fixed_id("verse.writer_id", &self.verse.writer_id)?;
+        if self.ha.initial_term == 0 {
+            return Err(ConfigError::Invalid("ha.initial_term must be >= 1".into()));
+        }
+        if let Some(bind) = &self.admin.bind
+            && bind.trim().is_empty()
+        {
+            return Err(ConfigError::Invalid("admin.bind must be non-empty".into()));
+        }
+        Ok(())
+    }
+
+    /// Extra checks for long-lived `scripture serve` under Serving Authority.
+    pub fn validate_serve_ha(&self) -> Result<(), ConfigError> {
+        if self.ha.mode != HaMode::ServingAuthority {
+            return Ok(());
+        }
+        match self.ha.startup_role {
+            None => {
+                return Err(ConfigError::Invalid(
+                    "ha.startup_role is required for scripture serve under ha.mode: serving-authority"
+                        .into(),
+                ));
+            }
+            Some(StartupRole::Standby) => {
+                if self
+                    .admin
+                    .bind
+                    .as_ref()
+                    .is_none_or(|bind| bind.trim().is_empty())
+                {
+                    return Err(ConfigError::Invalid(
+                        "admin.bind is required for ha.startup_role: standby".into(),
+                    ));
+                }
+            }
+            Some(StartupRole::BootstrapIfEmpty) => {}
+        }
         Ok(())
     }
 
@@ -299,9 +378,47 @@ metrics:
             + r#"
 ha:
   mode: serving-authority
+  startup_role: bootstrap-if-empty
+  initial_term: 1
 "#;
         let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
         config.validate().expect("valid");
+        config.validate_serve_ha().expect("serve ha");
         assert_eq!(config.ha.mode, HaMode::ServingAuthority);
+        assert_eq!(config.ha.startup_role, Some(StartupRole::BootstrapIfEmpty));
+    }
+
+    #[test]
+    fn serving_authority_serve_requires_startup_role() {
+        let yaml = sample_yaml().to_owned()
+            + r#"
+ha:
+  mode: serving-authority
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        config.validate().expect("base valid");
+        assert!(config.validate_serve_ha().is_err());
+    }
+
+    #[test]
+    fn standby_requires_admin_bind_for_serve() {
+        let yaml = sample_yaml().to_owned()
+            + r#"
+ha:
+  mode: serving-authority
+  startup_role: standby
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        assert!(config.validate_serve_ha().is_err());
+        let yaml = sample_yaml().to_owned()
+            + r#"
+ha:
+  mode: serving-authority
+  startup_role: standby
+admin:
+  bind: "127.0.0.1:9200"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        config.validate_serve_ha().expect("standby with admin.bind");
     }
 }

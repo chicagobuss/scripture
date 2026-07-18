@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scripture-stable-REPLACE_RUN_ID
+  labels:
+    app.kubernetes.io/part-of: scripture
+    scripture.dev/purpose: stable-two-process
+    scripture.dev/release-class: rc

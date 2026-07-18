@@ -22,18 +22,22 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::assemble;
-use crate::config::{HaMode, ScriptureConfig};
+use crate::config::{HaMode, ScriptureConfig, StartupRole};
+use crate::ha_activate;
 
 pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
     if config.ha.mode == HaMode::ServingAuthority {
-        return Err(
-            "refusing plain `scripture serve` under ha.mode: serving-authority — \
-             Holylog open writables cannot cross process exit. Use long-lived \
-             `scripture bootstrap --config …` (Empty→Serving) or \
-             `scripture promote --config … --candidate-term N` (promote-and-serve). \
-             Authority is the VirtualLog root fence (no separate authority store)."
-                .into(),
-        );
+        config.validate_serve_ha()?;
+        return match config.ha.startup_role {
+            Some(StartupRole::BootstrapIfEmpty) => {
+                let initial_term = config.ha.initial_term;
+                ha_activate::bootstrap_and_serve_cli(config, initial_term).await
+            }
+            Some(StartupRole::Standby) => ha_activate::standby_and_serve_cli(config).await,
+            None => Err(
+                "ha.startup_role is required for scripture serve under serving-authority".into(),
+            ),
+        };
     }
 
     let assembled = assemble::assemble_supervisor(&config)?;

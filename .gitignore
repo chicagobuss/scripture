@@ -8,3 +8,4 @@ Cargo.lock.bak
 /deploy/fleet-exercise/inventory/hosts.env
 /deploy/fleet-exercise/results/*
 !/deploy/fleet-exercise/results/.gitkeep
+/config/local/scripture-stable/
