@@ -81,15 +81,19 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             CoverageLayer::Core,
             Some(Scenario::KWindowDelayedCompletion),
         ),
-        // Seal-boundary proof exists as `k-window-permanent-wedge-seal`; full
-        // family 4 also requires lawful successor publication at that boundary.
+        // Seal-boundary + VirtualLog successor: `permanent-wedge-seal-successor`.
         row(
             4,
             "permanent-k-window-wedge-seal-successor",
             CoverageLayer::Core,
-            None,
+            Some(Scenario::PermanentWedgeSealSuccessor),
         ),
-        row(5, "seal-tail-race", CoverageLayer::Core, None),
+        row(
+            5,
+            "seal-tail-race",
+            CoverageLayer::Core,
+            Some(Scenario::SealTailRace),
+        ),
         row(
             6,
             "stale-writer-after-cutover",
@@ -106,7 +110,7 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             8,
             "striped-lagging-scan-reconstruction",
             CoverageLayer::Composition,
-            None,
+            Some(Scenario::StripedLaggingScanReconstruction),
         ),
         row(
             9,
@@ -118,13 +122,13 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             10,
             "quorum-repair-unavailability",
             CoverageLayer::Composition,
-            None,
+            Some(Scenario::QuorumRepairUnavailability),
         ),
         row(
             11,
             "nested-stripe-quorum-schedules",
             CoverageLayer::Composition,
-            None,
+            Some(Scenario::NestedStripeQuorumSchedules),
         ),
         row(
             12,
@@ -229,15 +233,6 @@ fn row(
 
 fn default_not_run_reason(family: u8) -> Option<String> {
     Some(match family {
-        4 => "AtomicLog seal-boundary scenario exists; VirtualLog successor publication at sealed boundary 2 not yet campaign-wired".into(),
-        5 => "seal/tail race scenario not yet wired into scripture-campaign".into(),
-        8 => "striped lagging-scan reconstruction pending bounded schedule port".into(),
-        10 => "quorum repair/unavailability scenario pending campaign wiring".into(),
-        11 => "nested stripe/quorum matrix pending campaign wiring".into(),
-        13..=14 | 16..=17 => {
-            "process-separated family pending ephemeral in-namespace RustFS lifecycle execute"
-                .into()
-        }
         15 => {
             "root-CAS reply-loss fault injection is not available in the temporary bootstrap/promote adapter; family 6 covers in-process semantics"
                 .into()

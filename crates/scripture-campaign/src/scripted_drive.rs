@@ -1,8 +1,8 @@
 //! Deterministic scripted LogDrive for composition campaign scenarios.
 //!
 //! Ported from Holylog's test `ScriptedDrive` so scripture-campaign can gate
-//! writes and inject post-write failures without depending on Holylog's private
-//! test harness.
+//! writes/tail scans and inject post-write failures without depending on
+//! Holylog's private test harness.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,8 +49,8 @@ impl PollGate {
     }
 }
 
-/// Deterministic primitive LogDrive with explicit write gates and failures.
-#[derive(Debug, Default)]
+/// Deterministic primitive LogDrive with explicit write/tail gates and failures.
+#[derive(Debug)]
 pub(crate) struct ScriptedDrive {
     model: Mutex<ReferenceLogDrive>,
     available: AtomicBool,
@@ -58,16 +58,45 @@ pub(crate) struct ScriptedDrive {
     write_gates: Mutex<HashMap<Address, Arc<PollGate>>>,
     failing_writes: Mutex<BTreeSet<Address>>,
     post_write_failures: Mutex<BTreeSet<Address>>,
+    pending_tail_gate: Mutex<Option<Arc<PollGate>>>,
+    last_tail_scan_written: Mutex<BTreeSet<Address>>,
+}
+
+impl Default for ScriptedDrive {
+    fn default() -> Self {
+        Self {
+            model: Mutex::new(ReferenceLogDrive::new()),
+            available: AtomicBool::new(true),
+            writes: AtomicU64::new(0),
+            write_gates: Mutex::new(HashMap::new()),
+            failing_writes: Mutex::new(BTreeSet::new()),
+            post_write_failures: Mutex::new(BTreeSet::new()),
+            pending_tail_gate: Mutex::new(None),
+            last_tail_scan_written: Mutex::new(BTreeSet::new()),
+        }
+    }
 }
 
 impl ScriptedDrive {
     /// Creates an available empty drive.
     #[must_use]
     pub(crate) fn available() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Creates an unavailable drive (all operations fail closed).
+    #[must_use]
+    #[allow(dead_code)] // reserved for additional unavailability schedules
+    pub(crate) fn unavailable() -> Arc<Self> {
         Arc::new(Self {
-            available: AtomicBool::new(true),
+            available: AtomicBool::new(false),
             ..Self::default()
         })
+    }
+
+    /// Toggles availability after construction.
+    pub(crate) fn set_available(&self, available: bool) {
+        self.available.store(available, Ordering::Release);
     }
 
     /// Arms (or returns) a closed write gate for `address`.
@@ -79,9 +108,27 @@ impl ScriptedDrive {
         Arc::clone(gates.entry(address).or_default())
     }
 
+    /// Arms a one-shot gate for the next `weak_tail` snapshot.
+    pub(crate) fn gate_next_tail_scan(&self) -> Arc<PollGate> {
+        let gate = Arc::new(PollGate::default());
+        *self
+            .pending_tail_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&gate));
+        gate
+    }
+
     /// Persist then return an error (durable-but-uncompleted slot).
     pub(crate) fn fail_after_write(&self, address: Address) {
         self.post_write_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(address);
+    }
+
+    /// Fail the write before persistence.
+    pub(crate) fn fail_write(&self, address: Address) {
+        self.failing_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(address);
@@ -95,6 +142,24 @@ impl ScriptedDrive {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .read(address)
             .is_some()
+    }
+
+    /// Written addresses observed by the most recent gated/ungated weak_tail.
+    #[must_use]
+    pub(crate) fn last_tail_scan_written(&self) -> BTreeSet<Address> {
+        self.last_tail_scan_written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Current durable written-address set.
+    #[must_use]
+    pub(crate) fn written_addresses(&self) -> BTreeSet<Address> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .written_addresses()
     }
 
     fn check_available(&self) -> Result<(), DriveError> {
@@ -162,11 +227,24 @@ impl LogDrive for ScriptedDrive {
     fn weak_tail(&self, k: u64) -> DriveFuture<'_, TailDescription> {
         Box::pin(async move {
             self.check_available()?;
-            Ok(self
-                .model
+            let gate = self
+                .pending_tail_gate
                 .lock()
                 .map_err(|_| DriveError::backend(InjectedFailure))?
-                .weak_tail(k))
+                .take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+            }
+            self.check_available()?;
+            let model = self
+                .model
+                .lock()
+                .map_err(|_| DriveError::backend(InjectedFailure))?;
+            *self
+                .last_tail_scan_written
+                .lock()
+                .map_err(|_| DriveError::backend(InjectedFailure))? = model.written_addresses();
+            Ok(model.weak_tail(k))
         })
     }
 }

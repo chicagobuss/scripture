@@ -40,8 +40,13 @@ impl Suite {
         let composition = vec![
             Scenario::KWindowDelayedCompletion,
             Scenario::KWindowPermanentWedgeSeal,
+            Scenario::PermanentWedgeSealSuccessor,
+            Scenario::SealTailRace,
             Scenario::StripedModuloMapping,
+            Scenario::StripedLaggingScanReconstruction,
             Scenario::QuorumPartialWriteNotGlobal,
+            Scenario::QuorumRepairUnavailability,
+            Scenario::NestedStripeQuorumSchedules,
         ];
         let resilience = vec![
             Scenario::ProcessSeparatedBaseline,
@@ -57,8 +62,13 @@ impl Suite {
             Self::All => {
                 let mut all = core;
                 for scenario in [
+                    Scenario::PermanentWedgeSealSuccessor,
+                    Scenario::SealTailRace,
                     Scenario::StripedModuloMapping,
+                    Scenario::StripedLaggingScanReconstruction,
                     Scenario::QuorumPartialWriteNotGlobal,
+                    Scenario::QuorumRepairUnavailability,
+                    Scenario::NestedStripeQuorumSchedules,
                 ] {
                     if !all.contains(&scenario) {
                         all.push(scenario);

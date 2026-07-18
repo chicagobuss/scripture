@@ -108,10 +108,20 @@ pub enum Scenario {
     KWindowDelayedCompletion,
     /// Permanent K-window wedge sealed at the physical durable boundary.
     KWindowPermanentWedgeSeal,
+    /// Family 4: wedge → seal → VirtualLog successor at sealed boundary 2.
+    PermanentWedgeSealSuccessor,
+    /// Family 5: seal/check-tail race with no illegal fast/slow observation.
+    SealTailRace,
     /// Striped modulo mapping judged by ReferenceLogDrive.
     StripedModuloMapping,
+    /// Family 8: striped lagging-scan reconstruction vs scan-claim oracle.
+    StripedLaggingScanReconstruction,
     /// Quorum: one replica is not a global write.
     QuorumPartialWriteNotGlobal,
+    /// Family 10: quorum repair unavailable — never a successful tail.
+    QuorumRepairUnavailability,
+    /// Family 11: nested stripe/quorum schedule judged by reference model.
+    NestedStripeQuorumSchedules,
     /// Process-separated baseline against ephemeral in-namespace RustFS.
     ProcessSeparatedBaseline,
     /// Kill A, explicit lawful B promotion, dense continuation (temporary adapter).
@@ -126,14 +136,19 @@ pub enum Scenario {
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 12] = [
+    pub const ALL: [&'static str; 17] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
         "k-window-delayed-completion",
         "k-window-permanent-wedge-seal",
+        "permanent-wedge-seal-successor",
+        "seal-tail-race",
         "striped-modulo-mapping",
+        "striped-lagging-scan-reconstruction",
         "quorum-partial-write-not-global",
+        "quorum-repair-unavailability",
+        "nested-stripe-quorum-schedules",
         "process-separated-baseline",
         "kill-a-explicit-b-promotion",
         "wedged-payload-process-separated",
@@ -149,8 +164,13 @@ impl Scenario {
             "writer-dies-after-payload" => Ok(Self::WriterDiesAfterPayload),
             "k-window-delayed-completion" => Ok(Self::KWindowDelayedCompletion),
             "k-window-permanent-wedge-seal" => Ok(Self::KWindowPermanentWedgeSeal),
+            "permanent-wedge-seal-successor" => Ok(Self::PermanentWedgeSealSuccessor),
+            "seal-tail-race" => Ok(Self::SealTailRace),
             "striped-modulo-mapping" => Ok(Self::StripedModuloMapping),
+            "striped-lagging-scan-reconstruction" => Ok(Self::StripedLaggingScanReconstruction),
             "quorum-partial-write-not-global" => Ok(Self::QuorumPartialWriteNotGlobal),
+            "quorum-repair-unavailability" => Ok(Self::QuorumRepairUnavailability),
+            "nested-stripe-quorum-schedules" => Ok(Self::NestedStripeQuorumSchedules),
             "process-separated-baseline" => Ok(Self::ProcessSeparatedBaseline),
             "kill-a-explicit-b-promotion" => Ok(Self::KillAExplicitBPromotion),
             "wedged-payload-process-separated" => Ok(Self::WedgedPayloadProcessSeparated),
@@ -169,8 +189,13 @@ impl Scenario {
             Self::WriterDiesAfterPayload => "writer-dies-after-payload",
             Self::KWindowDelayedCompletion => "k-window-delayed-completion",
             Self::KWindowPermanentWedgeSeal => "k-window-permanent-wedge-seal",
+            Self::PermanentWedgeSealSuccessor => "permanent-wedge-seal-successor",
+            Self::SealTailRace => "seal-tail-race",
             Self::StripedModuloMapping => "striped-modulo-mapping",
+            Self::StripedLaggingScanReconstruction => "striped-lagging-scan-reconstruction",
             Self::QuorumPartialWriteNotGlobal => "quorum-partial-write-not-global",
+            Self::QuorumRepairUnavailability => "quorum-repair-unavailability",
+            Self::NestedStripeQuorumSchedules => "nested-stripe-quorum-schedules",
             Self::ProcessSeparatedBaseline => "process-separated-baseline",
             Self::KillAExplicitBPromotion => "kill-a-explicit-b-promotion",
             Self::WedgedPayloadProcessSeparated => "wedged-payload-process-separated",
@@ -186,8 +211,13 @@ impl Scenario {
             self,
             Self::KWindowDelayedCompletion
                 | Self::KWindowPermanentWedgeSeal
+                | Self::PermanentWedgeSealSuccessor
+                | Self::SealTailRace
                 | Self::StripedModuloMapping
+                | Self::StripedLaggingScanReconstruction
                 | Self::QuorumPartialWriteNotGlobal
+                | Self::QuorumRepairUnavailability
+                | Self::NestedStripeQuorumSchedules
         )
     }
 
@@ -549,8 +579,13 @@ pub async fn run_campaign(
         Scenario::WriterDiesAfterPayload => run_wedged_payload(run_id, &backend).await?,
         Scenario::KWindowDelayedCompletion
         | Scenario::KWindowPermanentWedgeSeal
+        | Scenario::PermanentWedgeSealSuccessor
+        | Scenario::SealTailRace
         | Scenario::StripedModuloMapping
-        | Scenario::QuorumPartialWriteNotGlobal => {
+        | Scenario::StripedLaggingScanReconstruction
+        | Scenario::QuorumPartialWriteNotGlobal
+        | Scenario::QuorumRepairUnavailability
+        | Scenario::NestedStripeQuorumSchedules => {
             unreachable!("composition scenarios handled above")
         }
         Scenario::ProcessSeparatedBaseline
