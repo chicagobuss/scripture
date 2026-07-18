@@ -91,6 +91,11 @@ pub(crate) async fn run_composition(
         final_root,
         final_authority: serde_json::Value::Null,
         verdict,
+        checker: crate::CheckerAttestation::NotApplicable {
+            reason: "composition schedules are direct-oracle tests; RecordingSink is not bridged"
+                .into(),
+        },
+        evidence_class: Some("direct-oracle-test"),
     })
 }
 

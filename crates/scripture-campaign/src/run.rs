@@ -5,13 +5,16 @@ use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
+use crate::cutover_oracle::{self, ExpectedAuthority};
 use crate::kellnr::ReleaseAttestation;
 use crate::lifecycle::RunLifecycle;
 use crate::preflight::PreflightReport;
 use crate::profile::{Profile, RustFsHomeFleetProfile};
 use crate::raw_lines_client::{self, RawLinesAck};
 use crate::scenario::Suite;
-use crate::{CampaignBackend, CampaignError, CampaignReport, Scenario, run_campaign};
+use crate::{
+    CampaignBackend, CampaignError, CampaignReport, CheckerAttestation, Scenario, run_campaign,
+};
 use holylog_correctness::Verdict;
 
 /// Options for one autonomous campaign invocation.
@@ -305,21 +308,31 @@ async fn run_raw_lines_ab_cutover(
 
     let phase_b: [&str; 3] = ["cutover-b-0", "cutover-b-1", "cutover-b-2"];
     let acks_b = raw_lines_client::exchange_committed("127.0.0.1:19002", &phase_b).await?;
-    // Raw-lines OK offsets are loglet-local; after promote they restart at 0 on the
-    // successor. Cross-cutover denseness is the VirtualLog generation chain.
+    // Per-epoch denseness on the temporary raw-lines OK surface (loglet-local).
     assert_dense_continuation(&acks_b, None)?;
     forward_b.stop();
 
-    let succession = observe_ha_succession(
+    let expected_payloads: Vec<&str> = phase_a
+        .iter()
+        .chain(phase_b.iter())
+        .copied()
+        .collect();
+    let cutover = cutover_oracle::prove_raw_lines_cutover(
         rustfs_endpoint,
         &lifecycle.store.bucket,
         lifecycle.access_key(),
         lifecycle.secret_key(),
         &ha_prefix,
-    )?;
+        &expected_payloads,
+        ExpectedAuthority {
+            owner: cutover_oracle::actor_b_owner(),
+            term: 2,
+        },
+    )
+    .await?;
 
-    // After B serves, A must not yield a committed ACK (stale writer path closed).
-    assert_no_committed_ack(
+    // A-death / unreachability only — not a live stale-writer fence proof (family 6).
+    assert_a_unreachable_for_producer(
         &lifecycle.kube_context,
         &lifecycle.namespace,
         "svc/scripture-actor-a",
@@ -350,11 +363,11 @@ async fn run_raw_lines_ab_cutover(
             Scenario::RawLinesAbCutover,
             lifecycle,
             serde_json::json!({
-                "evidence_class": "producer-raw-lines-ab-cutover",
+                "evidence_class": "producer-ack + Holylog-state/readback oracle",
                 "ha_prefix": ha_prefix,
                 "actor_a": actor_a,
                 "actor_b": actor_b,
-                "ha_succession": succession,
+                "cutover_oracle": cutover.observation,
                 "actions": [
                     "bootstrap-a-and-serve",
                     "producer-raw-lines-to-a",
@@ -362,9 +375,9 @@ async fn run_raw_lines_ab_cutover(
                     "wait-a-unreachable",
                     "promote-b-term-2-same-ha-prefix",
                     "producer-raw-lines-to-b",
-                    "assert-dense-per-epoch",
-                    "observe-virtual-log-generation-chain",
-                    "assert-no-stale-a-ack"
+                    "assert-dense-per-epoch-ok-acks",
+                    "holylog-exact-boundary-and-readback-oracle",
+                    "assert-a-service-unreachable"
                 ],
                 "producer_acks_a": ack_summary(&acks_a),
                 "producer_acks_b": ack_summary(&acks_b),
@@ -372,118 +385,34 @@ async fn run_raw_lines_ab_cutover(
                     "Producer committed OK ACKs came from actor A's raw-lines listener",
                     "A was force-deleted and became unreachable before B promote",
                     "B was promoted on the identical HA object prefix and returned dense per-epoch OK ACKs",
-                    "VirtualLog register on that prefix shows a sealed predecessor chained to a successor generation",
-                    "Stale A did not return a committed OK after B served",
+                    "Holylog membership: predecessor sealed.tail + start equals successor.start exactly",
+                    "Serving authority fence decodes to owner scripture-own-b! at writer_term 2 on the successor generation",
+                    "VirtualLog readback across the generation chain returns A then B payload identities exactly once and in order",
+                    "A's Service has no live producer ACK path after cutover (death/unreachability, not live stale-writer fencing)",
                     "A and B are distinct OS processes/pods on configured nodes",
                     "object store is the run-owned ephemeral RustFS Service"
                 ],
                 "non_claims": [
                     "temporary-bootstrap-promote adapter until stable scripture serve lands",
-                    "Raw-lines OK offsets are loglet-local and restart on the successor; cross-cutover denseness is the VirtualLog generation chain, not OK first_offset continuity",
-                    "Holylog semantic TraceEvent export is not available from the temporary adapter; verdict is producer-ACK / store-oracle, not check_trace",
+                    "Raw-lines OK offsets are loglet-local; cross-cutover denseness is Holylog sealed-tail == successor.start plus chunk readback",
+                    "checker not applied: temporary actor has no TraceEvent export",
                     "not automatic failover",
-                    "not family 14 DieAfterPayload wedge; not family 15 reply-loss",
+                    "not a live stale-writer fence (family 6); not family 14 DieAfterPayload; not family 15 reply-loss",
                     "scripture:0.1.0 remains development-source; cannot close family 22"
                 ]
             }),
         ),
         events: Vec::new(),
-        final_root: succession,
-        final_authority: serde_json::Value::Null,
+        final_root: cutover.observation.clone(),
+        final_authority: cutover.observation.get("serving_authority").cloned().unwrap_or(serde_json::Value::Null),
         verdict: Verdict::Pass,
+        checker: CheckerAttestation::NotApplicable {
+            reason: "temporary actor has no TraceEvent export".into(),
+        },
+        evidence_class: Some("producer-ack + Holylog-state/readback oracle"),
     })
 }
 
-fn observe_ha_succession(
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    ha_prefix: &str,
-) -> Result<serde_json::Value, CampaignError> {
-    // Object key uses literal %2F separators in this Holylog layout.
-    let key = format!("{ha_prefix}/virtual-log%2Fverse%2Fregister-pointer");
-    let output = Command::new("aws")
-        .args([
-            "--endpoint-url",
-            endpoint,
-            "s3",
-            "cp",
-            &format!("s3://{bucket}/{key}"),
-            "-",
-        ])
-        .env("AWS_ACCESS_KEY_ID", access_key)
-        .env("AWS_SECRET_ACCESS_KEY", secret_key)
-        .env("AWS_DEFAULT_REGION", "us-east-1")
-        .output()
-        .map_err(|error| CampaignError::Scenario(format!("aws s3 cp: {error}")))?;
-    if !output.status.success() {
-        return Err(CampaignError::Scenario(format!(
-            "aws s3 cp register-pointer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    let pointer: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| CampaignError::Scenario(format!("register-pointer json: {error}")))?;
-    let generations = pointer
-        .pointer("/state/generations")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| {
-            CampaignError::Scenario("register-pointer missing state.generations".into())
-        })?;
-    if generations.len() < 2 {
-        return Err(CampaignError::Scenario(format!(
-            "expected sealed predecessor + successor generations, got {}",
-            generations.len()
-        )));
-    }
-    let start0 = generations[0]
-        .get("start")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let start1 = generations[1]
-        .get("start")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| CampaignError::Scenario("successor generation missing start".into()))?;
-    if start1 <= start0 {
-        return Err(CampaignError::Scenario(format!(
-            "successor start {start1} is not after predecessor start {start0}"
-        )));
-    }
-    let pred_id = generations[0]
-        .get("loglet_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let seal_prefix = format!("{ha_prefix}/loglets/{pred_id}/seal/");
-    let seals = Command::new("aws")
-        .args([
-            "--endpoint-url",
-            endpoint,
-            "s3",
-            "ls",
-            &format!("s3://{bucket}/{seal_prefix}"),
-        ])
-        .env("AWS_ACCESS_KEY_ID", access_key)
-        .env("AWS_SECRET_ACCESS_KEY", secret_key)
-        .env("AWS_DEFAULT_REGION", "us-east-1")
-        .output()
-        .map_err(|error| CampaignError::Scenario(format!("aws s3 ls seal: {error}")))?;
-    let seal_listing = String::from_utf8_lossy(&seals.stdout);
-    if !seals.status.success() || seal_listing.trim().is_empty() {
-        return Err(CampaignError::Scenario(format!(
-            "predecessor loglet {pred_id} has no seal object under {seal_prefix}"
-        )));
-    }
-    Ok(serde_json::json!({
-        "ha_prefix": ha_prefix,
-        "register_pointer": pointer,
-        "predecessor_loglet_id": pred_id,
-        "successor_loglet_id": generations[1].get("loglet_id"),
-        "predecessor_start": start0,
-        "successor_start": start1,
-        "predecessor_seal_listing": seal_listing.trim(),
-    }))
-}
 
 fn assert_dense_continuation(
     acks: &[RawLinesAck],
@@ -567,7 +496,7 @@ async fn wait_actor_unreachable(
 }
 
 /// Asserts a producer exchange cannot obtain a committed OK from a dead actor.
-async fn assert_no_committed_ack(
+async fn assert_a_unreachable_for_producer(
     context: &str,
     namespace: &str,
     target: &str,
@@ -589,7 +518,7 @@ async fn assert_no_committed_ack(
     forward.stop();
     match result {
         Ok(Ok(_)) => Err(CampaignError::Scenario(format!(
-            "stale actor target {target} still returned a committed OK ACK"
+            "killed actor target {target} still returned a committed OK ACK"
         ))),
         Ok(Err(_)) | Err(_) => Ok(()),
     }

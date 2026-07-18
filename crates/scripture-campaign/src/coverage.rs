@@ -274,9 +274,9 @@ pub fn merge_executed(
                 _ => CoverageStatus::Inconclusive,
             };
             row.reason = match &report.verdict {
-                holylog_correctness::Verdict::Pass => None,
+                holylog_correctness::Verdict::Pass => report.evidence_class.map(str::to_owned),
                 holylog_correctness::Verdict::Fail { invariant, .. } => {
-                    Some(format!("checker fail: {invariant:?}"))
+                    Some(format!("oracle/checker fail: {invariant:?}"))
                 }
                 holylog_correctness::Verdict::Inconclusive { reason, .. } => Some(reason.clone()),
             };

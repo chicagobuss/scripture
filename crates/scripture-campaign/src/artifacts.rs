@@ -11,8 +11,10 @@ use crate::kellnr::ReleaseAttestation;
 pub struct MatrixEntry {
     /// Scenario token.
     pub scenario: String,
-    /// Checker verdict label.
+    /// Scenario/oracle verdict label.
     pub verdict: String,
+    /// Checker attestation status (`evaluated` or `not_applicable`).
+    pub checker: String,
     /// Process exit code for the scenario.
     pub exit_code: i32,
 }
@@ -159,12 +161,18 @@ impl SuiteArtifacts {
             lines.push(String::new());
             lines.push("## Scenarios".into());
             for report in reports {
+                let checker = match &report.checker {
+                    crate::CheckerAttestation::Evaluated => "evaluated",
+                    crate::CheckerAttestation::NotApplicable { .. } => "not_applicable",
+                };
                 lines.push(format!(
-                    "- `{}` backend={} events={} verdict={}",
+                    "- `{}` backend={} events={} oracle={} checker={} evidence_class={}",
                     report.scenario,
                     report.backend,
                     report.events.len(),
-                    report.verdict_label()
+                    report.verdict_label(),
+                    checker,
+                    report.evidence_class.unwrap_or("checker-trace")
                 ));
             }
         }
@@ -215,8 +223,12 @@ pub fn write_scenario_artifacts(dir: &Path, report: &CampaignReport) -> Result<(
         serde_json::to_vec_pretty(&report.environment)?,
     )?;
     std::fs::write(
-        dir.join("checker-verdict.json"),
+        dir.join("oracle-verdict.json"),
         serde_json::to_vec_pretty(&report.verdict_json()?)?,
+    )?;
+    std::fs::write(
+        dir.join("checker-verdict.json"),
+        serde_json::to_vec_pretty(&report.checker_json())?,
     )?;
     Ok(())
 }
@@ -238,9 +250,14 @@ pub enum ArtifactError {
 /// Builds a matrix row from one scenario report.
 #[must_use]
 pub fn matrix_from_report(report: &CampaignReport) -> MatrixEntry {
+    let checker = match &report.checker {
+        crate::CheckerAttestation::Evaluated => "evaluated",
+        crate::CheckerAttestation::NotApplicable { .. } => "not_applicable",
+    };
     MatrixEntry {
         scenario: report.scenario.to_owned(),
         verdict: report.verdict_label().to_owned(),
+        checker: checker.to_owned(),
         exit_code: report.exit_code(),
     }
 }

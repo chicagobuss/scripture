@@ -25,6 +25,7 @@
 mod artifacts;
 mod composition;
 mod coverage;
+mod cutover_oracle;
 mod kellnr;
 mod legacy;
 mod lifecycle;
@@ -444,6 +445,18 @@ impl PartsFactory for TracingPartsFactory {
     }
 }
 
+/// How the shared Holylog correctness checker relates to this report.
+#[derive(Debug, Clone)]
+pub enum CheckerAttestation {
+    /// Checker evaluated harness TraceEvents.
+    Evaluated,
+    /// Checker did not run (no TraceEvent export / direct-oracle path).
+    NotApplicable {
+        /// Why the checker was not applied.
+        reason: String,
+    },
+}
+
 /// Redacted campaign evidence bundle.
 #[derive(Debug)]
 pub struct CampaignReport {
@@ -461,8 +474,12 @@ pub struct CampaignReport {
     pub final_root: serde_json::Value,
     /// Final Serving Authority observation (null for harness-path scenarios).
     pub final_authority: serde_json::Value,
-    /// Shared checker verdict.
+    /// Scenario / oracle outcome (not necessarily a Holylog checker verdict).
     pub verdict: Verdict,
+    /// Whether `check_trace` was applied.
+    pub checker: CheckerAttestation,
+    /// Coverage evidence class when distinct from a checker pass.
+    pub evidence_class: Option<&'static str>,
 }
 
 impl CampaignReport {
@@ -479,10 +496,24 @@ impl CampaignReport {
         Ok(out)
     }
 
-    /// Serializes the verdict as JSON.
+    /// Serializes the scenario/oracle verdict as JSON.
     pub fn verdict_json(&self) -> Result<serde_json::Value, CampaignError> {
         serde_json::to_value(&self.verdict)
             .map_err(|error| CampaignError::Serialize(error.to_string()))
+    }
+
+    /// Serializes checker attestation separately from the oracle verdict.
+    pub fn checker_json(&self) -> serde_json::Value {
+        match &self.checker {
+            CheckerAttestation::Evaluated => serde_json::json!({
+                "status": "evaluated",
+                "verdict": self.verdict_label(),
+            }),
+            CheckerAttestation::NotApplicable { reason } => serde_json::json!({
+                "status": "not_applicable",
+                "reason": reason,
+            }),
+        }
     }
 
     /// Whether the checker returned `Pass`.
@@ -578,6 +609,8 @@ pub async fn run_campaign(
         final_root,
         final_authority,
         verdict,
+        checker: CheckerAttestation::Evaluated,
+        evidence_class: None,
     })
 }
 
