@@ -1,0 +1,53 @@
+# Least-privilege client identities for NetworkPolicy from-selectors.
+# The release drill must prove pods without these labels cannot reach admin/producer.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scripture-producer-client
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    scripture.dev/client: producer
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scripture-admin-client
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    scripture.dev/client: admin
+---
+# Example Job labels the drill runner should apply to ephemeral client pods.
+# Do not run these as always-on Deployments.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-producer-client
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    scripture.dev/client: producer
+  annotations:
+    scripture.dev/example: "true"
+spec:
+  serviceAccountName: scripture-producer-client
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: busybox:1.36
+      command: ["true"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-admin-client
+  namespace: scripture-stable-REPLACE_RUN_ID
+  labels:
+    scripture.dev/client: admin
+  annotations:
+    scripture.dev/example: "true"
+spec:
+  serviceAccountName: scripture-admin-client
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: busybox:1.36
+      command: ["true"]

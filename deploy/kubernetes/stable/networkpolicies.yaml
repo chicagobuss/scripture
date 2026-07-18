@@ -43,10 +43,32 @@ spec:
         - protocol: TCP
           port: 9000
 ---
+# Producer port: only release-drill producer clients (not any in-namespace source).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: producer-to-writer
+  name: producer-from-client
+  namespace: scripture-stable-REPLACE_RUN_ID
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: scripture
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              scripture.dev/client: producer
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# Read-only status/probes. Kubelet probe traffic is node-sourced; allow the
+# status port without a pod from-selector. Do not use this pattern for admin.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: status-probes
   namespace: scripture-stable-REPLACE_RUN_ID
 spec:
   podSelector:
@@ -56,14 +78,13 @@ spec:
   ingress:
     - ports:
         - protocol: TCP
-          port: 9000
-        - protocol: TCP
           port: 9100
 ---
+# Admin promote on B: only release-drill admin clients.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: admin-to-b
+  name: admin-from-client
   namespace: scripture-stable-REPLACE_RUN_ID
 spec:
   podSelector:
@@ -71,7 +92,11 @@ spec:
       scripture.dev/owner: b
   policyTypes: ["Ingress"]
   ingress:
-    - ports:
+    - from:
+        - podSelector:
+            matchLabels:
+              scripture.dev/client: admin
+      ports:
         - protocol: TCP
           port: 9200
 ---

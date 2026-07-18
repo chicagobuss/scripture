@@ -5,13 +5,14 @@ edition = "2024"
 rust-version = "1.97"
 description = "Transport-neutral, single-writer service primitives for Scripture"
 license = "MIT"
-publish = true
+repository = "https://github.com/chicagobuss/scripture"
+publish = ["fleet"]
 
 [features]
 virtuallog-test-support = []
 
 [dependencies]
-scripture = { path = "../scripture" }
+scripture = { path = "../scripture", version = "0.1.0-rc.1" }
 holylog.workspace = true
 thiserror.workspace = true
 blake3.workspace = true

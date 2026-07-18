@@ -22,9 +22,9 @@ holylog-correctness.workspace = true
 holylog-object-store = { workspace = true, features = ["s3"] }
 holylog-object-store-register = { workspace = true, features = ["aws"] }
 object_store = { workspace = true, default-features = false }
-scripture = { path = "../scripture" }
-scripture-runtime = { path = "../scripture-runtime" }
-scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
+scripture = { path = "../scripture", version = "0.1.0-rc.1" }
+scripture-runtime = { path = "../scripture-runtime", version = "0.1.0-rc.1" }
+scripture-service = { path = "../scripture-service", version = "0.1.0-rc.1", features = ["virtuallog-test-support"] }
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true

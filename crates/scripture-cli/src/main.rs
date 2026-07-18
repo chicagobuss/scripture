@@ -8,6 +8,7 @@
 
 #![allow(unreachable_pub)]
 
+mod admin_http;
 mod assemble;
 mod bootstrap;
 #[cfg(feature = "campaign-faults")]

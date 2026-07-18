@@ -316,24 +316,7 @@ async fn admin_promote_loop(
         let config = config.clone();
         let token = token.clone();
         tokio::spawn(async move {
-            let assemble_result =
-                assemble::assemble_supervisor(&config).map_err(|error| error.to_string());
-            let assembled = match assemble_result {
-                Ok(assembled) => assembled,
-                Err(message) => {
-                    let _ = write_http(stream, 500, &format!("assemble failed: {message}\n")).await;
-                    return;
-                }
-            };
-            handle_admin_connection(
-                stream,
-                config,
-                assembled,
-                session_slot,
-                promote_inflight,
-                token,
-            )
-            .await;
+            handle_admin_connection(stream, config, session_slot, promote_inflight, token).await;
         });
     }
 }
@@ -341,48 +324,37 @@ async fn admin_promote_loop(
 async fn handle_admin_connection(
     mut stream: tokio::net::TcpStream,
     config: ScriptureConfig,
-    assembled: AssembledNode,
     session_slot: Arc<RwLock<Option<Arc<HaServingSession>>>>,
     promote_inflight: Arc<AtomicBool>,
     expected_token: String,
 ) {
-    let mut buf = vec![0_u8; 8192];
-    let Ok(n) = stream.read(&mut buf).await else {
-        return;
+    use crate::admin_http::{MAX_ADMIN_REQUEST_BYTES, parse_promote_request};
+    use tokio::time::{Duration, timeout};
+
+    let raw = match timeout(
+        Duration::from_secs(2),
+        read_bounded_http_request(&mut stream, MAX_ADMIN_REQUEST_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(error)) => {
+            let (code, body) = admin_error_response(&error);
+            let _ = write_http(stream, code, body).await;
+            return;
+        }
+        Err(_) => {
+            let _ = write_http(stream, 408, "request timeout\n").await;
+            return;
+        }
     };
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let Some(first) = request.lines().next() else {
-        let _ = write_http(stream, 400, "bad request\n").await;
-        return;
-    };
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
-    if method != "POST" || path != "/v1/promote" {
-        let _ = write_http(stream, 404, "not found\n").await;
-        return;
-    }
-    let Some(auth) = request
-        .lines()
-        .find_map(|line| line.strip_prefix("Authorization: Bearer "))
-        .map(str::trim)
-    else {
-        let _ = write_http(stream, 401, "unauthorized\n").await;
-        return;
-    };
-    if !tokens_equal(auth.as_bytes(), expected_token.as_bytes()) {
-        let _ = write_http(stream, 401, "unauthorized\n").await;
-        return;
-    }
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .or_else(|| request.split("\n\n").nth(1))
-        .unwrap_or("");
-    let candidate_term = match parse_candidate_term(body) {
-        Ok(term) => term,
-        Err(message) => {
-            let _ = write_http(stream, 400, &format!("{message}\n")).await;
+
+    // Authenticate + strict decode before assemble / promote work.
+    let promote = match parse_promote_request(&raw, &expected_token) {
+        Ok(req) => req,
+        Err(error) => {
+            let (code, body) = admin_error_response(&error);
+            let _ = write_http(stream, code, body).await;
             return;
         }
     };
@@ -399,7 +371,17 @@ async fn handle_admin_connection(
         return;
     }
 
-    let result = activate_promote_session(&config, &assembled, candidate_term)
+    let assemble_result = assemble::assemble_supervisor(&config).map_err(|error| error.to_string());
+    let assembled = match assemble_result {
+        Ok(assembled) => assembled,
+        Err(message) => {
+            promote_inflight.store(false, Ordering::SeqCst);
+            let _ = write_http(stream, 500, &format!("assemble failed: {message}\n")).await;
+            return;
+        }
+    };
+
+    let result = activate_promote_session(&config, &assembled, promote.candidate_term)
         .await
         .map_err(|error| error.to_string());
     promote_inflight.store(false, Ordering::SeqCst);
@@ -407,8 +389,8 @@ async fn handle_admin_connection(
         Ok(session) => {
             *session_slot.write().await = Some(Arc::new(session));
             eprintln!(
-                "scripture: admin promote ok owner={} candidate_term={candidate_term}",
-                config.node.owner_id
+                "scripture: admin promote ok owner={} candidate_term={}",
+                config.node.owner_id, promote.candidate_term
             );
             let _ = write_http(stream, 200, "promoted\n").await;
         }
@@ -416,6 +398,87 @@ async fn handle_admin_connection(
             eprintln!("scripture: admin promote refused: {message}");
             let _ = write_http(stream, 409, &format!("promote refused: {message}\n")).await;
         }
+    }
+}
+
+async fn read_bounded_http_request(
+    stream: &mut tokio::net::TcpStream,
+    max_bytes: usize,
+) -> Result<Vec<u8>, crate::admin_http::AdminParseError> {
+    use crate::admin_http::AdminParseError;
+
+    let mut buf = Vec::with_capacity(512);
+    let mut tmp = [0_u8; 512];
+    loop {
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|_| AdminParseError::Incomplete)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > max_bytes {
+            return Err(AdminParseError::BadRequest("request too large"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(header_end) = find_header_body_split(&buf)
+            && let Some(content_length) = content_length_from_headers(&buf[..header_end])?
+        {
+            let total = header_end + 4 + content_length;
+            if total > max_bytes {
+                return Err(AdminParseError::BadRequest("request too large"));
+            }
+            if buf.len() >= total {
+                buf.truncate(total);
+                return Ok(buf);
+            }
+        }
+    }
+    Ok(buf)
+}
+
+fn find_header_body_split(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn content_length_from_headers(
+    headers: &[u8],
+) -> Result<Option<usize>, crate::admin_http::AdminParseError> {
+    use crate::admin_http::AdminParseError;
+    let text =
+        std::str::from_utf8(headers).map_err(|_| AdminParseError::BadRequest("not utf-8"))?;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| AdminParseError::BadRequest("bad content-length"))?;
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
+}
+
+fn admin_error_response(error: &crate::admin_http::AdminParseError) -> (u16, &'static str) {
+    use crate::admin_http::AdminParseError;
+    match error {
+        AdminParseError::Incomplete => (400, "incomplete request\n"),
+        AdminParseError::NotFound => (404, "not found\n"),
+        AdminParseError::Unauthorized => (401, "unauthorized\n"),
+        AdminParseError::BadRequest(message) => match *message {
+            "request too large" => (413, "request too large\n"),
+            "candidate_term must be >= 1" => (400, "candidate_term must be >= 1\n"),
+            "content-length required" => (400, "content-length required\n"),
+            "trailing bytes after body" => (400, "trailing bytes after body\n"),
+            "body must be exact JSON object" => (400, "body must be exact JSON object\n"),
+            "not utf-8" => (400, "not utf-8\n"),
+            "malformed header" => (400, "malformed header\n"),
+            "bad content-length" => (400, "bad content-length\n"),
+            _ => (400, "bad request\n"),
+        },
     }
 }
 
@@ -450,32 +513,6 @@ async fn activate_promote_session(
         timer,
     )
     .await?)
-}
-
-fn parse_candidate_term(body: &str) -> Result<u64, String> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Err("candidate_term required".into());
-    }
-    // Minimal JSON: {"candidate_term":N}
-    if let Some(rest) = trimmed.strip_prefix("{\"candidate_term\":") {
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return digits
-            .parse()
-            .map_err(|_| "candidate_term must be an integer".into());
-    }
-    Err("body must be {\"candidate_term\":N}".into())
-}
-
-fn tokens_equal(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 async fn write_http(

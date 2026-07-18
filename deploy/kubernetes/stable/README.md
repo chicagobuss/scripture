@@ -19,8 +19,11 @@ the gitignored overlay `config/local/scripture-stable/` — never in this tree.
 
 - Distinct `node.owner_id` for A and B.
 - Liveness → `/livez`; readiness → `/readyz` (standby must be unready).
+- Owner advertise DNS must resolve via per-owner Services `scripture-actor-a` / `scripture-actor-b` (not the producer Service).
+- Producer ingress only from pods labeled `scripture.dev/client: producer`; admin ingress only from `scripture.dev/client: admin`.
 - No literal Secret data in tracked YAML.
 - Release image must be built **without** `campaign-faults`.
+- Publishable crates use `publish = ["fleet"]` (never crates.io).
 - No live `kubectl apply` until Joshua approves the exact command sequence from the release-drill runner.
 
 ## Overlay

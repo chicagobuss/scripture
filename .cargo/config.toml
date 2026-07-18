@@ -1,0 +1,5 @@
+# Non-secret fleet registry index (Kellnr on home-fleet).
+# Auth tokens stay in operator credential providers / ignored local config —
+# never commit them here.
+[registries.fleet]
+index = "sparse+http://10.0.0.5:30990/api/v1/crates/"

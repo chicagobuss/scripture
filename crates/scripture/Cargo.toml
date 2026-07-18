@@ -5,7 +5,8 @@ edition = "2024"
 rust-version = "1.97"
 description = "A correctness-first durable journal system over holylog"
 license = "MIT"
-publish = true
+repository = "https://github.com/chicagobuss/scripture"
+publish = ["fleet"]
 
 [features]
 default = []
