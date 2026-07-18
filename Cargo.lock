@@ -1574,6 +1574,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "getrandom 0.3.4",
  "holylog",
  "holylog-correctness",
  "holylog-object-store",

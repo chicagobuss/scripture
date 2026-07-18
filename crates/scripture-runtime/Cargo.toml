@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 holylog.workspace = true
 holylog-object-store = { workspace = true, features = ["s3"] }
 holylog-object-store-register = { workspace = true, features = ["aws"] }
