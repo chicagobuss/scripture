@@ -65,9 +65,14 @@ pub async fn bootstrap_and_serve_cli(
     config: ScriptureConfig,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let mut assembled = assemble::assemble_supervisor(&config)?;
     #[cfg(feature = "campaign-faults")]
-    let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+    let (assembled, campaign) = {
+        let mut assembled = assemble::assemble_supervisor(&config)?;
+        let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+        (assembled, campaign)
+    };
+    #[cfg(not(feature = "campaign-faults"))]
+    let assembled = assemble::assemble_supervisor(&config)?;
     #[cfg(not(feature = "campaign-faults"))]
     let campaign = Option::<()>::None;
     let _ = &campaign;
@@ -116,9 +121,14 @@ pub async fn promote_and_serve_cli(
     config: ScriptureConfig,
     candidate_term: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let mut assembled = assemble::assemble_supervisor(&config)?;
     #[cfg(feature = "campaign-faults")]
-    let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+    let (assembled, campaign) = {
+        let mut assembled = assemble::assemble_supervisor(&config)?;
+        let campaign = crate::campaign_faults::install_into_assembled(&mut assembled)?;
+        (assembled, campaign)
+    };
+    #[cfg(not(feature = "campaign-faults"))]
+    let assembled = assemble::assemble_supervisor(&config)?;
     #[cfg(not(feature = "campaign-faults"))]
     let campaign = Option::<()>::None;
     let _ = &campaign;
@@ -157,7 +167,7 @@ pub async fn promote_and_serve_cli(
             // using the *same* Expected precondition so durable Transitioning intent matches
             // (fault is one-shot; resume uses complete_after_intent).
             eprintln!(
-                "scripture: promote reply-loss after applied root CAS ({error}); retrying once with same Expected precondition"
+                "scripture: promote reply-loss after applied RootCasReplyLost ({error}); retrying once with same Expected precondition"
             );
             promote_and_serve(
                 &coordinator,
@@ -298,11 +308,18 @@ async fn serve_probe_connection(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
+#[cfg(feature = "campaign-faults")]
 fn should_retry_promote_after_reply_loss(
     campaign: &Option<crate::campaign_faults::CampaignFaultContext>,
     error: &HaActivationError,
 ) -> bool {
-    if campaign.is_none() {
+    let Some(ctx) = campaign.as_ref() else {
+        return false;
+    };
+    // Retry only for an explicitly armed RootCasReplyLost that the harness
+    // evidenced as applied — never for an unrelated root/Indeterminate error
+    // merely because campaign tracing is enabled.
+    if !ctx.root_cas_reply_loss_armed() || !ctx.root_cas_reply_loss_applied() {
         return false;
     }
     matches!(

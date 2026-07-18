@@ -161,10 +161,7 @@ impl SuiteArtifacts {
             lines.push(String::new());
             lines.push("## Scenarios".into());
             for report in reports {
-                let checker = match &report.checker {
-                    crate::CheckerAttestation::Evaluated => "evaluated",
-                    crate::CheckerAttestation::NotApplicable { .. } => "not_applicable",
-                };
+                let checker = report.checker.label();
                 lines.push(format!(
                     "- `{}` backend={} events={} oracle={} checker={} evidence_class={}",
                     report.scenario,
@@ -250,14 +247,10 @@ pub enum ArtifactError {
 /// Builds a matrix row from one scenario report.
 #[must_use]
 pub fn matrix_from_report(report: &CampaignReport) -> MatrixEntry {
-    let checker = match &report.checker {
-        crate::CheckerAttestation::Evaluated => "evaluated",
-        crate::CheckerAttestation::NotApplicable { .. } => "not_applicable",
-    };
     MatrixEntry {
         scenario: report.scenario.to_owned(),
         verdict: report.verdict_label().to_owned(),
-        checker: checker.to_owned(),
+        checker: report.checker.label().to_owned(),
         exit_code: report.exit_code(),
     }
 }

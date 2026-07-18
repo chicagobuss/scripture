@@ -15,8 +15,8 @@ use holylog::provision::LogletObjectNamespaces;
 use holylog::virtual_log::{ConditionalRegister, LogletId};
 use holylog_correctness::faults::{FaultableConditionalRegister, FaultableLogDrive, FaultableSeal};
 use holylog_correctness::{
-    ActorId, ActorTrace, ArmedFault, EventKind, FaultController, OperationId, RecordingSink, RunId,
-    TraceEvent, TraceSink,
+    ActorId, ActorTrace, ArmedFault, EventKind, FaultController, FaultKind, OperationId,
+    RecordingSink, RunId, TraceEvent, TraceSink,
 };
 use scripture::Receipt;
 use scripture_runtime::{DurableLogletParts, PartsFactory, PartsFactoryError};
@@ -38,7 +38,6 @@ pub struct CampaignFaultContext {
     /// Actor-scoped trace (also mirrored to file when configured).
     pub trace: ActorTrace,
     /// In-memory recording mirror for nonempty checks.
-    #[allow(dead_code)]
     pub sink: Arc<RecordingSink>,
     /// Active loglet id for ScriptureCommittedAck enrichment.
     active_loglet: Arc<Mutex<String>>,
@@ -48,6 +47,30 @@ pub struct CampaignFaultContext {
     die_after_ack_count: u64,
     /// Whether DieAfterPayload is requested.
     die_after_payload: bool,
+    /// Whether RootCasReplyLost was explicitly armed for this process.
+    root_cas_reply_loss_armed: bool,
+}
+
+impl CampaignFaultContext {
+    /// True when this process was started with RootCasReplyLost armed.
+    #[must_use]
+    pub fn root_cas_reply_loss_armed(&self) -> bool {
+        self.root_cas_reply_loss_armed
+    }
+
+    /// True when the one-shot RootCasReplyLost fault applied (trace evidence).
+    #[must_use]
+    pub fn root_cas_reply_loss_applied(&self) -> bool {
+        self.sink.events().iter().any(|event| {
+            matches!(
+                &event.event,
+                EventKind::Fault {
+                    fault: FaultKind::RootCasReplyLost,
+                    applied: true,
+                }
+            )
+        })
+    }
 }
 
 /// Returns true when any campaign-fault env is present.
@@ -80,7 +103,8 @@ pub fn install_into_assembled(
         Arc::clone(&fanout) as Arc<dyn TraceSink>,
     );
     let faults = Arc::new(FaultController::new());
-    if env_flag(ENV_ROOT_CAS_REPLY_LOSS) {
+    let root_cas_reply_loss_armed = env_flag(ENV_ROOT_CAS_REPLY_LOSS);
+    if root_cas_reply_loss_armed {
         faults.arm(ArmedFault::RootCasReplyLost);
         eprintln!("scripture: campaign-faults armed RootCasReplyLost");
     }
@@ -119,6 +143,7 @@ pub fn install_into_assembled(
         ack_count: Arc::new(AtomicU64::new(0)),
         die_after_ack_count,
         die_after_payload,
+        root_cas_reply_loss_armed,
     }))
 }
 
