@@ -716,6 +716,10 @@ pub(crate) fn actor_b_owner() -> OwnerId {
     OwnerId::from_bytes(*b"scripture-own-b!")
 }
 
+pub(crate) fn actor_c_owner() -> OwnerId {
+    OwnerId::from_bytes(*b"scripture-own-c!")
+}
+
 #[cfg(test)]
 mod negative_controls {
     use super::match_payloads;

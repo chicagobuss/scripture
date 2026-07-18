@@ -349,6 +349,27 @@ impl HolylogJournalFoundation {
         }
     }
 
+    async fn ensure_membership_resolvable(
+        &self,
+        state: &VirtualLogState,
+    ) -> Result<(), FoundationTransitionError> {
+        for generation in &state.generations {
+            if self.resolver.contains(&generation.loglet_id) {
+                continue;
+            }
+            let parts = self
+                .parts
+                .open(&generation.loglet_id)
+                .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
+            let historical = resolve_read_seal(parts.components(self.k))
+                .await
+                .map_err(Self::map_unavailable)?;
+            self.resolver
+                .insert_read_seal(generation.loglet_id.clone(), Arc::new(historical));
+        }
+        Ok(())
+    }
+
     async fn ensure_predecessor_sealed(
         &self,
         predecessor: &LogletId,
@@ -536,27 +557,32 @@ impl HolylogJournalFoundation {
         publication: ServingPublication,
     ) -> Result<JournalGenerationRef, FoundationTransitionError> {
         let next_term = publication.authority().writer_term;
-        let predecessor = observed
+        let predecessor_desc = observed
             .state
             .active()
             .ok_or_else(|| FoundationTransitionError::Conflict {
                 message: "no active generation to seal".into(),
             })?
-            .loglet_id
             .clone();
+        let predecessor = predecessor_desc.loglet_id.clone();
 
+        // Fresh processes only have what Foundation installs. Holylog membership may
+        // retain older sealed generations; VerseRuntime/VirtualLog must resolve them.
+        self.ensure_membership_resolvable(&observed.state).await?;
         self.ensure_predecessor_sealed(&predecessor).await?;
         self.observer
             .checkpoint(FoundationTransitionCheckpoint::PredecessorSealed)?;
 
-        // Successor start = sealed predecessor contiguous tail (Holylog sets this
-        // on reconfigure; we bind the Serving fence to the post-publish observe).
+        // Successor start must match Holylog reconfigure:
+        // `predecessor.start + sealed.tail` (see VirtualLog::reconfigure_with_receipt).
         let next_revision = observed.state.revision.checked_add(1).ok_or_else(|| {
             FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
                 "VirtualLog revision overflow",
             )))
         })?;
-        let start = self.sealed_predecessor_start(&predecessor).await?;
+        let start = self
+            .sealed_predecessor_start(&predecessor, predecessor_desc.start)
+            .await?;
         self.observer
             .checkpoint(FoundationTransitionCheckpoint::SealedTailObserved)?;
         let (successor, _parts, receipt, writable, bind) = self
@@ -612,6 +638,7 @@ impl HolylogJournalFoundation {
     async fn sealed_predecessor_start(
         &self,
         predecessor: &LogletId,
+        predecessor_start: u64,
     ) -> Result<u64, FoundationTransitionError> {
         let parts = self
             .parts
@@ -620,11 +647,18 @@ impl HolylogJournalFoundation {
         let historical = resolve_read_seal(parts.components(self.k))
             .await
             .map_err(Self::map_unavailable)?;
-        let durable = historical
-            .observe_durable()
+        let sealed = historical
+            .check_tail_if_sealed()
             .await
-            .map_err(Self::map_unavailable)?;
-        Ok(durable.non_contiguous_tail())
+            .map_err(Self::map_unavailable)?
+            .ok_or_else(|| FoundationTransitionError::Conflict {
+                message: "predecessor seal/tail not observed for successor boundary".into(),
+            })?;
+        predecessor_start.checked_add(sealed.tail).ok_or_else(|| {
+            FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
+                "successor boundary address overflow",
+            )))
+        })
     }
 
     async fn classify_locked(
