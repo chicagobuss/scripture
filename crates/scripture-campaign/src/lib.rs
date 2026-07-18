@@ -139,11 +139,13 @@ pub enum Scenario {
     RawLinesDirectionalLoss,
     /// Family 17: scoped credential invalidation; restore and promote B.
     RawLinesCredentialInvalidation,
+    /// Family 21: resource inventory cleanup + second-run independence.
+    RawLinesResourceCleanup,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 18] = [
+    pub const ALL: [&'static str; 19] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
@@ -162,6 +164,7 @@ impl Scenario {
         "raw-lines-root-cas-reply-loss",
         "raw-lines-directional-loss",
         "raw-lines-credential-invalidation",
+        "raw-lines-resource-cleanup",
     ];
 
     /// Parses a scenario token.
@@ -185,6 +188,7 @@ impl Scenario {
             "raw-lines-root-cas-reply-loss" => Ok(Self::RawLinesRootCasReplyLoss),
             "raw-lines-directional-loss" => Ok(Self::RawLinesDirectionalLoss),
             "raw-lines-credential-invalidation" => Ok(Self::RawLinesCredentialInvalidation),
+            "raw-lines-resource-cleanup" => Ok(Self::RawLinesResourceCleanup),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -211,6 +215,7 @@ impl Scenario {
             Self::RawLinesRootCasReplyLoss => "raw-lines-root-cas-reply-loss",
             Self::RawLinesDirectionalLoss => "raw-lines-directional-loss",
             Self::RawLinesCredentialInvalidation => "raw-lines-credential-invalidation",
+            Self::RawLinesResourceCleanup => "raw-lines-resource-cleanup",
         }
     }
 
@@ -242,6 +247,7 @@ impl Scenario {
                 | Self::RawLinesRootCasReplyLoss
                 | Self::RawLinesDirectionalLoss
                 | Self::RawLinesCredentialInvalidation
+                | Self::RawLinesResourceCleanup
         )
     }
 }
@@ -680,7 +686,8 @@ pub async fn run_campaign(
         | Scenario::RawLinesDieAfterPayload
         | Scenario::RawLinesRootCasReplyLoss
         | Scenario::RawLinesDirectionalLoss
-        | Scenario::RawLinesCredentialInvalidation => {
+        | Scenario::RawLinesCredentialInvalidation
+        | Scenario::RawLinesResourceCleanup => {
             return Err(CampaignError::Scenario(format!(
                 "{} requires rustfs-home-fleet lifecycle orchestration",
                 scenario.as_str()

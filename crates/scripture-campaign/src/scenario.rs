@@ -56,6 +56,7 @@ impl Suite {
             Scenario::RawLinesRootCasReplyLoss,
             Scenario::RawLinesDirectionalLoss,
             Scenario::RawLinesCredentialInvalidation,
+            Scenario::RawLinesResourceCleanup,
         ];
         match self {
             Self::Core => core,
@@ -87,7 +88,7 @@ impl Suite {
         match self {
             Self::Core => "core-wp05",
             Self::Composition => "composition-wp05",
-            Self::Resilience => "resilience-wp06-families-12-17",
+            Self::Resilience => "resilience-wp08-families-12-17-21",
             Self::All => "all-implemented-wp05",
         }
     }

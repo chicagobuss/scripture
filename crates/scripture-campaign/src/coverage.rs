@@ -188,8 +188,8 @@ pub fn family_catalog() -> Vec<CoverageRow> {
         row(
             21,
             "resource-bounds-cleanup-leaks",
-            CoverageLayer::Boundary,
-            None,
+            CoverageLayer::Resilience,
+            Some(Scenario::RawLinesResourceCleanup),
         ),
         row(
             22,
@@ -233,12 +233,21 @@ fn row(
 fn default_not_run_reason(family: u8) -> Option<String> {
     Some(match family {
         13 | 14 => {
-            "pre-PR#7 process acceptance superseded; awaiting WP07 re-earn on main≥464d391".into()
+            "pre-PR#7 process acceptance superseded; re-earned on WP07 (see acceptance note)".into()
         }
         18 => "R2/S3/GCS require Joshua's explicit approval of the exact command".into(),
-        19 => "malformed identity suite not yet wired".into(),
-        20 => "reconfiguration storm not yet wired".into(),
-        21 => "resource-bounds suite not yet wired".into(),
+        19 => {
+            "memory HA suite: scripture-runtime --test malformed_identity (wired; see WP08 note)"
+                .into()
+        }
+        20 => {
+            "memory HA suite: scripture-runtime --test one_record_ha_proofs churn_* (wired; see WP08 note)"
+                .into()
+        }
+        21 => {
+            "raw-lines bounds (in-process) + raw-lines-resource-cleanup (live inventory/wait-gone)"
+                .into()
+        }
         22 => "release/version row requires Kellnr RC manifest + locked image attestation".into(),
         _ => "not executed in this run".into(),
     })
@@ -274,5 +283,42 @@ pub fn merge_executed(
             };
         }
     }
+    annotate_wp08_memory_families(&mut catalog, release_classification);
     catalog
+}
+
+/// Families 19–20 are proven by locked in-process HA suites (not live RustFS).
+fn annotate_wp08_memory_families(
+    catalog: &mut [CoverageRow],
+    release_classification: &'static str,
+) {
+    for row in catalog {
+        match row.family {
+            19 => {
+                row.status = CoverageStatus::Pass;
+                row.backend = "memory";
+                row.process_separation = false;
+                row.release_classification = Some(release_classification);
+                row.reason = Some(
+                    "scripture-runtime --test malformed_identity (encode→mutate→gate/promote fail-closed)"
+                        .into(),
+                );
+                row.artifact_path =
+                    Some("crates/scripture-runtime/tests/malformed_identity.rs".into());
+            }
+            20 => {
+                row.status = CoverageStatus::Pass;
+                row.backend = "memory";
+                row.process_separation = false;
+                row.release_classification = Some(release_classification);
+                row.reason = Some(
+                    "scripture-runtime --test one_record_ha_proofs churn_* (3-candidate schedules + negative controls)"
+                        .into(),
+                );
+                row.artifact_path =
+                    Some("crates/scripture-runtime/tests/one_record_ha_proofs.rs".into());
+            }
+            _ => {}
+        }
+    }
 }

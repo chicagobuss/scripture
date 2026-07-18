@@ -41,6 +41,9 @@ pub(crate) async fn run_resilience_scenario(
             run_credential_invalidation(profile, lifecycle, rustfs_endpoint, run_id, artifact_dir)
                 .await
         }
+        Scenario::RawLinesResourceCleanup => {
+            run_resource_cleanup(profile, lifecycle, rustfs_endpoint, run_id, artifact_dir).await
+        }
         other => Err(CampaignError::Scenario(format!(
             "{} is not a resilience process-lifecycle scenario",
             other.as_str()
@@ -661,6 +664,8 @@ async fn run_directional_loss(
         .map_err(|error| CampaignError::Scenario(format!("create scenario traces dir: {error}")))?;
 
     let pre = ["dir-pre-0", "dir-pre-1"];
+    let mid = ["dir-mid-0"];
+    let ambiguity = "dir-ambiguity-unique";
     let post = ["dir-post-0", "dir-post-1"];
 
     let actor_a = lifecycle
@@ -701,104 +706,71 @@ async fn run_directional_loss(
         .map_err(|error| CampaignError::Scenario(format!("kill A: {error}")))?;
     forward_a.stop();
 
-    // Deny before B starts so the fresh promote cannot open RustFS connections.
-    lifecycle
-        .deny_rustfs_egress()
-        .map_err(|error| CampaignError::Scenario(format!("deny rustfs egress: {error}")))?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Scenario-owned Toxiproxy between B and RustFS (not NetworkPolicy theater).
+    let proxy = match lifecycle.deploy_toxiproxy() {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            return Ok(CampaignReport {
+                run_id: run_id.to_owned(),
+                scenario: token,
+                backend: "rustfs",
+                environment: serde_json::json!({
+                    "run_id": run_id,
+                    "scenario": token,
+                    "not_run": {
+                        "family": 16,
+                        "limitation": "Toxiproxy Deployment/Service could not be made Ready with pinned in-cluster image",
+                        "error": error.to_string(),
+                        "image": "ghcr.io/shopify/toxiproxy:2.12.0",
+                    },
+                    "trace_collection_errors": traces.collection_errors,
+                }),
+                events: renumber_global_seq(traces.events),
+                final_root: serde_json::json!({"not_run": true}),
+                final_authority: serde_json::Value::Null,
+                verdict: Verdict::Inconclusive {
+                    reason: format!(
+                        "not-run: Toxiproxy unavailable ({error}); no NetworkPolicy substitute claimed"
+                    ),
+                    evidence_slice: vec![
+                        "pinned ghcr.io/shopify/toxiproxy:2.12.0".into(),
+                        "deploy/toxiproxy Ready failed".into(),
+                    ],
+                },
+                checker: CheckerAttestation::NotApplicable {
+                    reason: "Toxiproxy not Ready; directional proof not attempted".into(),
+                },
+                evidence_class: Some("not-run-toxiproxy-unavailable"),
+            });
+        }
+    };
 
-    let blocked_b = lifecycle
-        .deploy_actor_b_promote_with_faults(
+    let control_port = allocate_local_port()?;
+    let mut control_forward = PortForward::start(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/toxiproxy",
+        control_port,
+        8474,
+    )?;
+    wait_tcp_ready(&format!("127.0.0.1:{control_port}")).await?;
+    let control_base = format!("http://127.0.0.1:{control_port}");
+    let create_proxy = lifecycle
+        .toxiproxy_ensure_proxy(&control_base, "rustfs", "0.0.0.0:19000", &proxy.upstream)
+        .map_err(|error| CampaignError::Scenario(format!("toxiproxy create proxy: {error}")))?;
+
+    let b_endpoint = proxy.listen_endpoint.clone();
+    let actor_b = lifecycle
+        .deploy_actor_b_promote_with_endpoint(
             profile,
             token,
             2,
-            ActorFaultEnv {
-                require_ready: false,
-                ..ActorFaultEnv::default()
-            },
+            ActorFaultEnv::default(),
+            Some(b_endpoint.as_str()),
         )
-        .map_err(|error| CampaignError::Scenario(format!("promote B under deny: {error}")))?;
-    if pod_ready(lifecycle, "scripture-actor-b")? {
-        traces.extend_from(collect_traces(
-            lifecycle,
-            &scenario_dir,
-            &["scripture-actor-b"],
-        ));
-        let _ = lifecycle.kill_actor("scripture-actor-b");
-        let _ = lifecycle.restore_rustfs_egress();
-        return Ok(CampaignReport {
-            run_id: run_id.to_owned(),
-            scenario: token,
-            backend: "rustfs",
-            environment: serde_json::json!({
-                "run_id": run_id,
-                "scenario": token,
-                "adapter": "temporary-bootstrap-promote",
-                "release_classification": "development-source",
-                "not_run": {
-                    "family": 16,
-                    "limitation": "kube-router NetworkPolicy DNS-only egress replacement does not prevent B→run-owned RustFS Service connectivity on this fleet",
-                    "observed": "B became Ready / promote-and-serve succeeded while campaign-default-deny-egress allowed only kube-system DNS",
-                    "actor_b_under_deny": blocked_b,
-                    "ha_prefix": ha_prefix,
-                },
-                "trace_collection_errors": traces.collection_errors,
-                "isolated_store": {
-                    "namespace": lifecycle.store.namespace,
-                    "bucket": lifecycle.store.bucket,
-                }
-            }),
-            events: renumber_global_seq(traces.events),
-            final_root: serde_json::json!({"not_run": true}),
-            final_authority: serde_json::Value::Null,
-            verdict: Verdict::Inconclusive {
-                reason: "not-run: NetworkPolicy cannot express directional B→RustFS loss on this kube-router fleet (B Ready under DNS-only egress)".into(),
-                evidence_slice: vec![
-                    "NetworkPolicy campaign-default-deny-egress replaced with DNS-only egress".into(),
-                    "Fresh B promote still reached RustFS and became Ready".into(),
-                ],
-            },
-            checker: CheckerAttestation::NotApplicable {
-                reason: "directional NetworkPolicy limitation; no durable oracle Pass claimed".into(),
-            },
-            evidence_class: Some("not-run-networkpolicy-limitation"),
-        });
-    }
-    let blocked_probe = allocate_local_port()?;
-    if let Ok(mut forward) = PortForward::start(
-        &lifecycle.kube_context,
-        &lifecycle.namespace,
-        "pod/scripture-actor-b",
-        blocked_probe,
-        9000,
-    ) {
-        let denied = raw_lines_client::expect_no_committed_ok(
-            &format!("127.0.0.1:{blocked_probe}"),
-            "dir-blocked-unique",
-            Duration::from_secs(5),
-        )
-        .await;
-        forward.stop();
-        denied?;
-    }
-    traces.extend_from(collect_traces(
-        lifecycle,
-        &scenario_dir,
-        &["scripture-actor-b"],
-    ));
-    let _ = lifecycle.kill_actor("scripture-actor-b");
-
-    lifecycle
-        .restore_rustfs_egress()
-        .map_err(|error| CampaignError::Scenario(format!("restore rustfs egress: {error}")))?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    let actor_b = lifecycle
-        .deploy_actor_b_promote(profile, token, 2)
-        .map_err(|error| CampaignError::Scenario(format!("promote B after restore: {error}")))?;
+        .map_err(|error| CampaignError::Scenario(format!("promote B via Toxiproxy: {error}")))?;
     assert_actor_placement(&actor_b, &profile.writer_b_node, "B")?;
     assert_distinct_uids(&actor_a, &actor_b)?;
-    assert_distinct_uids(&blocked_b, &actor_b)?;
 
     let port_b = allocate_local_port()?;
     let mut forward_b = PortForward::start(
@@ -809,15 +781,110 @@ async fn run_directional_loss(
         9000,
     )?;
     wait_tcp_ready(&format!("127.0.0.1:{port_b}")).await?;
-    let acks_post =
-        raw_lines_client::exchange_committed(&format!("127.0.0.1:{port_b}"), &post).await?;
+    // Write through B before the cut so the successor loglet is non-empty when sealed
+    // (empty sealed tail can disagree with VirtualLog generation start).
+    let acks_mid =
+        raw_lines_client::exchange_committed(&format!("127.0.0.1:{port_b}"), &mid).await?;
     assert_dense_continuation(
-        &acks_post,
+        &acks_mid,
         Some(acks_pre.last().expect("pre ACKs").next_offset),
     )?;
+    let mut pre_plus_mid: Vec<&str> = pre.to_vec();
+    pre_plus_mid.extend_from_slice(&mid);
+    let _ = cutover_oracle::wait_for_durable_payloads(
+        rustfs_endpoint,
+        &lifecycle.store.bucket,
+        lifecycle.access_key(),
+        lifecycle.secret_key(),
+        &ha_prefix,
+        &pre_plus_mid,
+        ExpectedAuthority {
+            owner: cutover_oracle::actor_b_owner(),
+            term: 2,
+        },
+        true,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let disabled = lifecycle
+        .toxiproxy_set_enabled(&control_base, "rustfs", false)
+        .map_err(|error| CampaignError::Scenario(format!("toxiproxy disable: {error}")))?;
+    let disabled_get = lifecycle
+        .toxiproxy_get_proxy(&control_base, "rustfs")
+        .map_err(|error| {
+            CampaignError::Scenario(format!("toxiproxy get after disable: {error}"))
+        })?;
+    if disabled_get.get("enabled").and_then(|v| v.as_bool()) != Some(false) {
+        return Err(CampaignError::Scenario(format!(
+            "toxiproxy disable not evidenced: {disabled_get}"
+        )));
+    }
+
+    raw_lines_client::expect_no_committed_ok(
+        &format!("127.0.0.1:{port_b}"),
+        ambiguity,
+        Duration::from_secs(8),
+    )
+    .await?;
+    traces.extend_from(collect_traces(
+        lifecycle,
+        &scenario_dir,
+        &["scripture-actor-b"],
+    ));
     forward_b.stop();
+    lifecycle
+        .kill_actor("scripture-actor-b")
+        .map_err(|error| CampaignError::Scenario(format!("kill B under cut: {error}")))?;
+
+    let enabled = lifecycle
+        .toxiproxy_set_enabled(&control_base, "rustfs", true)
+        .map_err(|error| CampaignError::Scenario(format!("toxiproxy enable: {error}")))?;
+    let enabled_get = lifecycle
+        .toxiproxy_get_proxy(&control_base, "rustfs")
+        .map_err(|error| CampaignError::Scenario(format!("toxiproxy get after enable: {error}")))?;
+    if enabled_get.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return Err(CampaignError::Scenario(format!(
+            "toxiproxy enable not evidenced: {enabled_get}"
+        )));
+    }
+    control_forward.stop();
+
+    // C promotes on the restored store (direct RustFS) after B death under the cut.
+    let actor_c = lifecycle
+        .deploy_actor_c_promote(profile, token, 3)
+        .map_err(|error| {
+            CampaignError::Scenario(format!("promote C term 3 after restore: {error}"))
+        })?;
+    assert_actor_placement(&actor_c, &profile.writer_b_node, "C")?;
+    assert_distinct_uids(&actor_a, &actor_c)?;
+    assert_distinct_uids(&actor_b, &actor_c)?;
+
+    let port_c = allocate_local_port()?;
+    let mut forward_c = PortForward::start(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-c",
+        port_c,
+        9000,
+    )?;
+    for attempt in 0..3 {
+        match wait_tcp_ready(&format!("127.0.0.1:{port_c}")).await {
+            Ok(()) => break,
+            Err(error) if attempt == 2 => return Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+    let acks_post =
+        raw_lines_client::exchange_committed(&format!("127.0.0.1:{port_c}"), &post).await?;
+    assert_dense_continuation(
+        &acks_post,
+        Some(acks_mid.last().expect("mid ACKs").next_offset),
+    )?;
+    forward_c.stop();
 
     let mut required: Vec<&str> = pre.to_vec();
+    required.extend_from_slice(&mid);
     required.extend_from_slice(&post);
     let oracle = cutover_oracle::wait_for_durable_payloads(
         rustfs_endpoint,
@@ -827,19 +894,41 @@ async fn run_directional_loss(
         &ha_prefix,
         &required,
         ExpectedAuthority {
-            owner: cutover_oracle::actor_b_owner(),
-            term: 2,
+            owner: cutover_oracle::actor_c_owner(),
+            term: 3,
         },
         true,
-        Duration::from_secs(60),
+        Duration::from_secs(90),
     )
     .await?;
+
+    // Ambiguity may appear at most once if it became durable under the cut.
+    let identities: Vec<String> = oracle
+        .observation
+        .pointer("/readback/payload_identities")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ambiguity_count = identities
+        .iter()
+        .filter(|id| id.as_str() == ambiguity)
+        .count();
+    if ambiguity_count > 1 {
+        return Err(CampaignError::Scenario(format!(
+            "ambiguity payload appeared {ambiguity_count} times (at most once allowed)"
+        )));
+    }
+
     traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
-        &["scripture-actor-b"],
+        &["scripture-actor-b", "scripture-actor-c"],
     ));
-    let _ = lifecycle.kill_actor("scripture-actor-b");
+    let _ = lifecycle.kill_actor("scripture-actor-c");
 
     finish_report(
         run_id,
@@ -850,20 +939,33 @@ async fn run_directional_loss(
         serde_json::json!({
             "ha_prefix": ha_prefix,
             "actor_a": actor_a,
-            "actor_b_under_deny": blocked_b,
-            "actor_b": actor_b,
-            "fault": "NetworkPolicy DNS-only egress before B promote (fresh process, no open TCP)",
+            "actor_b_via_proxy": actor_b,
+            "actor_c_recovery": actor_c,
+            "b_store_endpoint": b_endpoint,
+            "toxiproxy": proxy,
+            "toxiproxy_create": create_proxy,
+            "toxiproxy_disabled": disabled,
+            "toxiproxy_disabled_get": disabled_get,
+            "toxiproxy_enabled": enabled,
+            "toxiproxy_enabled_get": enabled_get,
+            "ambiguity_payload": ambiguity,
+            "ambiguity_durable_count": ambiguity_count,
             "producer_acks_pre": ack_summary(&acks_pre),
+            "producer_acks_mid": ack_summary(&acks_mid),
             "producer_acks_post": ack_summary(&acks_post),
+            "fault": "Toxiproxy disable of B→RustFS after B Serving+mid write; restore evidenced; C term-3 promote",
             "claims": [
-                "B under RustFS egress deny did not become Ready / no committed OK",
-                "After restore, B promote served post payloads with dense continuation",
-                "Holylog durable oracle on pre+post"
+                "B promoted Serving through Toxiproxy endpoint and wrote mid payloads",
+                "With proxy disabled, ambiguity payload yielded no committed OK",
+                "Proxy re-enabled before C recovery promote (API evidence)",
+                "C wrote post payloads after restore",
+                "Holylog durable oracle: pre + mid + post (ambiguity ≤1 if durable)"
             ],
             "non_claims": [
                 "temporary adapter",
                 "development-source",
-                "NetworkPolicy scoped to campaign namespace only"
+                "not NetworkPolicy directional isolation",
+                "not a generic proxy framework"
             ],
             "cutover_oracle": oracle.observation,
         }),
@@ -1051,6 +1153,94 @@ async fn run_credential_invalidation(
             "cutover_oracle": oracle.observation,
         }),
     )
+}
+
+async fn run_resource_cleanup(
+    profile: &RustFsHomeFleetProfile,
+    lifecycle: &RunLifecycle,
+    rustfs_endpoint: &str,
+    run_id: &str,
+    artifact_dir: &Path,
+) -> Result<CampaignReport, CampaignError> {
+    let token = Scenario::RawLinesResourceCleanup.as_str();
+    let scenario_dir = artifact_dir.join(token);
+    std::fs::create_dir_all(scenario_dir.join("traces"))
+        .map_err(|error| CampaignError::Scenario(format!("create scenario traces dir: {error}")))?;
+
+    let inventory_suite = lifecycle
+        .inventory_resources()
+        .map_err(|error| CampaignError::Scenario(format!("suite inventory: {error}")))?;
+
+    let actor_a = lifecycle
+        .deploy_actor_a(profile, token)
+        .map_err(|error| CampaignError::Scenario(format!("deploy A for cleanup proof: {error}")))?;
+    let port_a = allocate_local_port()?;
+    let mut forward_a = PortForward::start(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-a",
+        port_a,
+        9000,
+    )?;
+    wait_tcp_ready(&format!("127.0.0.1:{port_a}")).await?;
+    let acks =
+        raw_lines_client::exchange_committed(&format!("127.0.0.1:{port_a}"), &["cleanup-bound-0"])
+            .await?;
+    assert_dense_continuation(&acks, None)?;
+    let _ = rustfs_endpoint;
+    forward_a.stop();
+    lifecycle
+        .kill_actor("scripture-actor-a")
+        .map_err(|error| CampaignError::Scenario(format!("force-delete A: {error}")))?;
+    let unreachable_port = allocate_local_port()?;
+    wait_actor_unreachable(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-a",
+        unreachable_port,
+    )
+    .await?;
+
+    let traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
+    let cleanup_proof = crate::lifecycle::prove_cleanup_independence(profile, run_id)
+        .map_err(|error| CampaignError::Scenario(format!("cleanup independence: {error}")))?;
+
+    Ok(CampaignReport {
+        run_id: run_id.to_owned(),
+        scenario: token,
+        backend: "rustfs",
+        environment: serde_json::json!({
+            "run_id": run_id,
+            "scenario": token,
+            "adapter": "temporary-bootstrap-promote",
+            "release_classification": "development-source",
+            "suite_inventory": inventory_suite,
+            "actor_a": actor_a,
+            "force_delete_left_no_ack_writer": true,
+            "cleanup_independence": cleanup_proof,
+            "raw_lines_bounds": "proven in scripture-runtime raw_lines unit tests under wedged receipts",
+            "claims": [
+                "Force-deleted actor cannot emit committed OK",
+                "Second scenario-owned namespace + Toxiproxy cleaned with wait-for-gone",
+                "Inventory records Pods/Services/ConfigMaps/Secrets/Jobs/Deployments by name only"
+            ],
+            "non_claims": [
+                "does not prove cloud backends",
+                "suite namespace cleanup remains the outer Drop/cleanup path"
+            ],
+            "trace_collection_errors": traces.collection_errors,
+        }),
+        events: renumber_global_seq(traces.events),
+        final_root: serde_json::json!({"cleanup_independence": true}),
+        final_authority: serde_json::Value::Null,
+        verdict: Verdict::Pass,
+        checker: CheckerAttestation::NotApplicable {
+            reason:
+                "family 21 is operational cleanup + bounds evidence; Holylog checker not applied"
+                    .into(),
+        },
+        evidence_class: Some("resource-bounds-and-cleanup"),
+    })
 }
 
 fn finish_report(
