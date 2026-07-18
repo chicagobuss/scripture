@@ -36,6 +36,7 @@ impl std::fmt::Display for AdminParseError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromoteBody {
     candidate_term: u64,
 }
@@ -78,17 +79,23 @@ pub fn parse_promote_request(
         let name = name.trim();
         let value = value.trim();
         if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(AdminParseError::BadRequest("duplicate content-length"));
+            }
             let parsed = value
                 .parse::<usize>()
                 .map_err(|_| AdminParseError::BadRequest("bad content-length"))?;
             content_length = Some(parsed);
         } else if name.eq_ignore_ascii_case("authorization") {
-            let Some(token) = value
-                .strip_prefix("Bearer ")
-                .or_else(|| value.strip_prefix("bearer "))
-            else {
+            if bearer.is_some() {
+                return Err(AdminParseError::BadRequest("duplicate authorization"));
+            }
+            let Some((scheme, token)) = value.split_once(char::is_whitespace) else {
                 return Err(AdminParseError::Unauthorized);
             };
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                return Err(AdminParseError::Unauthorized);
+            }
             bearer = Some(token.trim());
         }
     }
@@ -250,5 +257,36 @@ mod tests {
             parse_promote_request(raw, "secret-token"),
             Err(AdminParseError::Incomplete)
         );
+    }
+
+    #[test]
+    fn rejects_unknown_json_fields() {
+        let raw = request(
+            "Bearer secret-token",
+            r#"{"candidate_term":2,"extra":true}"#,
+        );
+        assert!(matches!(
+            parse_promote_request(&raw, "secret-token"),
+            Err(AdminParseError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_sensitive_headers() {
+        let body = r#"{\"candidate_term\":2}"#;
+        let raw = format!(
+            "POST /v1/promote HTTP/1.1\r\nAuthorization: Bearer secret-token\r\nAuthorization: Bearer secret-token\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(matches!(
+            parse_promote_request(raw.as_bytes(), "secret-token"),
+            Err(AdminParseError::BadRequest("duplicate authorization"))
+        ));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let raw = request("BeArEr secret-token", r#"{"candidate_term":2}"#);
+        parse_promote_request(&raw, "secret-token").expect("case-insensitive scheme");
     }
 }

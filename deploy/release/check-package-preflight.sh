@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 failed=0
+deferred=0
 
 for crate in scripture scripture-service scripture-runtime scripture-cli; do
   if ! grep -q 'publish = \["fleet"\]' "crates/$crate/Cargo.toml"; then
@@ -32,10 +33,11 @@ if ! grep -q 'scripture = { path = "../scripture", version = "0.1.0-rc.1" }' cra
   failed=1
 fi
 
-if [[ ! -f .cargo/config.toml ]] || ! grep -q '\[registries.fleet\]' .cargo/config.toml; then
-  echo "committed .cargo/config.toml must define registries.fleet index" >&2
-  failed=1
-fi
+registry_configured() {
+  [[ -n "${CARGO_REGISTRIES_FLEET_INDEX:-}" ]] && return 0
+  local cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+  [[ -f "$cargo_home/config.toml" ]] && grep -q '\[registries.fleet\]' "$cargo_home/config.toml"
+}
 
 attempt_package() {
   local crate="$1"
@@ -45,7 +47,8 @@ attempt_package() {
     return 0
   fi
   if grep -qi 'credential-provider\|authenticated registries\|401\|unauthorized' "$log"; then
-    echo "cargo package -p $crate deferred: fleet registry auth required (contract ok; run with Kellnr token for clean-builder)"
+    echo "cargo package -p $crate not attested: fleet registry auth required" >&2
+    deferred=1
     return 0
   fi
   echo "cargo package -p $crate failed:" >&2
@@ -53,10 +56,24 @@ attempt_package() {
   return 1
 }
 
-attempt_package scripture || failed=1
-attempt_package scripture-cli || failed=1
+if [[ "$failed" -ne 0 ]]; then
+  exit 1
+fi
+
+if ! registry_configured; then
+  echo "fleet registry configuration is operator-local and unavailable; package attestation not run" >&2
+  exit 2
+fi
+
+for crate in scripture scripture-service scripture-runtime scripture-cli; do
+  attempt_package "$crate" || failed=1
+done
 
 if [[ "$failed" -ne 0 ]]; then
   exit 1
+fi
+if [[ "$deferred" -ne 0 ]]; then
+  echo "package contract valid, but authenticated fleet package attestation is incomplete" >&2
+  exit 2
 fi
 echo "package preflight ok"

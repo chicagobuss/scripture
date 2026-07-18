@@ -428,8 +428,10 @@ async fn read_bounded_http_request(
             if total > max_bytes {
                 return Err(AdminParseError::BadRequest("request too large"));
             }
-            if buf.len() >= total {
-                buf.truncate(total);
+            if buf.len() > total {
+                return Err(AdminParseError::BadRequest("trailing bytes after body"));
+            }
+            if buf.len() == total {
                 return Ok(buf);
             }
         }
@@ -477,6 +479,8 @@ fn admin_error_response(error: &crate::admin_http::AdminParseError) -> (u16, &'s
             "not utf-8" => (400, "not utf-8\n"),
             "malformed header" => (400, "malformed header\n"),
             "bad content-length" => (400, "bad content-length\n"),
+            "duplicate content-length" => (400, "duplicate content-length\n"),
+            "duplicate authorization" => (400, "duplicate authorization\n"),
             _ => (400, "bad request\n"),
         },
     }
@@ -525,7 +529,9 @@ async fn write_http(
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        408 => "Request Timeout",
         409 => "Conflict",
+        413 => "Payload Too Large",
         _ => "Error",
     };
     let response = format!(
@@ -749,4 +755,56 @@ fn should_retry_promote_after_reply_loss(
     _error: &HaActivationError,
 ) -> bool {
     false
+}
+
+#[cfg(test)]
+mod admin_reader_tests {
+    use super::{read_bounded_http_request, write_http};
+    use crate::admin_http::{AdminParseError, MAX_ADMIN_REQUEST_BYTES};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_trailing_bytes_in_one_tcp_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_bounded_http_request(&mut stream, MAX_ADMIN_REQUEST_BYTES).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let body = r#"{"candidate_term":2}"#;
+        let raw = format!(
+            "POST /v1/promote HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}junk",
+            body.len()
+        );
+        client.write_all(raw.as_bytes()).await.expect("write");
+
+        assert_eq!(
+            server.await.expect("server task"),
+            Err(AdminParseError::BadRequest("trailing bytes after body"))
+        );
+    }
+
+    #[tokio::test]
+    async fn error_statuses_have_standard_reason_phrases() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            write_http(stream, 413, "too large\n")
+                .await
+                .expect("response");
+        });
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.expect("read");
+        server.await.expect("server task");
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+    }
 }

@@ -3,7 +3,7 @@
 # config/local/kellnr/config.toml via CARGO_HOME). Never commit tokens.
 #
 # [registries.fleet]
-# index = "sparse+http://10.0.0.5:30990/api/v1/crates/"
+# index = "sparse+REPLACE_WITH_KELLNR_SPARSE_INDEX"
 #
 # Prefer credential-provider / token-file over inline tokens:
 #   registry.global-credential-providers = ["cargo:token"]
