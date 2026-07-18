@@ -168,7 +168,15 @@ impl RunOptions {
                 scenario.as_str(),
             )?;
             let result = if scenario.needs_process_lifecycle() {
-                run_process_lifecycle(profile, &lifecycle, run_id, scenario, backend).await
+                run_process_lifecycle(
+                    profile,
+                    &lifecycle,
+                    &endpoint,
+                    run_id,
+                    scenario,
+                    backend,
+                )
+                .await
             } else {
                 run_campaign(run_id, scenario, backend).await
             };
@@ -185,9 +193,10 @@ impl RunOptions {
                 Err(error) => {
                     if self.keep_failed {
                         lifecycle.retain();
+                    } else {
+                        let _ = lifecycle.cleanup();
                     }
                     forward.stop();
-                    let _ = lifecycle.cleanup();
                     return Err(error.into());
                 }
             }
@@ -215,13 +224,14 @@ impl RunOptions {
 async fn run_process_lifecycle(
     profile: &RustFsHomeFleetProfile,
     lifecycle: &RunLifecycle,
+    rustfs_endpoint: &str,
     run_id: &str,
     scenario: Scenario,
     _backend: CampaignBackend,
 ) -> Result<CampaignReport, CampaignError> {
     match scenario {
         Scenario::RawLinesAbCutover => {
-            run_raw_lines_ab_cutover(profile, lifecycle, run_id).await
+            run_raw_lines_ab_cutover(profile, lifecycle, rustfs_endpoint, run_id).await
         }
         other => Err(CampaignError::Scenario(format!(
             "{} is not a process-lifecycle scenario",
@@ -233,6 +243,7 @@ async fn run_process_lifecycle(
 async fn run_raw_lines_ab_cutover(
     profile: &RustFsHomeFleetProfile,
     lifecycle: &RunLifecycle,
+    rustfs_endpoint: &str,
     run_id: &str,
 ) -> Result<CampaignReport, CampaignError> {
     let token = Scenario::RawLinesAbCutover.as_str();
@@ -260,23 +271,17 @@ async fn run_raw_lines_ab_cutover(
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill actor A: {error}")))?;
-
-    // Stale A must not yield a committed ACK on the same producer path.
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        raw_lines_client::exchange_committed("127.0.0.1:19001", &["stale-a-probe"]),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {
-            forward_a.stop();
-            return Err(CampaignError::Scenario(
-                "stale actor A still returned a committed OK ACK after kill".into(),
-            ));
-        }
-        Ok(Err(_)) | Err(_) => {}
-    }
+    // Force-delete can remove the pod from the API before the process exits.
+    // Drop the forward and wait until A is unreachable so a later OK cannot be
+    // mistaken for a lawful stale-writer ACK.
     forward_a.stop();
+    wait_actor_unreachable(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-a",
+        19_011,
+    )
+    .await?;
 
     let actor_b = lifecycle
         .deploy_actor_b_promote(profile, token, 2)
@@ -300,12 +305,27 @@ async fn run_raw_lines_ab_cutover(
 
     let phase_b: [&str; 3] = ["cutover-b-0", "cutover-b-1", "cutover-b-2"];
     let acks_b = raw_lines_client::exchange_committed("127.0.0.1:19002", &phase_b).await?;
-    let expected_start = acks_a
-        .last()
-        .map(|ack| ack.next_offset)
-        .ok_or_else(|| CampaignError::Scenario("missing A ACK for dense continuation".into()))?;
-    assert_dense_continuation(&acks_b, Some(expected_start))?;
+    // Raw-lines OK offsets are loglet-local; after promote they restart at 0 on the
+    // successor. Cross-cutover denseness is the VirtualLog generation chain.
+    assert_dense_continuation(&acks_b, None)?;
     forward_b.stop();
+
+    let succession = observe_ha_succession(
+        rustfs_endpoint,
+        &lifecycle.store.bucket,
+        lifecycle.access_key(),
+        lifecycle.secret_key(),
+        &ha_prefix,
+    )?;
+
+    // After B serves, A must not yield a committed ACK (stale writer path closed).
+    assert_no_committed_ack(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-a",
+        19_012,
+    )
+    .await?;
 
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
@@ -334,27 +354,33 @@ async fn run_raw_lines_ab_cutover(
                 "ha_prefix": ha_prefix,
                 "actor_a": actor_a,
                 "actor_b": actor_b,
+                "ha_succession": succession,
                 "actions": [
                     "bootstrap-a-and-serve",
                     "producer-raw-lines-to-a",
                     "kill-a",
-                    "assert-no-stale-a-ack",
+                    "wait-a-unreachable",
                     "promote-b-term-2-same-ha-prefix",
                     "producer-raw-lines-to-b",
-                    "assert-dense-continuation"
+                    "assert-dense-per-epoch",
+                    "observe-virtual-log-generation-chain",
+                    "assert-no-stale-a-ack"
                 ],
                 "producer_acks_a": ack_summary(&acks_a),
                 "producer_acks_b": ack_summary(&acks_b),
                 "claims": [
                     "Producer committed OK ACKs came from actor A's raw-lines listener",
-                    "A was force-deleted; subsequent producer exchange did not yield a committed OK",
-                    "B was promoted on the identical HA object prefix and returned dense continuation OK ACKs",
+                    "A was force-deleted and became unreachable before B promote",
+                    "B was promoted on the identical HA object prefix and returned dense per-epoch OK ACKs",
+                    "VirtualLog register on that prefix shows a sealed predecessor chained to a successor generation",
+                    "Stale A did not return a committed OK after B served",
                     "A and B are distinct OS processes/pods on configured nodes",
                     "object store is the run-owned ephemeral RustFS Service"
                 ],
                 "non_claims": [
                     "temporary-bootstrap-promote adapter until stable scripture serve lands",
-                    "Holylog semantic TraceEvent export is not available from the temporary adapter; verdict is producer-ACK / density oracle, not check_trace",
+                    "Raw-lines OK offsets are loglet-local and restart on the successor; cross-cutover denseness is the VirtualLog generation chain, not OK first_offset continuity",
+                    "Holylog semantic TraceEvent export is not available from the temporary adapter; verdict is producer-ACK / store-oracle, not check_trace",
                     "not automatic failover",
                     "not family 14 DieAfterPayload wedge; not family 15 reply-loss",
                     "scripture:0.1.0 remains development-source; cannot close family 22"
@@ -362,13 +388,101 @@ async fn run_raw_lines_ab_cutover(
             }),
         ),
         events: Vec::new(),
-        final_root: serde_json::json!({
-            "ha_prefix": format!("scripture/correctness/{run_id}/{token}/ha"),
-            "observation": "producer-ack-oracle"
-        }),
+        final_root: succession,
         final_authority: serde_json::Value::Null,
         verdict: Verdict::Pass,
     })
+}
+
+fn observe_ha_succession(
+    endpoint: &str,
+    bucket: &str,
+    access_key: &str,
+    secret_key: &str,
+    ha_prefix: &str,
+) -> Result<serde_json::Value, CampaignError> {
+    // Object key uses literal %2F separators in this Holylog layout.
+    let key = format!("{ha_prefix}/virtual-log%2Fverse%2Fregister-pointer");
+    let output = Command::new("aws")
+        .args([
+            "--endpoint-url",
+            endpoint,
+            "s3",
+            "cp",
+            &format!("s3://{bucket}/{key}"),
+            "-",
+        ])
+        .env("AWS_ACCESS_KEY_ID", access_key)
+        .env("AWS_SECRET_ACCESS_KEY", secret_key)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output()
+        .map_err(|error| CampaignError::Scenario(format!("aws s3 cp: {error}")))?;
+    if !output.status.success() {
+        return Err(CampaignError::Scenario(format!(
+            "aws s3 cp register-pointer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let pointer: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| CampaignError::Scenario(format!("register-pointer json: {error}")))?;
+    let generations = pointer
+        .pointer("/state/generations")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            CampaignError::Scenario("register-pointer missing state.generations".into())
+        })?;
+    if generations.len() < 2 {
+        return Err(CampaignError::Scenario(format!(
+            "expected sealed predecessor + successor generations, got {}",
+            generations.len()
+        )));
+    }
+    let start0 = generations[0]
+        .get("start")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let start1 = generations[1]
+        .get("start")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CampaignError::Scenario("successor generation missing start".into()))?;
+    if start1 <= start0 {
+        return Err(CampaignError::Scenario(format!(
+            "successor start {start1} is not after predecessor start {start0}"
+        )));
+    }
+    let pred_id = generations[0]
+        .get("loglet_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let seal_prefix = format!("{ha_prefix}/loglets/{pred_id}/seal/");
+    let seals = Command::new("aws")
+        .args([
+            "--endpoint-url",
+            endpoint,
+            "s3",
+            "ls",
+            &format!("s3://{bucket}/{seal_prefix}"),
+        ])
+        .env("AWS_ACCESS_KEY_ID", access_key)
+        .env("AWS_SECRET_ACCESS_KEY", secret_key)
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output()
+        .map_err(|error| CampaignError::Scenario(format!("aws s3 ls seal: {error}")))?;
+    let seal_listing = String::from_utf8_lossy(&seals.stdout);
+    if !seals.status.success() || seal_listing.trim().is_empty() {
+        return Err(CampaignError::Scenario(format!(
+            "predecessor loglet {pred_id} has no seal object under {seal_prefix}"
+        )));
+    }
+    Ok(serde_json::json!({
+        "ha_prefix": ha_prefix,
+        "register_pointer": pointer,
+        "predecessor_loglet_id": pred_id,
+        "successor_loglet_id": generations[1].get("loglet_id"),
+        "predecessor_start": start0,
+        "successor_start": start1,
+        "predecessor_seal_listing": seal_listing.trim(),
+    }))
 }
 
 fn assert_dense_continuation(
@@ -417,6 +531,68 @@ async fn wait_tcp_ready(endpoint: &str) -> Result<(), CampaignError> {
     Err(CampaignError::Scenario(format!(
         "raw-lines listener not ready at {endpoint}"
     )))
+}
+
+/// Waits until a Service has no reachable raw-lines TCP endpoint.
+async fn wait_actor_unreachable(
+    context: &str,
+    namespace: &str,
+    target: &str,
+    local_port: u16,
+) -> Result<(), CampaignError> {
+    use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
+    for _ in 0..40 {
+        let mut forward = match PortForward::start(context, namespace, target, local_port, 9000) {
+            Ok(forward) => forward,
+            Err(_) => return Ok(()),
+        };
+        let reachable = matches!(
+            timeout(
+                Duration::from_secs(1),
+                TcpStream::connect(format!("127.0.0.1:{local_port}"))
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        forward.stop();
+        if !reachable {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(CampaignError::Scenario(format!(
+        "actor target {target} still accepts TCP connections after kill"
+    )))
+}
+
+/// Asserts a producer exchange cannot obtain a committed OK from a dead actor.
+async fn assert_no_committed_ack(
+    context: &str,
+    namespace: &str,
+    target: &str,
+    local_port: u16,
+) -> Result<(), CampaignError> {
+    use tokio::time::{Duration, timeout};
+    let mut forward = match PortForward::start(context, namespace, target, local_port, 9000) {
+        Ok(forward) => forward,
+        Err(_) => return Ok(()),
+    };
+    let result = timeout(
+        Duration::from_secs(3),
+        raw_lines_client::exchange_committed(
+            &format!("127.0.0.1:{local_port}"),
+            &["stale-a-probe"],
+        ),
+    )
+    .await;
+    forward.stop();
+    match result {
+        Ok(Ok(_)) => Err(CampaignError::Scenario(format!(
+            "stale actor target {target} still returned a committed OK ACK"
+        ))),
+        Ok(Err(_)) | Err(_) => Ok(()),
+    }
 }
 
 fn assert_actor_placement(
