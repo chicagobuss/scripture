@@ -10,6 +10,8 @@
 
 mod assemble;
 mod bootstrap;
+#[cfg(feature = "campaign-faults")]
+mod campaign_faults;
 mod config;
 mod ha_activate;
 mod promote;

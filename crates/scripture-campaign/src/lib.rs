@@ -23,16 +23,29 @@
 //! availability, or replica-independence claim.
 
 mod artifacts;
+mod composition;
+mod coverage;
+mod cutover_oracle;
+mod kellnr;
 mod legacy;
+mod lifecycle;
 mod preflight;
 mod producer_identity;
 mod profile;
+mod raw_lines_client;
+mod resilience;
 mod run;
 mod scenario;
+mod scripted_drive;
 mod trace_observer;
 
 pub use artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
+pub use coverage::{CoverageRow, CoverageStatus, family_catalog, merge_executed};
+pub use kellnr::{ReleaseAttestation, ReleaseClassification};
 pub use legacy::{legacy_main, print_campaign_help};
+pub use lifecycle::{
+    ActorFaultEnv, ActorPlacement, IsolatedStoreIdentity, LifecycleError, RunLifecycle,
+};
 pub use preflight::{PreflightReport, default_topology_path};
 pub use profile::{Profile, ProfileError, RustFsHomeFleetProfile};
 pub use run::{RunError, RunOptions, RunOutcome, detect_repo_root};
@@ -85,8 +98,7 @@ use scripture_runtime::{
 /// Weak-tail window used by the Foundation-path scenarios.
 const FOUNDATION_K: u64 = 2;
 
-/// Named campaign scenarios. These correspond to the initial RustFS sequence in
-/// the Tracker campaign topology and reuse the proven in-process flows.
+/// Named campaign scenarios (WP04/WP05 families).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scenario {
     /// A serves; bounded committed ACKs are recorded and re-observed.
@@ -97,14 +109,59 @@ pub enum Scenario {
     /// Writer payload lands durably then the writer wedges before a committed
     /// ACK; HA recovery seals the predecessor and B serves the successor.
     WriterDiesAfterPayload,
+    /// Exact K-window delayed completion (Holylog AtomicLog).
+    KWindowDelayedCompletion,
+    /// Permanent K-window wedge sealed at the physical durable boundary.
+    KWindowPermanentWedgeSeal,
+    /// Family 4: wedge → seal → VirtualLog successor at sealed boundary 2.
+    PermanentWedgeSealSuccessor,
+    /// Family 5: seal/check-tail race with no illegal fast/slow observation.
+    SealTailRace,
+    /// Striped modulo mapping judged by ReferenceLogDrive.
+    StripedModuloMapping,
+    /// Family 8: striped lagging-scan reconstruction vs scan-claim oracle.
+    StripedLaggingScanReconstruction,
+    /// Quorum: one replica is not a global write.
+    QuorumPartialWriteNotGlobal,
+    /// Family 10: quorum repair unavailable — never a successful tail.
+    QuorumRepairUnavailability,
+    /// Family 11: nested stripe/quorum schedule judged by reference model.
+    NestedStripeQuorumSchedules,
+    /// Producer raw-lines → A → kill A → promote B on same HA root → B continuation.
+    RawLinesAbCutover,
+    /// Family 12: producer raw-lines baseline against live actor A (no cutover).
+    RawLinesBaseline,
+    /// Family 14: durable payload then pre-ACK death; B recovers same root.
+    RawLinesDieAfterPayload,
+    /// Family 15: applied root-CAS reply loss; reread-only promote B.
+    RawLinesRootCasReplyLoss,
+    /// Family 16: directional RustFS egress loss during A serve; recover B.
+    RawLinesDirectionalLoss,
+    /// Family 17: scoped credential invalidation; restore and promote B.
+    RawLinesCredentialInvalidation,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 3] = [
+    pub const ALL: [&'static str; 18] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
+        "k-window-delayed-completion",
+        "k-window-permanent-wedge-seal",
+        "permanent-wedge-seal-successor",
+        "seal-tail-race",
+        "striped-modulo-mapping",
+        "striped-lagging-scan-reconstruction",
+        "quorum-partial-write-not-global",
+        "quorum-repair-unavailability",
+        "nested-stripe-quorum-schedules",
+        "raw-lines-ab-cutover",
+        "raw-lines-baseline",
+        "raw-lines-die-after-payload",
+        "raw-lines-root-cas-reply-loss",
+        "raw-lines-directional-loss",
+        "raw-lines-credential-invalidation",
     ];
 
     /// Parses a scenario token.
@@ -113,6 +170,21 @@ impl Scenario {
             "baseline-committed-ack" => Ok(Self::BaselineCommittedAck),
             "root-cas-reply-lost" => Ok(Self::RootCasReplyLost),
             "writer-dies-after-payload" => Ok(Self::WriterDiesAfterPayload),
+            "k-window-delayed-completion" => Ok(Self::KWindowDelayedCompletion),
+            "k-window-permanent-wedge-seal" => Ok(Self::KWindowPermanentWedgeSeal),
+            "permanent-wedge-seal-successor" => Ok(Self::PermanentWedgeSealSuccessor),
+            "seal-tail-race" => Ok(Self::SealTailRace),
+            "striped-modulo-mapping" => Ok(Self::StripedModuloMapping),
+            "striped-lagging-scan-reconstruction" => Ok(Self::StripedLaggingScanReconstruction),
+            "quorum-partial-write-not-global" => Ok(Self::QuorumPartialWriteNotGlobal),
+            "quorum-repair-unavailability" => Ok(Self::QuorumRepairUnavailability),
+            "nested-stripe-quorum-schedules" => Ok(Self::NestedStripeQuorumSchedules),
+            "raw-lines-ab-cutover" => Ok(Self::RawLinesAbCutover),
+            "raw-lines-baseline" => Ok(Self::RawLinesBaseline),
+            "raw-lines-die-after-payload" => Ok(Self::RawLinesDieAfterPayload),
+            "raw-lines-root-cas-reply-loss" => Ok(Self::RawLinesRootCasReplyLoss),
+            "raw-lines-directional-loss" => Ok(Self::RawLinesDirectionalLoss),
+            "raw-lines-credential-invalidation" => Ok(Self::RawLinesCredentialInvalidation),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -124,7 +196,53 @@ impl Scenario {
             Self::BaselineCommittedAck => "baseline-committed-ack",
             Self::RootCasReplyLost => "root-cas-reply-lost",
             Self::WriterDiesAfterPayload => "writer-dies-after-payload",
+            Self::KWindowDelayedCompletion => "k-window-delayed-completion",
+            Self::KWindowPermanentWedgeSeal => "k-window-permanent-wedge-seal",
+            Self::PermanentWedgeSealSuccessor => "permanent-wedge-seal-successor",
+            Self::SealTailRace => "seal-tail-race",
+            Self::StripedModuloMapping => "striped-modulo-mapping",
+            Self::StripedLaggingScanReconstruction => "striped-lagging-scan-reconstruction",
+            Self::QuorumPartialWriteNotGlobal => "quorum-partial-write-not-global",
+            Self::QuorumRepairUnavailability => "quorum-repair-unavailability",
+            Self::NestedStripeQuorumSchedules => "nested-stripe-quorum-schedules",
+            Self::RawLinesAbCutover => "raw-lines-ab-cutover",
+            Self::RawLinesBaseline => "raw-lines-baseline",
+            Self::RawLinesDieAfterPayload => "raw-lines-die-after-payload",
+            Self::RawLinesRootCasReplyLoss => "raw-lines-root-cas-reply-loss",
+            Self::RawLinesDirectionalLoss => "raw-lines-directional-loss",
+            Self::RawLinesCredentialInvalidation => "raw-lines-credential-invalidation",
         }
+    }
+
+    /// Whether this scenario runs through the Holylog composition helpers.
+    #[must_use]
+    pub const fn is_composition(self) -> bool {
+        matches!(
+            self,
+            Self::KWindowDelayedCompletion
+                | Self::KWindowPermanentWedgeSeal
+                | Self::PermanentWedgeSealSuccessor
+                | Self::SealTailRace
+                | Self::StripedModuloMapping
+                | Self::StripedLaggingScanReconstruction
+                | Self::QuorumPartialWriteNotGlobal
+                | Self::QuorumRepairUnavailability
+                | Self::NestedStripeQuorumSchedules
+        )
+    }
+
+    /// Whether this scenario needs rustfs-home-fleet lifecycle orchestration.
+    #[must_use]
+    pub const fn needs_process_lifecycle(self) -> bool {
+        matches!(
+            self,
+            Self::RawLinesAbCutover
+                | Self::RawLinesBaseline
+                | Self::RawLinesDieAfterPayload
+                | Self::RawLinesRootCasReplyLoss
+                | Self::RawLinesDirectionalLoss
+                | Self::RawLinesCredentialInvalidation
+        )
     }
 }
 
@@ -363,6 +481,18 @@ impl PartsFactory for TracingPartsFactory {
     }
 }
 
+/// How the shared Holylog correctness checker relates to this report.
+#[derive(Debug, Clone)]
+pub enum CheckerAttestation {
+    /// Checker evaluated harness TraceEvents.
+    Evaluated,
+    /// Checker did not run (no TraceEvent export / direct-oracle path).
+    NotApplicable {
+        /// Why the checker was not applied.
+        reason: String,
+    },
+}
+
 /// Redacted campaign evidence bundle.
 #[derive(Debug)]
 pub struct CampaignReport {
@@ -380,8 +510,12 @@ pub struct CampaignReport {
     pub final_root: serde_json::Value,
     /// Final Serving Authority observation (null for harness-path scenarios).
     pub final_authority: serde_json::Value,
-    /// Shared checker verdict.
+    /// Scenario / oracle outcome (not necessarily a Holylog checker verdict).
     pub verdict: Verdict,
+    /// Whether `check_trace` was applied.
+    pub checker: CheckerAttestation,
+    /// Coverage evidence class when distinct from a checker pass.
+    pub evidence_class: Option<&'static str>,
 }
 
 impl CampaignReport {
@@ -398,10 +532,24 @@ impl CampaignReport {
         Ok(out)
     }
 
-    /// Serializes the verdict as JSON.
+    /// Serializes the scenario/oracle verdict as JSON.
     pub fn verdict_json(&self) -> Result<serde_json::Value, CampaignError> {
         serde_json::to_value(&self.verdict)
             .map_err(|error| CampaignError::Serialize(error.to_string()))
+    }
+
+    /// Serializes checker attestation separately from the oracle verdict.
+    pub fn checker_json(&self) -> serde_json::Value {
+        match &self.checker {
+            CheckerAttestation::Evaluated => serde_json::json!({
+                "status": "evaluated",
+                "verdict": self.verdict_label(),
+            }),
+            CheckerAttestation::NotApplicable { reason } => serde_json::json!({
+                "status": "not_applicable",
+                "reason": reason,
+            }),
+        }
     }
 
     /// Whether the checker returned `Pass`.
@@ -420,13 +568,13 @@ impl CampaignReport {
         }
     }
 
-    /// Process exit code: 0 Pass, 2 Fail, 3 Inconclusive.
+    /// Process exit code (WP05): 0 Pass, 3 Fail, 4 Inconclusive.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match &self.verdict {
             Verdict::Pass => 0,
-            Verdict::Fail { .. } => 2,
-            Verdict::Inconclusive { .. } => 3,
+            Verdict::Fail { .. } => 3,
+            Verdict::Inconclusive { .. } => 4,
         }
     }
 }
@@ -435,9 +583,7 @@ impl CampaignReport {
 #[derive(Debug, thiserror::Error)]
 pub enum CampaignError {
     /// Unknown scenario token.
-    #[error(
-        "unknown scenario {0:?}; expected baseline-committed-ack|root-cas-reply-lost|writer-dies-after-payload"
-    )]
+    #[error("unknown scenario {0:?}")]
     UnknownScenario(String),
     /// Backend construction failure.
     #[error("backend setup: {0}")]
@@ -458,10 +604,42 @@ pub async fn run_campaign(
 ) -> Result<CampaignReport, CampaignError> {
     let environment = backend.environment(scenario, run_id);
     let backend_label = backend.label();
+    if scenario.is_composition() {
+        let mut report = composition::run_composition(run_id, scenario).await?;
+        // Preserve the suite backend label when composition runs under memory.
+        if matches!(backend, CampaignBackend::InMemory) {
+            report.backend = backend_label;
+        }
+        let _ = environment;
+        return Ok(report);
+    }
+
     let (events, final_root, final_authority) = match scenario {
         Scenario::BaselineCommittedAck => run_baseline(run_id, &backend).await?,
         Scenario::RootCasReplyLost => run_root_cas_reply_lost(run_id, &backend).await?,
         Scenario::WriterDiesAfterPayload => run_wedged_payload(run_id, &backend).await?,
+        Scenario::KWindowDelayedCompletion
+        | Scenario::KWindowPermanentWedgeSeal
+        | Scenario::PermanentWedgeSealSuccessor
+        | Scenario::SealTailRace
+        | Scenario::StripedModuloMapping
+        | Scenario::StripedLaggingScanReconstruction
+        | Scenario::QuorumPartialWriteNotGlobal
+        | Scenario::QuorumRepairUnavailability
+        | Scenario::NestedStripeQuorumSchedules => {
+            unreachable!("composition scenarios handled above")
+        }
+        Scenario::RawLinesAbCutover
+        | Scenario::RawLinesBaseline
+        | Scenario::RawLinesDieAfterPayload
+        | Scenario::RawLinesRootCasReplyLoss
+        | Scenario::RawLinesDirectionalLoss
+        | Scenario::RawLinesCredentialInvalidation => {
+            return Err(CampaignError::Scenario(format!(
+                "{} requires rustfs-home-fleet lifecycle orchestration",
+                scenario.as_str()
+            )));
+        }
     };
     let verdict = check_trace(&events);
     Ok(CampaignReport {
@@ -473,6 +651,8 @@ pub async fn run_campaign(
         final_root,
         final_authority,
         verdict,
+        checker: CheckerAttestation::Evaluated,
+        evidence_class: None,
     })
 }
 

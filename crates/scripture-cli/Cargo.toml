@@ -13,8 +13,15 @@ path = "src/main.rs"
 # Avoid cargo-doc path collision with the `scripture` library crate.
 doc = false
 
+[features]
+default = []
+# Test-only Holylog fault/trace bridge for correctness-campaign actor images.
+campaign-faults = ["dep:holylog-correctness", "dep:serde_json", "dep:bytes", "scripture-service/virtuallog-test-support"]
+
 [dependencies]
+bytes = { workspace = true, optional = true }
 holylog.workspace = true
+holylog-correctness = { workspace = true, optional = true }
 holylog-object-store = { workspace = true, features = ["s3"] }
 holylog-object-store-register = { workspace = true, features = ["aws"] }
 object_store = { workspace = true, default-features = false }
@@ -23,6 +30,7 @@ scripture = { path = "../scripture" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service" }
 serde.workspace = true
+serde_json = { workspace = true, optional = true }
 serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }

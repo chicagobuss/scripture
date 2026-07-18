@@ -716,3 +716,124 @@ async fn wedged_payload_is_never_acknowledged_and_ha_recovery_serves_successor()
         "real HA recovery trace must satisfy the Holylog checker: {events:#?}"
     );
 }
+
+/// WP07 A3: temporary raw-lines must allocate a fresh producer identity after HA
+/// cutover so recovered B appends new records instead of replaying A's receipts.
+#[tokio::test]
+async fn raw_lines_ha_cutover_fresh_producer_dense_continuation() {
+    use scripture::decode_chunk;
+    use scripture_runtime::serve_ha_raw_lines_connection;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn exchange(session: Arc<HaServingSession>, line: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            serve_ha_raw_lines_connection(
+                stream,
+                session,
+                scripture_runtime::RawLinesConfig::default(),
+            )
+            .await
+            .expect("serve")
+        });
+        let mut client = TcpStream::connect(address).await.expect("connect");
+        client
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write");
+        client.shutdown().await.expect("shutdown");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read");
+        server.await.expect("join");
+        String::from_utf8(response).expect("utf8")
+    }
+
+    let register = Arc::new(InMemoryConditionalRegister::new());
+    let parts = Arc::new(SharedMemoryPartsFactory::default());
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new());
+
+    let a = build_node(
+        owner_a(),
+        "tcp://owner-a:9000",
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&parts),
+        Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
+    );
+    let b = build_node(
+        owner_b(),
+        "tcp://owner-b:9000",
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&parts),
+        Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
+    );
+
+    let a_session = bootstrap_and_serve(
+        &a.coordinator,
+        &a.foundation,
+        key(),
+        WriterTerm::new(1).expect("t1"),
+        runtime_config(owner_a()),
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&a.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await
+    .expect("A serving");
+    let expected = a_session.generation().clone();
+    let a_ok = exchange(Arc::new(a_session), "payload-from-a").await;
+    assert_eq!(a_ok, "OK 0 1\n");
+
+    let active = expected.active_loglet_id.clone();
+    a.resolver.remove(&active);
+
+    let b_session = promote_and_serve(
+        &b.coordinator,
+        &b.foundation,
+        key(),
+        WriterTerm::new(2).expect("t2"),
+        expected,
+        runtime_config(owner_b()),
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&b.resolver),
+        SystemClock::new(),
+        SystemTimer::new(),
+    )
+    .await
+    .expect("B promote");
+    let b_ok = exchange(Arc::new(b_session), "payload-from-b").await;
+    assert_eq!(
+        b_ok, "OK 1 2\n",
+        "B must continue dense offsets with a new append, not replay A's OK 0 1"
+    );
+
+    let virtual_log = VirtualLog::new(
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&b.resolver) as Arc<dyn LogletResolver>,
+    );
+    let mut payloads = Vec::new();
+    let mut producers = Vec::new();
+    let mut cursor = 0_u64;
+    while cursor < 2 {
+        let entry = virtual_log.read_next(cursor, 2).await.expect("read_next");
+        let chunk = decode_chunk(&entry.payload).expect("decode");
+        for frame in &chunk.frames {
+            for sub in &frame.submissions {
+                producers.push(sub.producer_id);
+            }
+            for record in &frame.records {
+                payloads.push(String::from_utf8_lossy(record.payload.as_ref()).into_owned());
+            }
+        }
+        cursor = entry.position.saturating_add(1);
+    }
+    assert_eq!(payloads, ["payload-from-a", "payload-from-b"]);
+    assert_eq!(producers.len(), 2);
+    assert_ne!(
+        producers[0], producers[1],
+        "B raw-lines connection must not reuse A's producer identity"
+    );
+}
