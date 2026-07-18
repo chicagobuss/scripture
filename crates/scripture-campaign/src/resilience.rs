@@ -82,7 +82,7 @@ async fn run_baseline(
     assert_dense_continuation(&acks, None)?;
     forward.stop();
 
-    let events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     let _ = lifecycle.kill_actor("scripture-actor-a");
 
     let oracle = cutover_oracle::prove_serving_baseline(
@@ -103,7 +103,7 @@ async fn run_baseline(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
@@ -172,7 +172,7 @@ async fn run_ab_cutover(
     )
     .await?;
 
-    let mut events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let mut traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill actor A: {error}")))?;
@@ -226,11 +226,11 @@ async fn run_ab_cutover(
         Duration::from_secs(60),
     )
     .await?;
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     let unreachable_port = allocate_local_port()?;
@@ -246,7 +246,7 @@ async fn run_ab_cutover(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
@@ -349,7 +349,7 @@ async fn run_die_after_payload(
     )
     .await?;
 
-    let mut events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let mut traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill wedged A: {error}")))?;
@@ -401,11 +401,23 @@ async fn run_die_after_payload(
     {
         Ok(report) => report,
         Err(error) => {
-            events.extend(
-                collect_traces(lifecycle, &scenario_dir, &["scripture-actor-b"])
-                    .unwrap_or_default(),
-            );
+            traces.extend_from(collect_traces(
+                lifecycle,
+                &scenario_dir,
+                &["scripture-actor-b"],
+            ));
             let _ = lifecycle.kill_actor("scripture-actor-b");
+            let checker = if traces.collection_errors.is_empty() && !traces.events.is_empty() {
+                CheckerAttestation::Evaluated {
+                    verdict: check_trace(&renumber_global_seq(traces.events.clone())),
+                }
+            } else {
+                CheckerAttestation::Incomplete {
+                    reason: "family 14 blocker: actor traces incomplete; checker not evaluated"
+                        .into(),
+                    collection_errors: traces.collection_errors.clone(),
+                }
+            };
             return Ok(CampaignReport {
                 run_id: run_id.to_owned(),
                 scenario: token,
@@ -430,35 +442,36 @@ async fn run_die_after_payload(
                         "producer_acks_pre": ack_summary(&acks_pre),
                         "producer_acks_post": ack_summary(&acks_post),
                     },
+                    "trace_collection_errors": traces.collection_errors,
                     "isolated_store": {
                         "namespace": lifecycle.store.namespace,
                         "bucket": lifecycle.store.bucket,
                     }
                 }),
-                events: renumber_global_seq(events),
+                events: renumber_global_seq(traces.events),
                 final_root: serde_json::json!({"blocker": true}),
                 final_authority: serde_json::Value::Null,
                 verdict: Verdict::Inconclusive {
                     reason: "WP07 family 14: Holylog durable oracle did not observe full pre+unacked+post history".into(),
                     evidence_slice: vec![error.to_string()],
                 },
-                checker: CheckerAttestation::Evaluated,
+                checker,
                 evidence_class: Some("blocker-evidence"),
             });
         }
     };
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     finish_report(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
@@ -530,7 +543,7 @@ async fn run_root_cas_reply_loss(
         Duration::from_secs(60),
     )
     .await?;
-    let mut events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let mut traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill A before B reply-loss: {error}")))?;
@@ -595,29 +608,30 @@ async fn run_root_cas_reply_loss(
             "family 15 cutover oracle failed (no baseline fallback): {error}"
         ))
     })?;
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     finish_report(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
             "actor_a": actor_a,
             "actor_b": actor_b,
-            "fault": "RootCasReplyLost on B promote CAS → Indeterminate → same-process fresh observation retry",
+            "fault": "RootCasReplyLost on B promote CAS → same-process reply-loss retry after applied-fault evidence",
             "stale_cas_witness": stale,
             "producer_acks_a": ack_summary(&acks_a),
             "producer_acks_b": ack_summary(&acks_b),
+            "reply_loss_resolution": "same-process (not B crash/restart after lost reply)",
             "claims": [
-                "B promote applied root CAS then lost reply; resolved via fresh observation in-process",
+                "B promote applied root CAS then lost reply; resolved via fresh observation in the same B process",
                 "Competing stale CAS could not overwrite the applied root",
                 "Holylog cutover oracle holds A then B payloads with distinct producer IDs"
             ],
@@ -625,7 +639,8 @@ async fn run_root_cas_reply_loss(
                 "not network proxy",
                 "temporary adapter",
                 "development-source",
-                "campaign-faults CLI Indeterminate retry is test-only"
+                "campaign-faults CLI reply-loss retry is test-only",
+                "does not prove B crash/restart recovery after a lost root-CAS reply"
             ],
             "cutover_oracle": oracle.observation,
         }),
@@ -680,7 +695,7 @@ async fn run_directional_loss(
         Duration::from_secs(60),
     )
     .await?;
-    let mut events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let mut traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill A: {error}")))?;
@@ -704,11 +719,11 @@ async fn run_directional_loss(
         )
         .map_err(|error| CampaignError::Scenario(format!("promote B under deny: {error}")))?;
     if pod_ready(lifecycle, "scripture-actor-b")? {
-        events.extend(collect_traces(
+        traces.extend_from(collect_traces(
             lifecycle,
             &scenario_dir,
             &["scripture-actor-b"],
-        )?);
+        ));
         let _ = lifecycle.kill_actor("scripture-actor-b");
         let _ = lifecycle.restore_rustfs_egress();
         return Ok(CampaignReport {
@@ -727,12 +742,13 @@ async fn run_directional_loss(
                     "actor_b_under_deny": blocked_b,
                     "ha_prefix": ha_prefix,
                 },
+                "trace_collection_errors": traces.collection_errors,
                 "isolated_store": {
                     "namespace": lifecycle.store.namespace,
                     "bucket": lifecycle.store.bucket,
                 }
             }),
-            events: renumber_global_seq(events),
+            events: renumber_global_seq(traces.events),
             final_root: serde_json::json!({"not_run": true}),
             final_authority: serde_json::Value::Null,
             verdict: Verdict::Inconclusive {
@@ -765,11 +781,11 @@ async fn run_directional_loss(
         forward.stop();
         denied?;
     }
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     lifecycle
@@ -818,18 +834,18 @@ async fn run_directional_loss(
         Duration::from_secs(60),
     )
     .await?;
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     finish_report(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
@@ -902,7 +918,7 @@ async fn run_credential_invalidation(
         Duration::from_secs(60),
     )
     .await?;
-    let mut events = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"])?;
+    let mut traces = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-a"]);
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("stop A before invalidate: {error}")))?;
@@ -946,7 +962,11 @@ async fn run_credential_invalidation(
         forward.stop();
         denied?;
     }
-    let _ = collect_traces(lifecycle, &scenario_dir, &["scripture-actor-b"]);
+    traces.extend_from(collect_traces(
+        lifecycle,
+        &scenario_dir,
+        &["scripture-actor-b"],
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     lifecycle
@@ -996,18 +1016,18 @@ async fn run_credential_invalidation(
         Duration::from_secs(60),
     )
     .await?;
-    events.extend(collect_traces(
+    traces.extend_from(collect_traces(
         lifecycle,
         &scenario_dir,
         &["scripture-actor-b"],
-    )?);
+    ));
     let _ = lifecycle.kill_actor("scripture-actor-b");
 
     finish_report(
         run_id,
         token,
         lifecycle,
-        events,
+        traces,
         oracle.observation.clone(),
         serde_json::json!({
             "ha_prefix": ha_prefix,
@@ -1037,27 +1057,51 @@ fn finish_report(
     run_id: &str,
     token: &'static str,
     lifecycle: &RunLifecycle,
-    events: Vec<TraceEvent>,
+    traces: CollectedTraces,
     final_root: serde_json::Value,
     process_separation: serde_json::Value,
 ) -> Result<CampaignReport, CampaignError> {
-    let events = renumber_global_seq(events);
-    let checker_trace = if events.is_empty() {
-        Verdict::Inconclusive {
-            reason: "empty actor TraceEvent bridge; Holylog oracle is authoritative".into(),
-            evidence_slice: Vec::new(),
+    let events = renumber_global_seq(traces.events);
+    let checker = if !traces.collection_errors.is_empty() {
+        CheckerAttestation::Incomplete {
+            reason: "required actor TraceEvent collection incomplete; checker not evaluated".into(),
+            collection_errors: traces.collection_errors.clone(),
+        }
+    } else if events.is_empty() {
+        CheckerAttestation::Incomplete {
+            reason: "empty actor TraceEvent bridge after successful collection paths; checker not evaluated"
+                .into(),
+            collection_errors: Vec::new(),
         }
     } else {
         // WP07: do not filter real events to manufacture a checker Pass.
-        check_trace(&events)
+        CheckerAttestation::Evaluated {
+            verdict: check_trace(&events),
+        }
     };
-    let checker = CheckerAttestation::Evaluated;
-    // Holylog oracle already succeeded before finish_report. Checker Fail is a
-    // real fail; checker Inconclusive is reported honestly without failing the
-    // durable-oracle Pass.
-    let verdict = match &checker_trace {
-        Verdict::Fail { .. } => checker_trace.clone(),
-        Verdict::Pass | Verdict::Inconclusive { .. } => Verdict::Pass,
+    // Holylog oracle already succeeded before finish_report. Checker Fail fails
+    // the report; checker Incomplete/Inconclusive leaves the oracle Pass intact.
+    let verdict = match &checker {
+        CheckerAttestation::Evaluated {
+            verdict: fail @ Verdict::Fail { .. },
+        } => fail.clone(),
+        _ => Verdict::Pass,
+    };
+    let checker_trace_for_env = match &checker {
+        CheckerAttestation::Evaluated { verdict } => serde_json::to_value(verdict)
+            .unwrap_or_else(|_| serde_json::json!({"verdict": "serialize-error"})),
+        CheckerAttestation::Incomplete {
+            reason,
+            collection_errors,
+        } => serde_json::json!({
+            "verdict": "inconclusive",
+            "reason": reason,
+            "collection_errors": collection_errors,
+        }),
+        CheckerAttestation::NotApplicable { reason } => serde_json::json!({
+            "status": "not_applicable",
+            "reason": reason,
+        }),
     };
     let final_authority = final_root
         .get("serving_authority")
@@ -1073,7 +1117,8 @@ fn finish_report(
             "adapter": "temporary-bootstrap-promote",
             "release_classification": "development-source",
             "process_separation": process_separation,
-            "checker_trace_verdict": checker_trace,
+            "checker_trace_verdict": checker_trace_for_env,
+            "trace_collection_errors": traces.collection_errors,
             "isolated_store": {
                 "namespace": lifecycle.store.namespace,
                 "service": lifecycle.store.service,
@@ -1098,23 +1143,51 @@ fn renumber_global_seq(mut events: Vec<TraceEvent>) -> Vec<TraceEvent> {
     events
 }
 
+/// Accumulated actor TraceEvents plus collection diagnostics for checker gating.
+#[derive(Debug, Default)]
+struct CollectedTraces {
+    events: Vec<TraceEvent>,
+    collection_errors: Vec<String>,
+}
+
+impl CollectedTraces {
+    fn extend_from(&mut self, other: CollectedTraces) {
+        self.events.extend(other.events);
+        self.collection_errors.extend(other.collection_errors);
+    }
+}
+
 fn collect_traces(
     lifecycle: &RunLifecycle,
     scenario_dir: &Path,
     actors: &[&str],
-) -> Result<Vec<TraceEvent>, CampaignError> {
-    let mut events = Vec::new();
+) -> CollectedTraces {
+    let mut out = CollectedTraces::default();
     for actor in actors {
         let dest = scenario_dir.join("traces").join(format!("{actor}.ndjson"));
         match lifecycle.collect_actor_trace(actor, &dest) {
             Ok(()) => {
-                if dest.exists() {
-                    events.extend(parse_ndjson_trace(&dest)?);
+                if !dest.exists() {
+                    out.collection_errors.push(format!(
+                        "{actor}: collect_actor_trace ok but {} missing",
+                        dest.display()
+                    ));
+                    continue;
+                }
+                match parse_ndjson_trace(&dest) {
+                    Ok(events) if events.is_empty() => {
+                        out.collection_errors
+                            .push(format!("{actor}: trace file empty ({})", dest.display()));
+                    }
+                    Ok(events) => out.events.extend(events),
+                    Err(error) => out
+                        .collection_errors
+                        .push(format!("{actor}: parse failed: {error}")),
                 }
             }
             Err(error) => {
-                // Soft: pod may have already exited; treat as empty contribution.
-                let _ = error;
+                out.collection_errors
+                    .push(format!("{actor}: collect failed: {error}"));
             }
         }
         if let Ok(logs) = lifecycle.actor_logs(actor) {
@@ -1122,7 +1195,7 @@ fn collect_traces(
             let _ = std::fs::write(log_path, logs);
         }
     }
-    Ok(events)
+    out
 }
 
 fn parse_ndjson_trace(path: &Path) -> Result<Vec<TraceEvent>, CampaignError> {

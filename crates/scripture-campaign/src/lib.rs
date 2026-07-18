@@ -484,13 +484,41 @@ impl PartsFactory for TracingPartsFactory {
 /// How the shared Holylog correctness checker relates to this report.
 #[derive(Debug, Clone)]
 pub enum CheckerAttestation {
-    /// Checker evaluated harness TraceEvents.
-    Evaluated,
-    /// Checker did not run (no TraceEvent export / direct-oracle path).
+    /// Checker evaluated successfully collected TraceEvents.
+    Evaluated {
+        /// Raw `check_trace` verdict (never the oracle verdict).
+        verdict: Verdict,
+    },
+    /// Required actor traces were missing, empty, or uncollectable.
+    ///
+    /// Serialized as checker `inconclusive` — never as `evaluated`.
+    Incomplete {
+        /// Why traces were insufficient for an Evaluated claim.
+        reason: String,
+        /// Collection / parse diagnostics preserved in artifacts.
+        collection_errors: Vec<String>,
+    },
+    /// Checker did not run (direct-oracle / structural not-run path).
     NotApplicable {
         /// Why the checker was not applied.
         reason: String,
     },
+}
+
+impl CheckerAttestation {
+    /// Matrix / summary label: `pass` | `fail` | `inconclusive` | `not_applicable`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Evaluated { verdict } => match verdict {
+                Verdict::Pass => "pass",
+                Verdict::Fail { .. } => "fail",
+                Verdict::Inconclusive { .. } => "inconclusive",
+            },
+            Self::Incomplete { .. } => "inconclusive",
+            Self::NotApplicable { .. } => "not_applicable",
+        }
+    }
 }
 
 /// Redacted campaign evidence bundle.
@@ -541,9 +569,27 @@ impl CampaignReport {
     /// Serializes checker attestation separately from the oracle verdict.
     pub fn checker_json(&self) -> serde_json::Value {
         match &self.checker {
-            CheckerAttestation::Evaluated => serde_json::json!({
-                "status": "evaluated",
-                "verdict": self.verdict_label(),
+            CheckerAttestation::Evaluated { verdict } => match serde_json::to_value(verdict) {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("status".into(), serde_json::json!(self.checker.label()));
+                    }
+                    value
+                }
+                Err(_) => serde_json::json!({
+                    "status": "inconclusive",
+                    "verdict": "inconclusive",
+                    "reason": "failed to serialize checker verdict",
+                }),
+            },
+            CheckerAttestation::Incomplete {
+                reason,
+                collection_errors,
+            } => serde_json::json!({
+                "status": "inconclusive",
+                "verdict": "inconclusive",
+                "reason": reason,
+                "collection_errors": collection_errors,
             }),
             CheckerAttestation::NotApplicable { reason } => serde_json::json!({
                 "status": "not_applicable",
@@ -650,8 +696,8 @@ pub async fn run_campaign(
         events,
         final_root,
         final_authority,
-        verdict,
-        checker: CheckerAttestation::Evaluated,
+        verdict: verdict.clone(),
+        checker: CheckerAttestation::Evaluated { verdict },
         evidence_class: None,
     })
 }
