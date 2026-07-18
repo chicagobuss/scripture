@@ -24,7 +24,7 @@ use holylog::virtual_log::{
     ApplicationFence, InMemoryConditionalRegister, LogletId, LogletResolver,
     ReceiptReconfiguration, ResolveFuture, VirtualLog, VirtualLogError,
 };
-use holylog_correctness::{RecordingSink, RunId, Verdict, check_trace};
+use holylog_correctness::{RecordingSink, RunId, Verdict};
 
 use crate::scripted_drive::ScriptedDrive;
 use crate::{CampaignError, CampaignReport, Scenario};
@@ -54,13 +54,18 @@ pub(crate) async fn run_composition(
         }
     };
 
-    let mut verdict = check_trace(&events);
-    if !oracle_ok {
-        verdict = Verdict::Fail {
+    // Direct-oracle only: RecordingSink is not bridged into these schedules, so
+    // check_trace on the (empty) event vector would be a vacuous pass. Verdict
+    // follows the independent Rust oracle; the seeded negative checker test
+    // below remains the checker control.
+    let verdict = if oracle_ok {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
             invariant: holylog_correctness::Invariant::UniqueCommittedOffset,
             evidence_slice: vec![detail.clone()],
-        };
-    }
+        }
+    };
 
     Ok(CampaignReport {
         run_id: run_id.to_owned(),
@@ -69,12 +74,15 @@ pub(crate) async fn run_composition(
         environment: serde_json::json!({
             "run_id": run_id,
             "scenario": scenario.as_str(),
+            "evidence_class": "direct-oracle-test",
             "backend": { "kind": "memory", "layer": "holylog-composition" },
             "oracle": detail,
+            "trace_event_count": events.len(),
             "claims": [
-                "exercises Holylog AtomicLog/composition adapters with an independent ReferenceLogDrive oracle where applicable"
+                "deterministic Holylog AtomicLog/composition schedule judged by an independent ReferenceLogDrive / Rust oracle"
             ],
             "non_claims": [
+                "not a Holylog semantic-trace / checker pass (sink not attached; events are not transition-point traces)",
                 "not a Scripture HA/process-separated proof",
                 "not an object-store or cloud-backend attestation"
             ],

@@ -48,13 +48,8 @@ impl Suite {
             Scenario::QuorumRepairUnavailability,
             Scenario::NestedStripeQuorumSchedules,
         ];
-        let resilience = vec![
-            Scenario::ProcessSeparatedBaseline,
-            Scenario::KillAExplicitBPromotion,
-            Scenario::WedgedPayloadProcessSeparated,
-            Scenario::DirectionalBackendLossRecovery,
-            Scenario::ScopedCredentialInvalidation,
-        ];
+        // Sole real resilience claim until 12/14–17 are rebuilt on this path.
+        let resilience = vec![Scenario::RawLinesAbCutover];
         match self {
             Self::Core => core,
             Self::Composition => composition,
@@ -85,7 +80,7 @@ impl Suite {
         match self {
             Self::Core => "core-wp05",
             Self::Composition => "composition-wp05",
-            Self::Resilience => "resilience-wp05-ephemeral-rustfs",
+            Self::Resilience => "resilience-wp05-raw-lines-ab-cutover",
             Self::All => "all-implemented-wp05",
         }
     }

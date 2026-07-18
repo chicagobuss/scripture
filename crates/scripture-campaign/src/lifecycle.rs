@@ -373,6 +373,10 @@ impl RunLifecycle {
                 configmap: spec.configmap,
             }),
         )?;
+        apply_yaml(
+            &self.kube_context,
+            &actor_service_yaml(spec.name, &self.namespace, &self.run_id, spec.role),
+        )?;
         wait_for_pod_ready(
             &self.kube_context,
             &self.namespace,
@@ -1132,6 +1136,35 @@ metrics:
   status_bind: "0.0.0.0:9100"
 ha:
   mode: serving-authority
+"#
+    )
+}
+
+fn actor_service_yaml(name: &str, namespace: &str, run_id: &str, role: &str) -> String {
+    format!(
+        r#"apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  namespace: {namespace}
+  labels:
+    app.kubernetes.io/name: scripture
+    app.kubernetes.io/component: correctness-actor
+    scripture.dev/run-id: {run_id}
+    scripture.dev/role: {role}
+    scripture.dev/adapter: temporary-bootstrap-promote
+spec:
+  selector:
+    app.kubernetes.io/name: scripture
+    scripture.dev/run-id: {run_id}
+    scripture.dev/role: {role}
+  ports:
+    - name: raw-lines
+      port: 9000
+      targetPort: raw-lines
+    - name: status
+      port: 9100
+      targetPort: status
 "#
     )
 }

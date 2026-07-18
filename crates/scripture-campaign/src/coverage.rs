@@ -130,43 +130,33 @@ pub fn family_catalog() -> Vec<CoverageRow> {
             CoverageLayer::Composition,
             Some(Scenario::NestedStripeQuorumSchedules),
         ),
-        row(
-            12,
-            "process-separated-baseline",
-            CoverageLayer::Resilience,
-            Some(Scenario::ProcessSeparatedBaseline),
-        ),
+        // Families 12/14/16/17: prior orchestration-smoke rows are not semantic
+        // pass evidence. Only family 13 is wired to the producer→A→kill→B path.
+        row(12, "process-separated-baseline", CoverageLayer::Resilience, None),
         row(
             13,
             "kill-a-explicit-b-promotion",
             CoverageLayer::Resilience,
-            Some(Scenario::KillAExplicitBPromotion),
+            Some(Scenario::RawLinesAbCutover),
         ),
         row(
             14,
             "wedged-payload-recovery-process-separated",
             CoverageLayer::Resilience,
-            Some(Scenario::WedgedPayloadProcessSeparated),
-        ),
-        // Family 14 process-recovery (force-delete ready A → promote B) is not a
-        // substitute for family 2's durable-payload/no-ACK wedge semantics.
-        row(
-            15,
-            "root-cas-reply-loss-reread",
-            CoverageLayer::Resilience,
             None,
         ),
+        row(15, "root-cas-reply-loss-reread", CoverageLayer::Resilience, None),
         row(
             16,
             "directional-backend-loss-recovery",
             CoverageLayer::Resilience,
-            Some(Scenario::DirectionalBackendLossRecovery),
+            None,
         ),
         row(
             17,
             "scoped-credential-invalidation",
             CoverageLayer::Resilience,
-            Some(Scenario::ScopedCredentialInvalidation),
+            None,
         ),
         row(
             18,
@@ -233,8 +223,24 @@ fn row(
 
 fn default_not_run_reason(family: u8) -> Option<String> {
     Some(match family {
+        12 => {
+            "downgraded: prior row was orchestration smoke (deploy A + in-process campaign); awaiting a dedicated producer→A raw-lines baseline on the actor HA root"
+                .into()
+        }
+        14 => {
+            "not-run: force-delete ready A is process-recovery smoke, not family-2 durable-payload/no-ACK wedge across processes; DieAfterPayload seam absent in temporary adapter"
+                .into()
+        }
         15 => {
             "root-CAS reply-loss fault injection is not available in the temporary bootstrap/promote adapter; family 6 covers in-process semantics"
+                .into()
+        }
+        16 => {
+            "downgraded: prior row mutated NetworkPolicy then ran an in-process campaign; not-run until directional loss is proven on the producer→actor raw-lines path"
+                .into()
+        }
+        17 => {
+            "downgraded: prior row mutated the run Secret then ran an in-process campaign; not-run until credential denial is proven on the producer→actor raw-lines path"
                 .into()
         }
         18 => "R2/S3/GCS require Joshua's explicit approval of the exact command".into(),

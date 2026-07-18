@@ -9,8 +9,10 @@ use crate::kellnr::ReleaseAttestation;
 use crate::lifecycle::RunLifecycle;
 use crate::preflight::PreflightReport;
 use crate::profile::{Profile, RustFsHomeFleetProfile};
+use crate::raw_lines_client::{self, RawLinesAck};
 use crate::scenario::Suite;
 use crate::{CampaignBackend, CampaignError, CampaignReport, Scenario, run_campaign};
+use holylog_correctness::Verdict;
 
 /// Options for one autonomous campaign invocation.
 #[derive(Debug, Clone)]
@@ -215,23 +217,11 @@ async fn run_process_lifecycle(
     lifecycle: &RunLifecycle,
     run_id: &str,
     scenario: Scenario,
-    backend: CampaignBackend,
+    _backend: CampaignBackend,
 ) -> Result<CampaignReport, CampaignError> {
     match scenario {
-        Scenario::ProcessSeparatedBaseline => {
-            run_process_separated_baseline(profile, lifecycle, run_id, backend).await
-        }
-        Scenario::KillAExplicitBPromotion => {
-            run_kill_a_promote_b(profile, lifecycle, run_id, backend, scenario).await
-        }
-        Scenario::WedgedPayloadProcessSeparated => {
-            run_kill_a_promote_b(profile, lifecycle, run_id, backend, scenario).await
-        }
-        Scenario::DirectionalBackendLossRecovery => {
-            run_directional_backend_loss(profile, lifecycle, run_id, backend).await
-        }
-        Scenario::ScopedCredentialInvalidation => {
-            run_scoped_credential_invalidation(profile, lifecycle, run_id, backend).await
+        Scenario::RawLinesAbCutover => {
+            run_raw_lines_ab_cutover(profile, lifecycle, run_id).await
         }
         other => Err(CampaignError::Scenario(format!(
             "{} is not a process-lifecycle scenario",
@@ -240,56 +230,53 @@ async fn run_process_lifecycle(
     }
 }
 
-async fn run_process_separated_baseline(
+async fn run_raw_lines_ab_cutover(
     profile: &RustFsHomeFleetProfile,
     lifecycle: &RunLifecycle,
     run_id: &str,
-    backend: CampaignBackend,
 ) -> Result<CampaignReport, CampaignError> {
-    let placement = lifecycle
-        .deploy_actor_a(profile, Scenario::ProcessSeparatedBaseline.as_str())
-        .map_err(|error| CampaignError::Scenario(format!("deploy actor A: {error}")))?;
-    assert_actor_placement(&placement, &profile.writer_a_node, "A")?;
+    let token = Scenario::RawLinesAbCutover.as_str();
+    let ha_prefix = format!("scripture/correctness/{run_id}/{token}/ha");
 
-    let mut report = run_campaign(run_id, Scenario::BaselineCommittedAck, backend).await?;
-    report.scenario = Scenario::ProcessSeparatedBaseline.as_str();
-    report.environment = process_env(
-        run_id,
-        Scenario::ProcessSeparatedBaseline,
-        lifecycle,
-        serde_json::json!({
-            "actor_a": placement,
-            "claims": [
-                "actor A is a distinct OS process/pod on the configured node",
-                "object store is the run-owned ephemeral RustFS Service"
-            ],
-            "non_claims": [
-                "Actor A bootstrap process is temporary until stable scripture serve lands",
-                "Baseline ACK traffic in this row is campaign-driven against the ephemeral store, not yet a producer-to-actor raw-lines proof",
-                "scripture:0.1.0 import for the temporary adapter remains development-source and cannot close family 22"
-            ]
-        }),
-    );
-    let _ = lifecycle.kill_actor("scripture-actor-a");
-    Ok(report)
-}
-
-async fn run_kill_a_promote_b(
-    profile: &RustFsHomeFleetProfile,
-    lifecycle: &RunLifecycle,
-    run_id: &str,
-    backend: CampaignBackend,
-    scenario: Scenario,
-) -> Result<CampaignReport, CampaignError> {
-    let token = scenario.as_str();
     let actor_a = lifecycle
         .deploy_actor_a(profile, token)
         .map_err(|error| CampaignError::Scenario(format!("deploy actor A: {error}")))?;
     assert_actor_placement(&actor_a, &profile.writer_a_node, "A")?;
 
+    let mut forward_a = PortForward::start(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-a",
+        19_001,
+        9000,
+    )
+    .map_err(|error| CampaignError::Scenario(format!("port-forward A: {error}")))?;
+    wait_tcp_ready("127.0.0.1:19001").await?;
+
+    let phase_a: [&str; 3] = ["cutover-a-0", "cutover-a-1", "cutover-a-2"];
+    let acks_a = raw_lines_client::exchange_committed("127.0.0.1:19001", &phase_a).await?;
+    assert_dense_continuation(&acks_a, None)?;
+
     lifecycle
         .kill_actor("scripture-actor-a")
         .map_err(|error| CampaignError::Scenario(format!("kill actor A: {error}")))?;
+
+    // Stale A must not yield a committed ACK on the same producer path.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        raw_lines_client::exchange_committed("127.0.0.1:19001", &["stale-a-probe"]),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            forward_a.stop();
+            return Err(CampaignError::Scenario(
+                "stale actor A still returned a committed OK ACK after kill".into(),
+            ));
+        }
+        Ok(Err(_)) | Err(_) => {}
+    }
+    forward_a.stop();
 
     let actor_b = lifecycle
         .deploy_actor_b_promote(profile, token, 2)
@@ -301,178 +288,135 @@ async fn run_kill_a_promote_b(
         ));
     }
 
-    // Dense continuation on a distinct campaign prefix (honest non-claim below).
-    let mut report = run_campaign(run_id, Scenario::BaselineCommittedAck, backend).await?;
-    report.scenario = scenario.as_str();
-    let wedge_note = if scenario == Scenario::WedgedPayloadProcessSeparated {
-        "Writer death is approximated by force-deleting ready actor A; exact DieAfterPayload injection inside the temporary adapter is not claimed"
-    } else {
-        "Kill A is an operator-forced pod delete, not an automatic failover"
+    let mut forward_b = PortForward::start(
+        &lifecycle.kube_context,
+        &lifecycle.namespace,
+        "svc/scripture-actor-b",
+        19_002,
+        9000,
+    )
+    .map_err(|error| CampaignError::Scenario(format!("port-forward B: {error}")))?;
+    wait_tcp_ready("127.0.0.1:19002").await?;
+
+    let phase_b: [&str; 3] = ["cutover-b-0", "cutover-b-1", "cutover-b-2"];
+    let acks_b = raw_lines_client::exchange_committed("127.0.0.1:19002", &phase_b).await?;
+    let expected_start = acks_a
+        .last()
+        .map(|ack| ack.next_offset)
+        .ok_or_else(|| CampaignError::Scenario("missing A ACK for dense continuation".into()))?;
+    assert_dense_continuation(&acks_b, Some(expected_start))?;
+    forward_b.stop();
+
+    let _ = lifecycle.kill_actor("scripture-actor-b");
+
+    let ack_summary = |acks: &[RawLinesAck]| {
+        acks.iter()
+            .map(|ack| {
+                serde_json::json!({
+                    "first_offset": ack.first_offset,
+                    "next_offset": ack.next_offset,
+                    "payload_len": ack.payload.len(),
+                })
+            })
+            .collect::<Vec<_>>()
     };
-    report.environment = process_env(
-        run_id,
-        scenario,
-        lifecycle,
-        serde_json::json!({
-            "actor_a": actor_a,
-            "actor_b": actor_b,
-            "actions": ["bootstrap-a", "kill-a", "promote-b-term-2"],
-            "claims": [
-                "A and B are distinct OS processes/pods on configured nodes",
-                "B was promoted after A was deleted",
-                "object store is the run-owned ephemeral RustFS Service"
-            ],
-            "non_claims": [
-                "temporary-bootstrap-promote adapter until stable scripture serve lands",
-                wedge_note,
-                "Dense continuation ACK traffic is campaign-driven against the ephemeral store, not producer-to-B raw-lines",
-                "scripture:0.1.0 remains development-source; cannot close family 22"
-            ]
+
+    Ok(CampaignReport {
+        run_id: run_id.to_owned(),
+        scenario: token,
+        backend: "rustfs",
+        environment: process_env(
+            run_id,
+            Scenario::RawLinesAbCutover,
+            lifecycle,
+            serde_json::json!({
+                "evidence_class": "producer-raw-lines-ab-cutover",
+                "ha_prefix": ha_prefix,
+                "actor_a": actor_a,
+                "actor_b": actor_b,
+                "actions": [
+                    "bootstrap-a-and-serve",
+                    "producer-raw-lines-to-a",
+                    "kill-a",
+                    "assert-no-stale-a-ack",
+                    "promote-b-term-2-same-ha-prefix",
+                    "producer-raw-lines-to-b",
+                    "assert-dense-continuation"
+                ],
+                "producer_acks_a": ack_summary(&acks_a),
+                "producer_acks_b": ack_summary(&acks_b),
+                "claims": [
+                    "Producer committed OK ACKs came from actor A's raw-lines listener",
+                    "A was force-deleted; subsequent producer exchange did not yield a committed OK",
+                    "B was promoted on the identical HA object prefix and returned dense continuation OK ACKs",
+                    "A and B are distinct OS processes/pods on configured nodes",
+                    "object store is the run-owned ephemeral RustFS Service"
+                ],
+                "non_claims": [
+                    "temporary-bootstrap-promote adapter until stable scripture serve lands",
+                    "Holylog semantic TraceEvent export is not available from the temporary adapter; verdict is producer-ACK / density oracle, not check_trace",
+                    "not automatic failover",
+                    "not family 14 DieAfterPayload wedge; not family 15 reply-loss",
+                    "scripture:0.1.0 remains development-source; cannot close family 22"
+                ]
+            }),
+        ),
+        events: Vec::new(),
+        final_root: serde_json::json!({
+            "ha_prefix": format!("scripture/correctness/{run_id}/{token}/ha"),
+            "observation": "producer-ack-oracle"
         }),
-    );
-    let _ = lifecycle.kill_actor("scripture-actor-b");
-    Ok(report)
+        final_authority: serde_json::Value::Null,
+        verdict: Verdict::Pass,
+    })
 }
 
-async fn run_directional_backend_loss(
-    profile: &RustFsHomeFleetProfile,
-    lifecycle: &RunLifecycle,
-    run_id: &str,
-    backend: CampaignBackend,
-) -> Result<CampaignReport, CampaignError> {
-    let token = Scenario::DirectionalBackendLossRecovery.as_str();
-    let actor_a = lifecycle
-        .deploy_actor_a(profile, token)
-        .map_err(|error| CampaignError::Scenario(format!("deploy actor A: {error}")))?;
-    assert_actor_placement(&actor_a, &profile.writer_a_node, "A")?;
-
-    lifecycle
-        .deny_rustfs_egress()
-        .map_err(|error| CampaignError::Scenario(format!("deny rustfs egress: {error}")))?;
-    // Give NetworkPolicy a moment to apply; readiness may flap but we do not
-    // require a crash — loss of store path is the directional fault.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    lifecycle
-        .restore_rustfs_egress()
-        .map_err(|error| CampaignError::Scenario(format!("restore rustfs egress: {error}")))?;
-
-    lifecycle
-        .kill_actor("scripture-actor-a")
-        .map_err(|error| CampaignError::Scenario(format!("kill actor A after loss: {error}")))?;
-    let actor_b = lifecycle
-        .deploy_actor_b_promote(profile, token, 2)
-        .map_err(|error| CampaignError::Scenario(format!("promote actor B after loss: {error}")))?;
-    assert_actor_placement(&actor_b, &profile.writer_b_node, "B")?;
-
-    let mut report = run_campaign(run_id, Scenario::BaselineCommittedAck, backend).await?;
-    report.scenario = Scenario::DirectionalBackendLossRecovery.as_str();
-    report.environment = process_env(
-        run_id,
-        Scenario::DirectionalBackendLossRecovery,
-        lifecycle,
-        serde_json::json!({
-            "actor_a": actor_a,
-            "actor_b": actor_b,
-            "actions": [
-                "bootstrap-a",
-                "deny-rustfs-egress",
-                "restore-rustfs-egress",
-                "kill-a",
-                "promote-b-term-2"
-            ],
-            "claims": [
-                "Directional loss targeted only the run-owned RustFS Service path via NetworkPolicy",
-                "Recovery used explicit promote of B after restoring egress",
-                "A and B are distinct processes/pods"
-            ],
-            "non_claims": [
-                "Does not prove automatic failover or store HA",
-                "Does not prove mid-flight request semantics during the deny window",
-                "Campaign ACK path remains campaign-driven; temporary adapter",
-                "development-source only"
-            ]
-        }),
-    );
-    let _ = lifecycle.kill_actor("scripture-actor-b");
-    Ok(report)
-}
-
-async fn run_scoped_credential_invalidation(
-    profile: &RustFsHomeFleetProfile,
-    lifecycle: &RunLifecycle,
-    run_id: &str,
-    backend: CampaignBackend,
-) -> Result<CampaignReport, CampaignError> {
-    let token = Scenario::ScopedCredentialInvalidation.as_str();
-    let actor_a = lifecycle
-        .deploy_actor_a(profile, token)
-        .map_err(|error| CampaignError::Scenario(format!("deploy actor A: {error}")))?;
-    assert_actor_placement(&actor_a, &profile.writer_a_node, "A")?;
-
-    lifecycle
-        .invalidate_store_credentials()
-        .map_err(|error| CampaignError::Scenario(format!("invalidate credentials: {error}")))?;
-    lifecycle
-        .kill_actor("scripture-actor-a")
-        .map_err(|error| CampaignError::Scenario(format!("kill A for cred restart: {error}")))?;
-
-    // Redeploy A with invalidated Secret — must fail Ready within timeout.
-    let invalid_a = lifecycle.deploy_actor_a(profile, token);
-    let invalid_redeploy_error = match &invalid_a {
-        Ok(_) => {
-            let _ = lifecycle.kill_actor("scripture-actor-a");
-            return Err(CampaignError::Scenario(
-                "actor A became Ready with invalidated credentials; scoped invalidation unproven"
-                    .into(),
-            ));
+fn assert_dense_continuation(
+    acks: &[RawLinesAck],
+    expected_first: Option<u64>,
+) -> Result<(), CampaignError> {
+    if acks.is_empty() {
+        return Err(CampaignError::Scenario("no committed ACKs".into()));
+    }
+    if let Some(expected) = expected_first {
+        if acks[0].first_offset != expected {
+            return Err(CampaignError::Scenario(format!(
+                "dense continuation broke: want first_offset {expected}, got {}",
+                acks[0].first_offset
+            )));
         }
-        Err(error) => error.to_string(),
-    };
-    let _ = lifecycle.kill_actor("scripture-actor-a");
+    }
+    for window in acks.windows(2) {
+        if window[1].first_offset != window[0].next_offset {
+            return Err(CampaignError::Scenario(format!(
+                "non-dense ACK offsets: {} then {} (next was {})",
+                window[0].first_offset, window[1].first_offset, window[0].next_offset
+            )));
+        }
+    }
+    for ack in acks {
+        if ack.next_offset <= ack.first_offset {
+            return Err(CampaignError::Scenario(format!(
+                "OK next_offset {} not after first_offset {}",
+                ack.next_offset, ack.first_offset
+            )));
+        }
+    }
+    Ok(())
+}
 
-    lifecycle
-        .restore_store_credentials()
-        .map_err(|error| CampaignError::Scenario(format!("restore credentials: {error}")))?;
-    let actor_b = lifecycle
-        .deploy_actor_b_promote(profile, token, 2)
-        .map_err(|error| {
-            CampaignError::Scenario(format!("promote B after credential restore: {error}"))
-        })?;
-    assert_actor_placement(&actor_b, &profile.writer_b_node, "B")?;
-
-    let mut report = run_campaign(run_id, Scenario::BaselineCommittedAck, backend).await?;
-    report.scenario = Scenario::ScopedCredentialInvalidation.as_str();
-    report.environment = process_env(
-        run_id,
-        Scenario::ScopedCredentialInvalidation,
-        lifecycle,
-        serde_json::json!({
-            "actor_a_before": actor_a,
-            "actor_b": actor_b,
-            "invalid_redeploy_error": invalid_redeploy_error,
-            "actions": [
-                "bootstrap-a",
-                "invalidate-run-secret",
-                "kill-a",
-                "redeploy-a-expect-fail",
-                "restore-run-secret",
-                "promote-b-term-2"
-            ],
-            "claims": [
-                "Credential invalidation was scoped to the run-owned Secret",
-                "Actor restart with invalid credentials failed closed (not Ready)",
-                "Recovery used restored credentials and explicit B promote"
-            ],
-            "non_claims": [
-                "Not a proxy/middleware invalidation proof",
-                "temporary adapter; development-source",
-                "Campaign ACK path is campaign-driven"
-            ]
-        }),
-    );
-    let _ = lifecycle.kill_actor("scripture-actor-b");
-    Ok(report)
+async fn wait_tcp_ready(endpoint: &str) -> Result<(), CampaignError> {
+    use tokio::net::TcpStream;
+    use tokio::time::{Duration, timeout};
+    for _ in 0..40 {
+        match timeout(Duration::from_secs(1), TcpStream::connect(endpoint)).await {
+            Ok(Ok(_stream)) => return Ok(()),
+            Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    }
+    Err(CampaignError::Scenario(format!(
+        "raw-lines listener not ready at {endpoint}"
+    )))
 }
 
 fn assert_actor_placement(

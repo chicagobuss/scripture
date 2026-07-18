@@ -31,6 +31,7 @@ mod lifecycle;
 mod preflight;
 mod producer_identity;
 mod profile;
+mod raw_lines_client;
 mod run;
 mod scenario;
 mod scripted_drive;
@@ -122,21 +123,13 @@ pub enum Scenario {
     QuorumRepairUnavailability,
     /// Family 11: nested stripe/quorum schedule judged by reference model.
     NestedStripeQuorumSchedules,
-    /// Process-separated baseline against ephemeral in-namespace RustFS.
-    ProcessSeparatedBaseline,
-    /// Kill A, explicit lawful B promotion, dense continuation (temporary adapter).
-    KillAExplicitBPromotion,
-    /// Writer-death recovery across distinct A/B processes (temporary adapter).
-    WedgedPayloadProcessSeparated,
-    /// Directional loss of the run-owned RustFS path, then recovery.
-    DirectionalBackendLossRecovery,
-    /// Scoped credential invalidation against the run Secret, then recovery.
-    ScopedCredentialInvalidation,
+    /// Producer raw-lines → A → kill A → promote B on same HA root → B continuation.
+    RawLinesAbCutover,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 17] = [
+    pub const ALL: [&'static str; 13] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
@@ -149,11 +142,7 @@ impl Scenario {
         "quorum-partial-write-not-global",
         "quorum-repair-unavailability",
         "nested-stripe-quorum-schedules",
-        "process-separated-baseline",
-        "kill-a-explicit-b-promotion",
-        "wedged-payload-process-separated",
-        "directional-backend-loss-recovery",
-        "scoped-credential-invalidation",
+        "raw-lines-ab-cutover",
     ];
 
     /// Parses a scenario token.
@@ -171,11 +160,7 @@ impl Scenario {
             "quorum-partial-write-not-global" => Ok(Self::QuorumPartialWriteNotGlobal),
             "quorum-repair-unavailability" => Ok(Self::QuorumRepairUnavailability),
             "nested-stripe-quorum-schedules" => Ok(Self::NestedStripeQuorumSchedules),
-            "process-separated-baseline" => Ok(Self::ProcessSeparatedBaseline),
-            "kill-a-explicit-b-promotion" => Ok(Self::KillAExplicitBPromotion),
-            "wedged-payload-process-separated" => Ok(Self::WedgedPayloadProcessSeparated),
-            "directional-backend-loss-recovery" => Ok(Self::DirectionalBackendLossRecovery),
-            "scoped-credential-invalidation" => Ok(Self::ScopedCredentialInvalidation),
+            "raw-lines-ab-cutover" => Ok(Self::RawLinesAbCutover),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -196,11 +181,7 @@ impl Scenario {
             Self::QuorumPartialWriteNotGlobal => "quorum-partial-write-not-global",
             Self::QuorumRepairUnavailability => "quorum-repair-unavailability",
             Self::NestedStripeQuorumSchedules => "nested-stripe-quorum-schedules",
-            Self::ProcessSeparatedBaseline => "process-separated-baseline",
-            Self::KillAExplicitBPromotion => "kill-a-explicit-b-promotion",
-            Self::WedgedPayloadProcessSeparated => "wedged-payload-process-separated",
-            Self::DirectionalBackendLossRecovery => "directional-backend-loss-recovery",
-            Self::ScopedCredentialInvalidation => "scoped-credential-invalidation",
+            Self::RawLinesAbCutover => "raw-lines-ab-cutover",
         }
     }
 
@@ -224,14 +205,7 @@ impl Scenario {
     /// Whether this scenario needs rustfs-home-fleet lifecycle orchestration.
     #[must_use]
     pub const fn needs_process_lifecycle(self) -> bool {
-        matches!(
-            self,
-            Self::ProcessSeparatedBaseline
-                | Self::KillAExplicitBPromotion
-                | Self::WedgedPayloadProcessSeparated
-                | Self::DirectionalBackendLossRecovery
-                | Self::ScopedCredentialInvalidation
-        )
+        matches!(self, Self::RawLinesAbCutover)
     }
 }
 
@@ -588,15 +562,10 @@ pub async fn run_campaign(
         | Scenario::NestedStripeQuorumSchedules => {
             unreachable!("composition scenarios handled above")
         }
-        Scenario::ProcessSeparatedBaseline
-        | Scenario::KillAExplicitBPromotion
-        | Scenario::WedgedPayloadProcessSeparated
-        | Scenario::DirectionalBackendLossRecovery
-        | Scenario::ScopedCredentialInvalidation => {
-            return Err(CampaignError::Scenario(format!(
-                "{} requires rustfs-home-fleet lifecycle orchestration",
-                scenario.as_str()
-            )));
+        Scenario::RawLinesAbCutover => {
+            return Err(CampaignError::Scenario(
+                "raw-lines-ab-cutover requires rustfs-home-fleet lifecycle orchestration".into(),
+            ));
         }
     };
     let verdict = check_trace(&events);
