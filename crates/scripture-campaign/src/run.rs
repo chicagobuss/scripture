@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
+use crate::kellnr::ReleaseAttestation;
 use crate::preflight::PreflightReport;
 use crate::profile::Profile;
 use crate::scenario::Suite;
@@ -33,24 +34,34 @@ impl RunOptions {
         let artifact_dir = self.artifact_dir.join(&run_id);
         std::fs::create_dir_all(&artifact_dir)?;
 
+        let repo_root = detect_repo_root();
+        let attestation = ReleaseAttestation::detect(&repo_root);
+        std::fs::write(
+            artifact_dir.join("release-attestation.json"),
+            serde_json::to_vec_pretty(&attestation)?,
+        )?;
+
         let preflight = PreflightReport::run(&self.profile, self.execute);
         preflight.write(&artifact_dir)?;
 
         if !self.execute {
-            let suite_artifacts = SuiteArtifacts {
-                run_id: run_id.clone(),
-                profile: self.profile.label().to_owned(),
-                suite: self.suite.schedule_label().to_owned(),
-                dry_run: true,
-                matrix: Vec::new(),
-            };
+            let suite_artifacts = SuiteArtifacts::build(
+                run_id.clone(),
+                self.profile.label().to_owned(),
+                self.suite.schedule_label().to_owned(),
+                true,
+                Vec::new(),
+                &[],
+                &attestation,
+            );
             suite_artifacts.write(&artifact_dir, &[])?;
             return Ok(RunOutcome {
                 run_id,
                 artifact_dir,
                 preflight_ok: preflight.ok,
                 dry_run: true,
-                exit_code: if preflight.ok { 0 } else { 4 },
+                // WP05: preflight missing → exit 2; otherwise 0 for dry-run.
+                exit_code: if preflight.ok { 0 } else { 2 },
                 reports: Vec::new(),
             });
         }
@@ -65,7 +76,7 @@ impl RunOptions {
 
         if matches!(self.profile, Profile::RustFsHomeFleet(_)) {
             return Err(RunError::ExecutionUnavailable(
-                "rustfs-home-fleet --execute is deferred until Slice 3 owns isolated Kubernetes lifecycle and A/B/C process placement".to_owned(),
+                "rustfs-home-fleet --execute is deferred until isolated Kubernetes lifecycle and A/B/C process placement exist".to_owned(),
             ));
         }
 
@@ -80,13 +91,15 @@ impl RunOptions {
             reports.push(report);
         }
 
-        let suite_artifacts = SuiteArtifacts {
-            run_id: run_id.clone(),
-            profile: self.profile.label().to_owned(),
-            suite: self.suite.schedule_label().to_owned(),
-            dry_run: false,
-            matrix: matrix.clone(),
-        };
+        let suite_artifacts = SuiteArtifacts::build(
+            run_id.clone(),
+            self.profile.label().to_owned(),
+            self.suite.schedule_label().to_owned(),
+            false,
+            matrix,
+            &reports,
+            &attestation,
+        );
         suite_artifacts.write(&artifact_dir, &reports)?;
 
         Ok(RunOutcome {
@@ -141,9 +154,24 @@ pub enum RunError {
     /// Backend construction failure.
     #[error("backend: {0}")]
     Backend(String),
+    /// JSON serialization failure.
+    #[error("serialize: {0}")]
+    Serialize(#[from] serde_json::Error),
     /// IO failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl RunError {
+    /// WP05 exit code for orchestration errors.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::PreflightFailed | Self::SuiteUnavailable(_) | Self::ExecutionUnavailable(_) => 2,
+            Self::Campaign(_) => 3,
+            _ => 4,
+        }
+    }
 }
 
 fn generate_run_id(profile: &str) -> String {

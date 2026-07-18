@@ -23,15 +23,21 @@
 //! availability, or replica-independence claim.
 
 mod artifacts;
+mod composition;
+mod coverage;
+mod kellnr;
 mod legacy;
 mod preflight;
 mod producer_identity;
 mod profile;
 mod run;
 mod scenario;
+mod scripted_drive;
 mod trace_observer;
 
 pub use artifacts::{SuiteArtifacts, matrix_from_report, write_scenario_artifacts};
+pub use coverage::{CoverageRow, CoverageStatus, family_catalog, merge_executed};
+pub use kellnr::{ReleaseAttestation, ReleaseClassification};
 pub use legacy::{legacy_main, print_campaign_help};
 pub use preflight::{PreflightReport, default_topology_path};
 pub use profile::{Profile, ProfileError, RustFsHomeFleetProfile};
@@ -85,8 +91,7 @@ use scripture_runtime::{
 /// Weak-tail window used by the Foundation-path scenarios.
 const FOUNDATION_K: u64 = 2;
 
-/// Named campaign scenarios. These correspond to the initial RustFS sequence in
-/// the Tracker campaign topology and reuse the proven in-process flows.
+/// Named campaign scenarios (WP04/WP05 families).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scenario {
     /// A serves; bounded committed ACKs are recorded and re-observed.
@@ -97,14 +102,26 @@ pub enum Scenario {
     /// Writer payload lands durably then the writer wedges before a committed
     /// ACK; HA recovery seals the predecessor and B serves the successor.
     WriterDiesAfterPayload,
+    /// Exact K-window delayed completion (Holylog AtomicLog).
+    KWindowDelayedCompletion,
+    /// Permanent K-window wedge sealed at the physical durable boundary.
+    KWindowPermanentWedgeSeal,
+    /// Striped modulo mapping judged by ReferenceLogDrive.
+    StripedModuloMapping,
+    /// Quorum: one replica is not a global write.
+    QuorumPartialWriteNotGlobal,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 3] = [
+    pub const ALL: [&'static str; 7] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
+        "k-window-delayed-completion",
+        "k-window-permanent-wedge-seal",
+        "striped-modulo-mapping",
+        "quorum-partial-write-not-global",
     ];
 
     /// Parses a scenario token.
@@ -113,6 +130,10 @@ impl Scenario {
             "baseline-committed-ack" => Ok(Self::BaselineCommittedAck),
             "root-cas-reply-lost" => Ok(Self::RootCasReplyLost),
             "writer-dies-after-payload" => Ok(Self::WriterDiesAfterPayload),
+            "k-window-delayed-completion" => Ok(Self::KWindowDelayedCompletion),
+            "k-window-permanent-wedge-seal" => Ok(Self::KWindowPermanentWedgeSeal),
+            "striped-modulo-mapping" => Ok(Self::StripedModuloMapping),
+            "quorum-partial-write-not-global" => Ok(Self::QuorumPartialWriteNotGlobal),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -124,7 +145,23 @@ impl Scenario {
             Self::BaselineCommittedAck => "baseline-committed-ack",
             Self::RootCasReplyLost => "root-cas-reply-lost",
             Self::WriterDiesAfterPayload => "writer-dies-after-payload",
+            Self::KWindowDelayedCompletion => "k-window-delayed-completion",
+            Self::KWindowPermanentWedgeSeal => "k-window-permanent-wedge-seal",
+            Self::StripedModuloMapping => "striped-modulo-mapping",
+            Self::QuorumPartialWriteNotGlobal => "quorum-partial-write-not-global",
         }
+    }
+
+    /// Whether this scenario runs through the Holylog composition helpers.
+    #[must_use]
+    pub const fn is_composition(self) -> bool {
+        matches!(
+            self,
+            Self::KWindowDelayedCompletion
+                | Self::KWindowPermanentWedgeSeal
+                | Self::StripedModuloMapping
+                | Self::QuorumPartialWriteNotGlobal
+        )
     }
 }
 
@@ -420,13 +457,13 @@ impl CampaignReport {
         }
     }
 
-    /// Process exit code: 0 Pass, 2 Fail, 3 Inconclusive.
+    /// Process exit code (WP05): 0 Pass, 3 Fail, 4 Inconclusive.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match &self.verdict {
             Verdict::Pass => 0,
-            Verdict::Fail { .. } => 2,
-            Verdict::Inconclusive { .. } => 3,
+            Verdict::Fail { .. } => 3,
+            Verdict::Inconclusive { .. } => 4,
         }
     }
 }
@@ -435,9 +472,7 @@ impl CampaignReport {
 #[derive(Debug, thiserror::Error)]
 pub enum CampaignError {
     /// Unknown scenario token.
-    #[error(
-        "unknown scenario {0:?}; expected baseline-committed-ack|root-cas-reply-lost|writer-dies-after-payload"
-    )]
+    #[error("unknown scenario {0:?}")]
     UnknownScenario(String),
     /// Backend construction failure.
     #[error("backend setup: {0}")]
@@ -458,10 +493,26 @@ pub async fn run_campaign(
 ) -> Result<CampaignReport, CampaignError> {
     let environment = backend.environment(scenario, run_id);
     let backend_label = backend.label();
+    if scenario.is_composition() {
+        let mut report = composition::run_composition(run_id, scenario).await?;
+        // Preserve the suite backend label when composition runs under memory.
+        if matches!(backend, CampaignBackend::InMemory) {
+            report.backend = backend_label;
+        }
+        let _ = environment;
+        return Ok(report);
+    }
+
     let (events, final_root, final_authority) = match scenario {
         Scenario::BaselineCommittedAck => run_baseline(run_id, &backend).await?,
         Scenario::RootCasReplyLost => run_root_cas_reply_lost(run_id, &backend).await?,
         Scenario::WriterDiesAfterPayload => run_wedged_payload(run_id, &backend).await?,
+        Scenario::KWindowDelayedCompletion
+        | Scenario::KWindowPermanentWedgeSeal
+        | Scenario::StripedModuloMapping
+        | Scenario::QuorumPartialWriteNotGlobal => {
+            unreachable!("composition scenarios handled above")
+        }
     };
     let verdict = check_trace(&events);
     Ok(CampaignReport {

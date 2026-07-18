@@ -5,9 +5,9 @@ use crate::Scenario;
 /// Named scenario suites for autonomous campaigns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Suite {
-    /// Core AtomicLog / VirtualLog scenarios (Slice 1 subset).
+    /// Core AtomicLog / VirtualLog / Scripture scenarios.
     Core,
-    /// Composition scenarios (Slice 2 — not yet wired).
+    /// Composition scenarios (striped / quorum / K-window AtomicLog).
     Composition,
     /// Real backend / process resilience (Slice 3; not yet wired).
     Resilience,
@@ -34,12 +34,31 @@ impl Suite {
             Scenario::BaselineCommittedAck,
             Scenario::RootCasReplyLost,
             Scenario::WriterDiesAfterPayload,
+            Scenario::KWindowDelayedCompletion,
+            Scenario::KWindowPermanentWedgeSeal,
+        ];
+        let composition = vec![
+            Scenario::KWindowDelayedCompletion,
+            Scenario::KWindowPermanentWedgeSeal,
+            Scenario::StripedModuloMapping,
+            Scenario::QuorumPartialWriteNotGlobal,
         ];
         match self {
             Self::Core => core,
-            Self::Composition => Vec::new(),
+            Self::Composition => composition,
             Self::Resilience => Vec::new(),
-            Self::All => core,
+            Self::All => {
+                let mut all = core;
+                for scenario in [
+                    Scenario::StripedModuloMapping,
+                    Scenario::QuorumPartialWriteNotGlobal,
+                ] {
+                    if !all.contains(&scenario) {
+                        all.push(scenario);
+                    }
+                }
+                all
+            }
         }
     }
 
@@ -47,10 +66,10 @@ impl Suite {
     #[must_use]
     pub fn schedule_label(self) -> &'static str {
         match self {
-            Self::Core => "core-slice1",
-            Self::Composition => "composition-not-implemented",
+            Self::Core => "core-wp05",
+            Self::Composition => "composition-wp05",
             Self::Resilience => "resilience-not-implemented",
-            Self::All => "all-implemented-slice1",
+            Self::All => "all-implemented-wp05",
         }
     }
 
@@ -74,8 +93,8 @@ mod tests {
     use super::Suite;
 
     #[test]
-    fn unavailable_suites_are_not_reported_as_implemented() {
-        assert!(!Suite::Composition.is_implemented());
+    fn composition_is_implemented_after_wp05_wiring() {
+        assert!(Suite::Composition.is_implemented());
         assert!(!Suite::Resilience.is_implemented());
         assert!(Suite::Core.is_implemented());
         assert!(Suite::All.is_implemented());

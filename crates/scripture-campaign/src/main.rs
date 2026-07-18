@@ -1,10 +1,12 @@
-//! Autonomous Scripture correctness campaign runner (WP04 Slice 1).
+//! Autonomous Scripture correctness campaign runner (WP05).
 
 use std::error::Error;
 use std::path::PathBuf;
 use std::process;
 
-use scripture_campaign::{Profile, RunOptions, Suite, default_topology_path, detect_repo_root};
+use scripture_campaign::{
+    Profile, RunError, RunOptions, Suite, default_topology_path, detect_repo_root,
+};
 
 struct RunArgs {
     profile: String,
@@ -20,8 +22,12 @@ async fn main() {
     let mut arguments = std::env::args().skip(1).peekable();
     if arguments.peek().is_some_and(|arg| arg == "run") {
         arguments.next();
-        if let Err(error) = run_campaign(&mut arguments).await {
-            exit_with_error(error, 4);
+        match run_campaign(&mut arguments).await {
+            Ok(()) => {}
+            Err(error) => {
+                let code = error.exit_code();
+                exit_with_error(error.into(), code);
+            }
         }
         return;
     }
@@ -32,13 +38,14 @@ async fn main() {
 
 async fn run_campaign(
     arguments: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-) -> Result<(), Box<dyn Error>> {
-    let args = parse_run_args(arguments)?;
+) -> Result<(), RunError> {
+    let args = parse_run_args(arguments).map_err(|error| RunError::Backend(error.to_string()))?;
     let repo_root = detect_repo_root();
     let topology = args
         .topology
         .or_else(|| Some(default_topology_path(&repo_root)));
-    let profile = Profile::parse(&args.profile, topology.as_deref())?;
+    let profile = Profile::parse(&args.profile, topology.as_deref())
+        .map_err(|error| RunError::Backend(error.to_string()))?;
     let outcome = RunOptions {
         profile,
         suite: args.suite,
@@ -121,7 +128,7 @@ fn required(
 fn print_run_help() {
     eprintln!(
         "\
-scripture-campaign run — autonomous correctness gauntlet (WP04)
+scripture-campaign run — autonomous correctness gauntlet (WP05)
 
 Usage:
   scripture-campaign run \\
@@ -135,11 +142,11 @@ Usage:
 Default is dry-run preflight only (no cluster writes, no scenarios executed).
 `--execute` runs the selected suite after preflight passes.
 
-Exit codes:
-  0  pass / preflight ok
-  2  checker fail
-  3  inconclusive
-  4  invalid orchestration / preflight failure
+Exit codes (WP05):
+  0  every selected scenario passed (or dry-run preflight ok)
+  2  preflight or required capability missing; no test claim
+  3  a scenario or checker failure
+  4  runner/collection indeterminate; no success claim
 "
     );
 }
