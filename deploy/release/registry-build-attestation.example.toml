@@ -6,6 +6,7 @@
 schema_version = 1
 attestation_kind = "clean-registry-only"
 source_commit = "REPLACE_WITH_CLEAN_COMMIT"
+holylog_source_commit = "REPLACE_WITH_HOLYLOG_RC_COMMIT"
 
 [builder]
 # Must all be true for provenance pass.
@@ -20,8 +21,10 @@ cargo_registries = ["fleet"]
 # scripture-service = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
 # scripture-runtime = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
 # scripture-cli = { version = "0.1.0-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
-# holylog = { version = "0.2.2", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
-# holylog-correctness = { version = "0.1.0", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog = { version = "0.2.3-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog-correctness = { version = "0.1.1-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog-object-store = { version = "0.2.3-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
+# holylog-object-store-register = { version = "0.2.3-rc.1", checksum = "sha256:...", source = "registry+fleet", registry = "fleet" }
 
 [image]
 digest = "sha256:REPLACE"

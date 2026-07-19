@@ -11,7 +11,12 @@ if grep -E 'COPY[[:space:]].*deploy/bin/|COPY[[:space:]].*target/release/scriptu
   echo "release Dockerfile must not copy a host-prebuilt scripture binary" >&2
   exit 1
 fi
-if grep -E 'mount=type=ssh' "$dockerfile" >/dev/null; then
-  echo "note: release Dockerfile still uses BuildKit SSH for Holylog git until Kellnr RC resolution lands" >&2
+if grep -E 'mount=type=ssh|ssh-keyscan|openssh-client|git ' "$dockerfile" >/dev/null; then
+  echo "release Dockerfile must not use SSH/Git source resolution" >&2
+  exit 1
+fi
+if ! grep -E 'mount=type=secret,id=fleet_token' "$dockerfile" >/dev/null; then
+  echo "release Dockerfile must consume the fleet token through a BuildKit secret" >&2
+  exit 1
 fi
 echo "release Dockerfile checks ok"

@@ -12,7 +12,7 @@ publish = ["fleet"]
 virtuallog-test-support = []
 
 [dependencies]
-scripture = { path = "../scripture", version = "0.1.0-rc.1" }
+scripture = { path = "../scripture", version = "0.1.0-rc.1", registry = "fleet" }
 holylog.workspace = true
 thiserror.workspace = true
 blake3.workspace = true

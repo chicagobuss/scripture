@@ -112,6 +112,8 @@ required = (
     "scripture-cli",
     "holylog",
     "holylog-correctness",
+    "holylog-object-store",
+    "holylog-object-store-register",
 )
 for name in required:
     ment = packages.get(name) if name.startswith("scripture") else None
@@ -155,9 +157,27 @@ for name in required:
         fail(f"{name} source must not be git/path (got {source!r})")
 
 holylog = manifest.get("holylog") or {}
-if holylog.get("git_tag") != "v0.2.2":
-    # Tag is historical identity; packages must still resolve from fleet.
-    fail(f"holylog.git_tag must be v0.2.2 (got {holylog.get('git_tag')!r})")
+att_holylog_src = att.get("holylog_source_commit")
+if not isinstance(holylog.get("source_commit"), str) or not holylog["source_commit"]:
+    fail("holylog.source_commit missing")
+if holylog["source_commit"] != att_holylog_src:
+    fail(
+        "holylog source_commit mismatch between rc-manifest and attestation "
+        f"({holylog['source_commit']!r} != {att_holylog_src!r})"
+    )
+
+holylog_versions = {
+    "holylog": "holylog_version",
+    "holylog-correctness": "holylog_correctness_version",
+    "holylog-object-store": "holylog_object_store_version",
+    "holylog-object-store-register": "holylog_object_store_register_version",
+}
+for package, field in holylog_versions.items():
+    if holylog.get(field) != resolved[package].get("version"):
+        fail(
+            f"holylog.{field} must match resolved_packages.{package}.version "
+            f"({holylog.get(field)!r} != {resolved[package].get('version')!r})"
+        )
 
 imports = att.get("node_imports") or {}
 for node in ("node-a", "node-b"):

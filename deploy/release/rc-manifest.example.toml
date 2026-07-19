@@ -13,12 +13,11 @@ clean_tree_required = true
 # scripture-cli = { version = "0.1.0-rc.1", checksum = "sha256:..." }
 
 [holylog]
-git_tag = "v0.2.2"
-# Matches crate versions inside that tag (correctness is still 0.1.0).
-holylog_version = "0.2.2"
-holylog_correctness_version = "0.1.0"
-# Prefer Kellnr when available:
-# holylog = { version = "0.2.2", registry = "fleet", checksum = "sha256:..." }
+source_commit = "REPLACE_WITH_HOLYLOG_RC_COMMIT"
+holylog_version = "0.2.3-rc.1"
+holylog_correctness_version = "0.1.1-rc.1"
+holylog_object_store_version = "0.2.3-rc.1"
+holylog_object_store_register_version = "0.2.3-rc.1"
 
 # Operator-local registry-only build attestation (required for provenance pass):
 # attestation_path is informational; runner defaults to

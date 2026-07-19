@@ -8,5 +8,5 @@
 # Prefer credential-provider / token-file over inline tokens:
 #   registry.global-credential-providers = ["cargo:token"]
 #
-# Until Holylog packages are published to Kellnr, local builds continue to
-# resolve the git tag specified in workspace.dependencies (version+git+registry).
+# Release builds resolve Holylog exclusively from this registry; do not add a
+# Git or path fallback to the release source.

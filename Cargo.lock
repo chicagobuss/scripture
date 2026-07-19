@@ -521,8 +521,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "holylog"
-version = "0.2.2"
-source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.2#9e199376301e5d95ca49da39cbe9f46bc2fd75e7"
+version = "0.2.3-rc.1"
+source = "sparse+http://10.0.0.5:30990/api/v1/crates/"
+checksum = "41745407772dee536d53d3c633d3e7886ea8e988e6264e79ca9492a4c1d7ea67"
 dependencies = [
  "bytes",
  "futures",
@@ -533,8 +534,9 @@ dependencies = [
 
 [[package]]
 name = "holylog-correctness"
-version = "0.1.0"
-source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.2#9e199376301e5d95ca49da39cbe9f46bc2fd75e7"
+version = "0.1.1-rc.1"
+source = "sparse+http://10.0.0.5:30990/api/v1/crates/"
+checksum = "2df5ff32fcb773e3e937167b0ad8ed001e012233e128b0f185007bd32fc52b15"
 dependencies = [
  "bytes",
  "futures",
@@ -547,8 +549,9 @@ dependencies = [
 
 [[package]]
 name = "holylog-object-store"
-version = "0.2.2"
-source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.2#9e199376301e5d95ca49da39cbe9f46bc2fd75e7"
+version = "0.2.3-rc.1"
+source = "sparse+http://10.0.0.5:30990/api/v1/crates/"
+checksum = "518854fd98efe0cabfaf175ac6e079d5067e8b8d12d2fa06845252aceac23a6d"
 dependencies = [
  "bytes",
  "futures",
@@ -559,8 +562,9 @@ dependencies = [
 
 [[package]]
 name = "holylog-object-store-register"
-version = "0.2.2"
-source = "git+ssh://git@github.com/chicagobuss/holylog.git?tag=v0.2.2#9e199376301e5d95ca49da39cbe9f46bc2fd75e7"
+version = "0.2.3-rc.1"
+source = "sparse+http://10.0.0.5:30990/api/v1/crates/"
+checksum = "935d5b6516caa0b06e08a74f6980926e491fcdb3b5f48d7622d3cf09f1d20a91"
 dependencies = [
  "bytes",
  "futures",

@@ -17,19 +17,26 @@ for crate in scripture scripture-service scripture-runtime scripture-cli; do
   fi
 done
 
-# Holylog deps must carry version + fleet registry (git is local resolve only).
-if ! grep -q 'holylog = { version = "0.2.2", registry = "fleet"' Cargo.toml; then
-  echo "holylog must declare version+registry=fleet in workspace.dependencies" >&2
-  failed=1
-fi
-if ! grep -q 'holylog-correctness = { version = "0.1.0", registry = "fleet"' Cargo.toml; then
-  echo "holylog-correctness must declare version+registry=fleet" >&2
+# The release source has no Git fallback: every direct Holylog dependency is
+# an exact package from the private fleet registry.
+for dep in \
+  'holylog = { version = "=0.2.3-rc.1", registry = "fleet" }' \
+  'holylog-correctness = { version = "=0.1.1-rc.1", registry = "fleet" }' \
+  'holylog-object-store = { version = "=0.2.3-rc.1", registry = "fleet" }' \
+  'holylog-object-store-register = { version = "=0.2.3-rc.1", registry = "fleet" }'; do
+  if ! grep -Fq "$dep" Cargo.toml; then
+    echo "missing exact fleet registry dependency: $dep" >&2
+    failed=1
+  fi
+done
+if grep -q 'chicagobuss/holylog\|git = .*holylog\|path = .*holylog' Cargo.toml; then
+  echo "release workspace must not retain a Holylog git/path fallback" >&2
   failed=1
 fi
 
 # Path deps must carry publishable version requirements.
-if ! grep -q 'scripture = { path = "../scripture", version = "0.1.0-rc.1" }' crates/scripture-cli/Cargo.toml; then
-  echo "scripture-cli path dep missing version" >&2
+if ! grep -Fq 'scripture = { path = "../scripture", version = "0.1.0-rc.1", registry = "fleet" }' crates/scripture-cli/Cargo.toml; then
+  echo "scripture-cli path dep must carry version+registry=fleet" >&2
   failed=1
 fi
 
@@ -48,7 +55,7 @@ attempt_package() {
     echo "cargo package -p $crate ok"
     return 0
   fi
-  if grep -qi 'credential-provider\|authenticated registries\|401\|unauthorized' "$log"; then
+  if grep -qi 'credential-provider\|authenticated registries\|no token found\|401\|unauthorized' "$log"; then
     echo "cargo package -p $crate not attested: fleet registry auth required" >&2
     deferred=1
     return 0
