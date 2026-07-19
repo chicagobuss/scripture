@@ -51,6 +51,31 @@ struct ConditionalVersion {
     version: Option<String>,
 }
 
+impl ConditionalVersion {
+    fn non_empty(value: Option<&String>) -> Option<&str> {
+        value
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// True when at least one conditional witness field is present and non-empty.
+    fn has_witness(&self) -> bool {
+        Self::non_empty(self.e_tag.as_ref()).is_some()
+            || Self::non_empty(self.version.as_ref()).is_some()
+    }
+
+    fn require_witness(&self) -> Result<(), ProgressError> {
+        if self.has_witness() {
+            Ok(())
+        } else {
+            Err(ProgressError::Io(
+                "conditional object lacks e_tag and version witness".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConditionalValue {
     bytes: Vec<u8>,
@@ -104,6 +129,7 @@ impl ConditionalObjectRegister for ObjectStoreConditionalObjectRegister {
                 e_tag: result.meta.e_tag.clone(),
                 version: result.meta.version.clone(),
             };
+            version.require_witness()?;
             let bytes = result
                 .bytes()
                 .await
@@ -124,10 +150,13 @@ impl ConditionalObjectRegister for ObjectStoreConditionalObjectRegister {
         Box::pin(async move {
             let mode = match expected {
                 None => PutMode::Create,
-                Some(version) => PutMode::Update(UpdateVersion {
-                    e_tag: version.e_tag.clone(),
-                    version: version.version.clone(),
-                }),
+                Some(version) => {
+                    version.require_witness()?;
+                    PutMode::Update(UpdateVersion {
+                        e_tag: version.e_tag.clone(),
+                        version: version.version.clone(),
+                    })
+                }
             };
             let result = self
                 .store
@@ -138,10 +167,14 @@ impl ConditionalObjectRegister for ObjectStoreConditionalObjectRegister {
                 )
                 .await;
             match result {
-                Ok(put) => Ok(ConditionalSwap::Applied(ConditionalVersion {
-                    e_tag: put.e_tag,
-                    version: put.version,
-                })),
+                Ok(put) => {
+                    let applied = ConditionalVersion {
+                        e_tag: put.e_tag,
+                        version: put.version,
+                    };
+                    applied.require_witness()?;
+                    Ok(ConditionalSwap::Applied(applied))
+                }
                 Err(object_store::Error::AlreadyExists { .. })
                 | Err(object_store::Error::Precondition { .. }) => Ok(ConditionalSwap::Conflict),
                 Err(error) => Ok(ConditionalSwap::Unknown(error.to_string())),
@@ -179,20 +212,26 @@ impl ObjectStoreProgressStore {
 
     /// Maps the durable object-store witness into the opaque [`ProgressVersion`].
     ///
-    /// This is derived from the conditional object's `e_tag`/`version`, never from
-    /// a process-local counter. Lost-reply recovery must re-read the object and
-    /// re-derive this witness; callers must not invent versions.
-    fn progress_version_from_conditional(version: &ConditionalVersion) -> ProgressVersion {
-        let mut data = Vec::with_capacity(64);
-        data.extend_from_slice(b"sprg-v1\0");
-        data.extend_from_slice(version.e_tag.as_deref().unwrap_or("").as_bytes());
-        data.push(0);
-        data.extend_from_slice(version.version.as_deref().unwrap_or("").as_bytes());
-        let digest = blake3::hash(&data);
-        let bytes = digest.as_bytes();
-        ProgressVersion::new(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
+    /// Encodes the exact conditional `e_tag`/`version` pair (length-prefixed),
+    /// never a truncated hash or process-local counter. At least one witness
+    /// field must be present.
+    fn progress_version_from_conditional(
+        version: &ConditionalVersion,
+    ) -> Result<ProgressVersion, ProgressError> {
+        version.require_witness()?;
+        let etag = ConditionalVersion::non_empty(version.e_tag.as_ref()).unwrap_or("");
+        let ver = ConditionalVersion::non_empty(version.version.as_ref()).unwrap_or("");
+        let etag_len = u16::try_from(etag.len())
+            .map_err(|_| ProgressError::Io("conditional e_tag exceeds u16 length".into()))?;
+        let ver_len = u16::try_from(ver.len())
+            .map_err(|_| ProgressError::Io("conditional version exceeds u16 length".into()))?;
+        let mut bytes = Vec::with_capacity(12 + etag.len() + ver.len());
+        bytes.extend_from_slice(b"sprg-wit-v1");
+        bytes.extend_from_slice(&etag_len.to_le_bytes());
+        bytes.extend_from_slice(etag.as_bytes());
+        bytes.extend_from_slice(&ver_len.to_le_bytes());
+        bytes.extend_from_slice(ver.as_bytes());
+        Ok(ProgressVersion::from_opaque_bytes(bytes))
     }
 
     fn register_path_for_key(&self, key: &BindingKey) -> Result<ObjectPath, ProgressError> {
@@ -232,15 +271,18 @@ impl ObjectStoreProgressStore {
         let observed = self.inner.register.read(&path).await?;
         match observed {
             None => Ok(None),
-            Some(value) => Ok(Some((
-                decode_record(
-                    &value.bytes,
-                    key,
-                    MAX_PROGRESS_TOKEN_BYTES,
-                    MAX_PROGRESS_COMMIT_REF_BYTES,
-                )?,
-                value.version,
-            ))),
+            Some(value) => {
+                value.version.require_witness()?;
+                Ok(Some((
+                    decode_record(
+                        &value.bytes,
+                        key,
+                        MAX_PROGRESS_TOKEN_BYTES,
+                        MAX_PROGRESS_COMMIT_REF_BYTES,
+                    )?,
+                    value.version,
+                )))
+            }
         }
     }
 
@@ -361,9 +403,13 @@ impl ConsumerProgressStore for ObjectStoreProgressStore {
         Box::pin(async move {
             let key = BindingKey::new(workload_id.clone(), canon_id.clone(), verse_id.clone());
             let observed = self.read_register_for(&key).await?;
-            Ok(observed.map(|(register, version)| {
-                (register, Self::progress_version_from_conditional(&version))
-            }))
+            match observed {
+                None => Ok(None),
+                Some((register, version)) => Ok(Some((
+                    register,
+                    Self::progress_version_from_conditional(&version)?,
+                ))),
+            }
         })
     }
 
@@ -416,14 +462,14 @@ impl ConsumerProgressStore for ObjectStoreProgressStore {
             {
                 ConditionalSwap::Applied(new_version) => Ok((
                     intended,
-                    Self::progress_version_from_conditional(&new_version),
+                    Self::progress_version_from_conditional(&new_version)?,
                 )),
                 ConditionalSwap::Conflict => Err(ProgressError::CasConflict),
                 ConditionalSwap::Unknown(detail) => {
                     let reread = self.read_register_for(&key).await?;
                     match reread {
                         Some((register, version)) if register == intended => {
-                            Ok((intended, Self::progress_version_from_conditional(&version)))
+                            Ok((intended, Self::progress_version_from_conditional(&version)?))
                         }
                         Some((register, _)) if register == existing => {
                             Err(ProgressError::Indeterminate(format!(
@@ -463,6 +509,7 @@ fn encode_record(
     max_commit_ref_bytes: usize,
 ) -> Result<Vec<u8>, ProgressError> {
     register.binding.validate()?;
+    validate_frontier_commit_coherence(register)?;
     let token = register.binding_token.as_str().as_bytes();
     if token.is_empty() || token.len() > max_token_bytes {
         return Err(ProgressError::MalformedRecord(format!(
@@ -623,12 +670,32 @@ fn decode_record(
         binding_epoch,
     };
     binding.validate()?;
-    Ok(ProgressRegister {
+    let register = ProgressRegister {
         binding,
         binding_token,
         frontier: SourceOffset::new(frontier),
         last_commit_ref,
-    })
+    };
+    validate_frontier_commit_coherence(&register)?;
+    Ok(register)
+}
+
+fn validate_frontier_commit_coherence(register: &ProgressRegister) -> Result<(), ProgressError> {
+    let frontier = register.frontier.get();
+    let has_commit = register
+        .last_commit_ref
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
+    match (frontier, has_commit) {
+        (0, false) => Ok(()),
+        (0, true) => Err(ProgressError::MalformedRecord(
+            "frontier is 0 but last_commit_ref is present".into(),
+        )),
+        (_, true) => Ok(()),
+        (_, false) => Err(ProgressError::MalformedRecord(
+            "frontier > 0 but last_commit_ref is absent".into(),
+        )),
+    }
 }
 
 fn safe_hex_component(
@@ -734,6 +801,9 @@ mod tests {
         ) -> ProgressFuture<'a, Result<ConditionalSwap, ProgressError>> {
             Box::pin(async move {
                 let mut guard = self.inner.lock().expect("lock");
+                if let Some(expected) = expected {
+                    expected.require_witness()?;
+                }
                 let current = guard.objects.get(path.as_ref()).cloned();
                 let matches = match (expected, current.as_ref()) {
                     (None, None) => true,
@@ -907,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_version_tracks_object_store_witness_not_local_counter() {
+    fn progress_version_is_exact_opaque_witness_not_numeric() {
         let fake = Arc::new(FakeConditionalRegister::new());
         let store = store_with_fake(Arc::clone(&fake));
         let token = BindingToken::new("worker-a").expect("token");
@@ -925,7 +995,6 @@ mod tests {
             advance_version, observe_version,
             "observe must re-derive the same durable witness as advance"
         );
-        // Same etag must keep mapping; a new write must change it.
         let (_, second_version) =
             block_on(store.advance(&fence, SourceOffset::new(4), "commit-b".into()))
                 .expect("second advance");
@@ -936,6 +1005,136 @@ mod tests {
                 .expect("present")
                 .1;
         assert_eq!(second_version, reobserve);
+    }
+
+    #[test]
+    fn observed_object_without_witness_fails_closed() {
+        let fake = Arc::new(FakeConditionalRegister::new());
+        let store = store_with_fake(Arc::clone(&fake));
+        let path = store.register_path_for_key(&key()).expect("path");
+        let token = BindingToken::new("tok").expect("token");
+        let register = ProgressRegister {
+            binding: ConsumerBinding {
+                workload_id: key().workload_id.clone(),
+                canon_id: key().canon_id.clone(),
+                verse_id: key().verse_id.clone(),
+                binding_epoch: 1,
+            },
+            binding_token: token,
+            frontier: SourceOffset::new(0),
+            last_commit_ref: None,
+        };
+        let bytes = encode_record(
+            &register,
+            MAX_PROGRESS_TOKEN_BYTES,
+            MAX_PROGRESS_COMMIT_REF_BYTES,
+        )
+        .expect("encode");
+        {
+            let mut guard = fake.inner.lock().expect("lock");
+            guard.objects.insert(
+                path.as_ref().to_owned(),
+                ConditionalValue {
+                    bytes,
+                    version: ConditionalVersion {
+                        e_tag: None,
+                        version: None,
+                    },
+                },
+            );
+        }
+        let err = block_on(store.observe(&key().workload_id, &key().canon_id, &key().verse_id))
+            .expect_err("empty witness must fail closed");
+        assert!(matches!(err, ProgressError::Io(_)));
+    }
+
+    #[test]
+    fn conditional_update_without_witness_fails_closed() {
+        let fake = Arc::new(FakeConditionalRegister::new());
+        let path = ObjectPath::from("unit/register.bin");
+        let empty = ConditionalVersion {
+            e_tag: None,
+            version: None,
+        };
+        {
+            let mut guard = fake.inner.lock().expect("lock");
+            guard.objects.insert(
+                path.as_ref().to_owned(),
+                ConditionalValue {
+                    bytes: vec![1, 2, 3],
+                    version: empty.clone(),
+                },
+            );
+        }
+        let err = block_on(fake.compare_and_swap(&path, Some(&empty), vec![9]))
+            .expect_err("Update with empty witness must fail closed");
+        assert!(matches!(err, ProgressError::Io(_)));
+    }
+
+    #[test]
+    fn decode_rejects_frontier_zero_with_commit_ref() {
+        let register = ProgressRegister {
+            binding: ConsumerBinding {
+                workload_id: WorkloadId::new("w").expect("id"),
+                canon_id: CanonRef::new("c").expect("canon"),
+                verse_id: VerseRef::new("v").expect("verse"),
+                binding_epoch: 1,
+            },
+            binding_token: BindingToken::new("tok").expect("token"),
+            frontier: SourceOffset::new(0),
+            last_commit_ref: Some("commit-x".into()),
+        };
+        let err = encode_record(
+            &register,
+            MAX_PROGRESS_TOKEN_BYTES,
+            MAX_PROGRESS_COMMIT_REF_BYTES,
+        )
+        .expect_err("incoherent encode");
+        assert!(matches!(err, ProgressError::MalformedRecord(_)));
+    }
+
+    #[test]
+    fn decode_rejects_nonzero_frontier_without_commit_ref() {
+        let register = ProgressRegister {
+            binding: ConsumerBinding {
+                workload_id: WorkloadId::new("w").expect("id"),
+                canon_id: CanonRef::new("c").expect("canon"),
+                verse_id: VerseRef::new("v").expect("verse"),
+                binding_epoch: 1,
+            },
+            binding_token: BindingToken::new("tok").expect("token"),
+            frontier: SourceOffset::new(3),
+            last_commit_ref: None,
+        };
+        let err = encode_record(
+            &register,
+            MAX_PROGRESS_TOKEN_BYTES,
+            MAX_PROGRESS_COMMIT_REF_BYTES,
+        )
+        .expect_err("incoherent encode");
+        assert!(matches!(err, ProgressError::MalformedRecord(_)));
+
+        // Also reject on decode of a hand-built coherent-looking header with
+        // frontier>0 and no commit payload (bypass encode validation).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CODEC_MAGIC);
+        bytes.push(CODEC_VERSION);
+        bytes.push(0); // no commit flag
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // epoch
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // frontier
+        let token = b"tok";
+        bytes.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(token);
+        let err = decode_record(
+            &bytes,
+            &key(),
+            MAX_PROGRESS_TOKEN_BYTES,
+            MAX_PROGRESS_COMMIT_REF_BYTES,
+        )
+        .expect_err("incoherent decode");
+        assert!(matches!(err, ProgressError::MalformedRecord(_)));
     }
 
     #[test]

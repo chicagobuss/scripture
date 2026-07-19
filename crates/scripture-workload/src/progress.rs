@@ -16,21 +16,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{CanonRef, SourceOffset, VerseRef, WorkloadId};
 
-/// Opaque compare-and-swap version (etag stand-in for a future register adapter).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProgressVersion(u64);
+/// Opaque durable compare-and-swap witness.
+///
+/// Equality-only: adapters mint this from the exact object-store conditional
+/// witness (or a full digest of that witness). There is no numeric API and no
+/// component accessors — callers must not invent or reinterpret versions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProgressVersion {
+    opaque: std::sync::Arc<[u8]>,
+}
 
 impl ProgressVersion {
-    /// Constructs a version token.
+    /// Mints an opaque equality-only witness from durable bytes.
+    ///
+    /// Adapters and the in-memory proof store use this; product code must treat
+    /// the contents as uninterpreted.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Integer form (test / debug only).
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
+    pub fn from_opaque_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        Self {
+            opaque: std::sync::Arc::from(bytes.as_ref()),
+        }
     }
 }
 
@@ -266,8 +271,7 @@ impl ConsumerProgressStore for InMemoryProgressStore {
                         frontier: SourceOffset::new(0),
                         last_commit_ref: None,
                     };
-                    let version = ProgressVersion::new(guard.next_version);
-                    guard.next_version = guard.next_version.saturating_add(1);
+                    let version = mint_memory_version(&mut guard);
                     guard.records.insert(map_key, (register, version));
                     Ok(AcquiredBinding {
                         binding,
@@ -283,8 +287,7 @@ impl ConsumerProgressStore for InMemoryProgressStore {
                         return Err(ProgressError::StaleBinding);
                     }
                     // Touch version so adapters see a successful renew write.
-                    let new_version = ProgressVersion::new(guard.next_version);
-                    guard.next_version = guard.next_version.saturating_add(1);
+                    let new_version = mint_memory_version(&mut guard);
                     let _ = version;
                     guard
                         .records
@@ -314,8 +317,7 @@ impl ConsumerProgressStore for InMemoryProgressStore {
                         frontier: existing.frontier,
                         last_commit_ref: existing.last_commit_ref,
                     };
-                    let version = ProgressVersion::new(guard.next_version);
-                    guard.next_version = guard.next_version.saturating_add(1);
+                    let version = mint_memory_version(&mut guard);
                     guard.records.insert(map_key, (register, version));
                     Ok(AcquiredBinding {
                         binding,
@@ -389,12 +391,20 @@ impl ConsumerProgressStore for InMemoryProgressStore {
                 frontier: new_frontier,
                 last_commit_ref: Some(last_commit_ref),
             };
-            let version = ProgressVersion::new(guard.next_version);
-            guard.next_version = guard.next_version.saturating_add(1);
-            guard.records.insert(key, (register.clone(), version));
+            let version = mint_memory_version(&mut guard);
+            guard
+                .records
+                .insert(key, (register.clone(), version.clone()));
             Ok((register, version))
         })
     }
+}
+
+fn mint_memory_version(guard: &mut MemoryState) -> ProgressVersion {
+    let n = guard.next_version;
+    guard.next_version = guard.next_version.saturating_add(1);
+    // Opaque proof witness only — not a durable object-store etag.
+    ProgressVersion::from_opaque_bytes(format!("mem-v{n}").into_bytes())
 }
 
 fn key_of(
