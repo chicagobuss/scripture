@@ -857,15 +857,18 @@ live_state_machine() {
   log "LIVE step2: secrets (env-file; no argv literals)"
   create_secrets_safe
 
-  log "LIVE step3: rustfs + bucket"
+  log "LIVE step3: rustfs Service + bucket"
   ctx apply -f "$rendered/rustfs.yaml"
+  # Bucket initialization reaches RustFS through its in-cluster Service.  The
+  # service must exist before the Job starts; the producer and owner-route
+  # Services are harmless until their deployments are applied below.
+  ctx apply -f "$rendered/services.yaml"
   wait_jsonpath "rustfs available" "1" 180 \
     -n "$NAMESPACE" get deploy rustfs -o jsonpath='{.status.availableReplicas}'
   run_bucket_init
 
-  log "LIVE step4: config, services, policies, clients, deployments"
+  log "LIVE step4: config, policies, clients, deployments"
   ctx apply -f "$rendered/configmaps.yaml"
-  ctx apply -f "$rendered/services.yaml"
   ctx apply -f "$rendered/networkpolicies.yaml"
   ctx apply -f "$rendered/clients.yaml"
   ctx apply -f "$rendered/deployments.yaml"
