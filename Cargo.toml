@@ -7,6 +7,7 @@ members = [
     "crates/scripture-cli",
     "crates/scripture-campaign",
     "crates/scripture-workload",
+    "crates/scripture-telemetry-producer",
 ]
 resolver = "3"
 

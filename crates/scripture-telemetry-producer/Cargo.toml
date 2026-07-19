@@ -1,0 +1,23 @@
+[package]
+name = "scripture-telemetry-producer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Experimental fleet telemetry producer: OpenMetrics scrape → OTel-shaped JSON → raw-lines"
+license = "MIT"
+publish = false
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[lints]
+workspace = true
