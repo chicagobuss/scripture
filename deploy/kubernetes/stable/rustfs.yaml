@@ -22,7 +22,10 @@ spec:
         - name: rustfs
           image: REPLACE_RUSTFS_IMAGE
           imagePullPolicy: IfNotPresent
-          args: ["--server-domains", "rustfs"]
+          # This lab uses path-style S3 through the in-cluster Service.
+          # Do not set RUSTFS_SERVER_DOMAINS / --server-domains here: that
+          # enables virtual-host routing and must exactly match the client
+          # Host header (including port).
           ports:
             - name: s3
               containerPort: 9000
