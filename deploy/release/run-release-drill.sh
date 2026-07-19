@@ -653,11 +653,27 @@ oldifs="\$IFS"
 IFS=,
 set -- \$payloads
 IFS="\$oldifs"
-n=0
-for _ in \$payloads; do n=\$((n+1)); done
-for p in "\$@"; do
-  printf '%s\\n' "\$p"
-done | nc -w 30 "\$target" "\$port" | tee /tmp/out || true
+n=\$#
+printf 'target=%s port=%s payload_count=%s\\n' "\$target" "\$port" "\$n"
+if ! nc -z -w 5 "\$target" "\$port"; then
+  echo "tcp_probe=failed" >&2
+  exit 1
+fi
+echo "tcp_probe=connected"
+for p in "\$@"; do printf '%s\\n' "\$p"; done > /tmp/in
+set +e
+nc -w 45 "\$target" "\$port" < /tmp/in > /tmp/out 2> /tmp/nc.err
+nc_rc=\$?
+set -e
+echo "nc_exit=\$nc_rc"
+if [ -s /tmp/nc.err ]; then
+  echo "nc_stderr_begin"
+  cat /tmp/nc.err
+  echo "nc_stderr_end"
+fi
+echo "response_begin"
+cat /tmp/out
+echo "response_end"
 ok=\$(grep -c '^OK ' /tmp/out || true)
 echo "ok_lines=\$ok want=\$n target=\$target"
 if [ "${expect_ok}" = "yes" ]; then
