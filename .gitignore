@@ -9,3 +9,6 @@ Cargo.lock.bak
 /deploy/fleet-exercise/inventory/hosts.env
 /deploy/fleet-exercise/results/*
 !/deploy/fleet-exercise/results/.gitkeep
+/specs/ha/states/
+/specs/ha/*_TTrace_*.bin
+/specs/ha/*_TTrace_*.tla

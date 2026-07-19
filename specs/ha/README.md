@@ -144,3 +144,59 @@ passes, the harness has stopped testing the guard and must be repaired.
 Measured runs (TLC 2.19, 4 workers): network model 7,627,560 distinct states at
 depth 46, no violation; fencing harness 20,977 distinct states at depth 25, no
 violation; mutant violated at 419 distinct states.
+
+## Which substrate carries recovery safety
+
+`ConcurrentRecoveryArbitration.tla` answers the question the other models
+assume away. Both of the earlier modules serialise recovery by construction — a
+single `recoveryCandidate` scalar plus a `phase = Serving` guard — so two
+Scribes never race to publish a successor. That mutual exclusion *is* an
+external consistency engine, so those models establish the authority rule only
+for deployments that already have one.
+
+This module makes both substrates explicit constants: `ExclusiveCandidacy`
+(does an external engine serialise candidate selection?) and
+`RegisterSemantics` (is the durable root a conditional register, or
+last-writer-wins?). Measured, three Scribes:
+
+| Config | Engine | Register | Distinct states | Result |
+|---|---|---|---|---|
+| `Arbitration.cfg` | no | cas | 1,374 | safe |
+| `ArbitrationBoth.cfg` | yes | cas | 1,228 | safe |
+| `ArbitrationLww.cfg` | yes | lww | 99 | `OneAuthorityPerGeneration` violated |
+| `ArbitrationNoEngine.cfg` | no | lww | 107 | `OneAuthorityPerGeneration` violated |
+
+Within this deliberately narrow arbitration model, the conditional register is
+necessary and sufficient; the external engine is not required for safety. This
+checks the optional-substrates authority rule rather than proving the whole
+recovery protocol: an external system may select *who attempts* recovery, and
+the modelled authority safety does not depend on it doing so correctly.
+
+The `yes/lww` counterexample is the load-bearing one. Candidacy is exclusive at
+every instant and the model still admits two writers in one generation: C reads
+the root at version 1, B becomes candidate and publishes generation 1, and C —
+becoming candidate only after B has released it — publishes generation 1 too,
+because last-writer-wins accepts its stale-version write. This is the expired
+lock or slow candidate. The unsafety occurs at the storage layer, after
+arbitration has already happened correctly, which is why no amount of external
+consensus repairs it.
+
+Run them with:
+
+```sh
+for cfg in Arbitration ArbitrationBoth ArbitrationLww ArbitrationNoEngine; do
+  java -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
+    -config "$cfg.cfg" ConcurrentRecoveryArbitration.tla
+done
+```
+
+Note that three Scribes are required. With two, the peer that is not the writer
+is the only possible candidate, no race exists, and all four configurations
+return identical results — a silent no-op experiment.
+
+This module abstracts a recovery publication as one root write. It does not
+model predecessor sealing, checked-tail and successor-boundary conservation,
+object-store durability, real control-plane lease packets, or producer retry
+and outbox behavior. Those properties remain obligations of the companion
+models and runtime evidence; a passing arbitration run must never be cited as
+proof of no-loss cutover by itself.
