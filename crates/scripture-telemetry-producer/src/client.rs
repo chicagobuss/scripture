@@ -106,6 +106,18 @@ impl RawLinesClient {
         self.stream = None;
     }
 
+    /// Retargets to a new `host:port` and drops any live session.
+    pub fn retarget(&mut self, endpoint: impl Into<String>) {
+        self.endpoint = endpoint.into();
+        self.stream = None;
+    }
+
+    /// Current target endpoint.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// Sends one buffered line and awaits a commit ACK.
     ///
     /// On disconnect/timeout before `OK`, returns [`AckStatus::Unacked`] and

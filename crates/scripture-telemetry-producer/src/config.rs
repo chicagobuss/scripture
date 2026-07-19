@@ -37,13 +37,32 @@ pub struct ScrapeSource {
     pub url: String,
 }
 
-/// Per-Verse raw-lines ingress endpoint.
+/// Per-Verse raw-lines ingress endpoint (primary + optional failover list).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngressEndpoint {
     /// Verse identity.
     pub verse: String,
-    /// `host:port` of the serving assignment's raw-lines listener.
+    /// Primary `host:port` of the serving assignment's raw-lines listener.
     pub connect: String,
+    /// Ordered failover endpoints tried after Denied / exhausted Unacked
+    /// (Phase 3 A→B promotion). Empty = single-endpoint resend only.
+    #[serde(default)]
+    pub failover_connects: Vec<String>,
+}
+
+impl IngressEndpoint {
+    /// Primary followed by failovers (deduplicated, order preserved).
+    #[must_use]
+    pub fn connect_chain(&self) -> Vec<String> {
+        let mut chain = Vec::with_capacity(1 + self.failover_connects.len());
+        chain.push(self.connect.clone());
+        for endpoint in &self.failover_connects {
+            if !chain.iter().any(|existing| existing == endpoint) {
+                chain.push(endpoint.clone());
+            }
+        }
+        chain
+    }
 }
 
 /// Scrape loop bounds.
@@ -105,6 +124,41 @@ pub struct ProducerConfig {
     pub connect_timeout: Duration,
     /// Whether to resend unacked records after reconnect (at-least-once).
     pub resend_unacked_on_reconnect: bool,
+    /// After scrape loop stops, how long send tasks may keep draining before
+    /// exiting with pending (honest unacked) rows left in the buffer.
+    #[serde(
+        default = "defaults::drain_deadline",
+        with = "humantime_serde_compat::duration"
+    )]
+    pub drain_deadline: Duration,
+    /// Initial backoff after Denied / Unacked before retry or failover.
+    #[serde(
+        default = "defaults::retry_initial_backoff",
+        with = "humantime_serde_compat::duration"
+    )]
+    pub retry_initial_backoff: Duration,
+    /// Cap for exponential retry backoff.
+    #[serde(
+        default = "defaults::retry_max_backoff",
+        with = "humantime_serde_compat::duration"
+    )]
+    pub retry_max_backoff: Duration,
+}
+
+mod defaults {
+    use std::time::Duration;
+
+    pub(crate) fn drain_deadline() -> Duration {
+        Duration::from_secs(10)
+    }
+
+    pub(crate) fn retry_initial_backoff() -> Duration {
+        Duration::from_millis(50)
+    }
+
+    pub(crate) fn retry_max_backoff() -> Duration {
+        Duration::from_secs(2)
+    }
 }
 
 /// On-disk YAML root (`telemetry_producer:`).
@@ -140,6 +194,7 @@ impl ProducerConfig {
             endpoints: vec![IngressEndpoint {
                 verse: "node-node-a".to_owned(),
                 connect: connect.to_owned(),
+                failover_connects: Vec::new(),
             }],
             scrape: ScrapeConfig {
                 interval: Duration::from_secs(30),
@@ -173,6 +228,9 @@ impl ProducerConfig {
             },
             connect_timeout: Duration::from_secs(3),
             resend_unacked_on_reconnect: true,
+            drain_deadline: defaults::drain_deadline(),
+            retry_initial_backoff: defaults::retry_initial_backoff(),
+            retry_max_backoff: defaults::retry_max_backoff(),
         }
     }
 
@@ -226,6 +284,14 @@ impl ProducerConfig {
                 return Err(ValidateError::DuplicateEndpointVerse(
                     endpoint.verse.clone(),
                 ));
+            }
+            if endpoint.connect.trim().is_empty() {
+                return Err(ValidateError::EmptyConnect(endpoint.verse.clone()));
+            }
+            for failover in &endpoint.failover_connects {
+                if failover.trim().is_empty() {
+                    return Err(ValidateError::EmptyConnect(endpoint.verse.clone()));
+                }
             }
         }
         if self.scrape.max_response_bytes == 0 || self.scrape.max_series_per_scrape == 0 {
@@ -288,6 +354,9 @@ pub enum ValidateError {
     /// Duplicate verse among ingress endpoints.
     #[error("duplicate ingress endpoint verse {0}")]
     DuplicateEndpointVerse(String),
+    /// Empty connect / failover address.
+    #[error("empty connect for verse {0}")]
+    EmptyConnect(String),
     /// Zero resource cap.
     #[error("resource caps must be >= 1")]
     ZeroCap,
@@ -413,6 +482,7 @@ mod tests {
         config.endpoints.push(IngressEndpoint {
             verse: "node-node-a".into(),
             connect: "127.0.0.1:9001".into(),
+            failover_connects: Vec::new(),
         });
         assert!(matches!(
             config.validate(),
