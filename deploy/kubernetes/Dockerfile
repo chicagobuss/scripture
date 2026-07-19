@@ -21,17 +21,18 @@ COPY . .
 # Release binary: no campaign-faults feature.
 RUN --mount=type=secret,id=fleet_token,required=true \
     set -eu; \
-    mkdir -p /root/.cargo; \
+    cargo_home="${CARGO_HOME:-/usr/local/cargo}"; \
+    mkdir -p "$cargo_home"; \
     printf '%s\n' \
       '[registries.fleet]' \
       'index = "sparse+http://10.0.0.5:30990/api/v1/crates/"' \
       '' \
       '[registry]' \
       'global-credential-providers = ["cargo:token"]' \
-      > /root/.cargo/config.toml; \
+      > "$cargo_home/config.toml"; \
     CARGO_REGISTRIES_FLEET_TOKEN="$(cat /run/secrets/fleet_token)" \
       CARGO_BUILD_JOBS=2 cargo build --release -p scripture-cli --locked; \
-    rm -f /root/.cargo/config.toml
+    rm -f "$cargo_home/config.toml"
 
 FROM debian:bookworm-slim
 RUN apt-get update \
