@@ -14,6 +14,7 @@ mod bootstrap;
 mod campaign_faults;
 mod config;
 mod directory_cmd;
+mod doctor;
 mod ha_activate;
 mod promote;
 mod replace;
@@ -116,12 +117,17 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
             directory_cmd::directory(config, canon.as_deref(), verse.as_deref()).await
         }
+        "doctor" => {
+            let (config_path, format) = parse_doctor_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            doctor::doctor(config, format).await
+        }
         "--help" | "-h" | "help" => {
             print_help();
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?} (expected validate|bootstrap|replace|promote|serve)"
+            "unknown command {other:?} (expected validate|bootstrap|replace|promote|serve|directory|doctor)"
         )
         .into()),
     }
@@ -160,6 +166,41 @@ fn parse_directory_args(
         return Err("directory: --canon and --verse must be given together".into());
     }
     Ok((config_path, canon, verse))
+}
+
+/// Parses `doctor --config <path> [--format human|json]`.
+fn parse_doctor_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, doctor::DoctorFormat), Box<dyn Error>> {
+    let mut config_path = None;
+    let mut format = doctor::DoctorFormat::Human;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => {
+                config_path = Some(arguments.next().ok_or("--config requires a path")?);
+            }
+            "--format" => {
+                let value = arguments.next().ok_or("--format requires human|json")?;
+                format = match value.as_str() {
+                    "human" => doctor::DoctorFormat::Human,
+                    "json" => doctor::DoctorFormat::Json,
+                    other => {
+                        return Err(format!(
+                            "doctor: unknown --format {other} (expected human|json)"
+                        )
+                        .into());
+                    }
+                };
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("doctor: unexpected argument {other}").into()),
+        }
+    }
+    let config_path = config_path.ok_or("doctor requires --config")?;
+    Ok((config_path, format))
 }
 
 fn parse_config_only_args(
@@ -326,6 +367,8 @@ Usage:
   scripture promote --config /path/to/scripture.yaml --candidate-term <N>
   scripture promote --config multi.yaml --assignment <ID> --candidate-term <N>
   scripture serve --config /path/to/scripture.yaml
+  scripture directory --config /path/to/scripture.yaml [--canon ID --verse ID]
+  scripture doctor --config /path/to/scripture.yaml [--format human|json]
 validate:  load + validate non-secret YAML; no network; no ownership.
 bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
            long-lived bootstrap-and-serve (one-record VirtualLog root fence).
@@ -338,6 +381,12 @@ promote:   long-lived promote-and-serve under ha.mode: serving-authority.
            promote only; siblings keep posture — standby is a dormant candidate).
 serve:     long-running legacy Canon path; refused under Serving-Authority mode
            (writables cannot cross process exit — use bootstrap/promote).
+directory: list fleet-directory records (decision 0014); optional (canon, verse)
+           ranking. Discovery only — never authority.
+doctor:    durability/availability capability report for the four failure
+           boundaries (Canon history, producer continuity, Scribe availability,
+           failure-domain durability). Availability is observed heartbeats from
+           the fleet directory, not a replica count.
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority

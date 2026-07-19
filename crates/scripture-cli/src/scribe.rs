@@ -563,11 +563,42 @@ async fn run_multi_ingress(
         });
     }
 
-    spawn_directory_heartbeat(&config, Arc::clone(&supervisor), store);
+    spawn_directory_heartbeat(&config, Arc::clone(&supervisor), Arc::clone(&store));
 
-    // Keep the process alive; dispositions remain as activated (no auto-promote).
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    // Graceful stop withdraws the directory record immediately. Expiry remains
+    // the fallback for crashes; a withdraw failure must not block shutdown.
+    wait_for_shutdown_signal().await;
+    alive.store(false, Ordering::Relaxed);
+    if let Err(error) =
+        scripture_runtime::directory::withdraw(&store, &config.store.prefix, &config.node.owner_id)
+            .await
+    {
+        eprintln!("scripture: directory withdraw failed (expiry remains fallback): {error}");
+    }
+    Ok(())
+}
+
+/// SIGINT / SIGTERM. Kept local so the multi-assignment path can withdraw
+/// before the process exits without pulling signal plumbing into the runtime.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

@@ -16,7 +16,7 @@ doc = false
 [features]
 default = []
 # Test-only Holylog fault/trace bridge for correctness-campaign actor images.
-campaign-faults = ["dep:holylog-correctness", "dep:serde_json", "dep:bytes", "scripture-service/virtuallog-test-support"]
+campaign-faults = ["dep:holylog-correctness", "dep:bytes", "scripture-service/virtuallog-test-support"]
 
 [dependencies]
 bytes = { workspace = true, optional = true }
@@ -30,7 +30,7 @@ scripture = { path = "../scripture" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service" }
 serde.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
