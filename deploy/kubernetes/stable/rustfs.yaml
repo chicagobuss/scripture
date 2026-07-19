@@ -31,8 +31,8 @@ spec:
               containerPort: 9000
           env:
             # Keep this disposable lab store aligned with the RustFS profile
-            # exercised by the correctness campaign.  It is intentionally
-            # separate from Tracker storage and never a production claim.
+            # exercised by the correctness campaign. It is a dedicated
+            # ephemeral lab store, never a production claim.
             - name: RUSTFS_VOLUMES
               value: /data/rustfs0
             - name: RUSTFS_ADDRESS
