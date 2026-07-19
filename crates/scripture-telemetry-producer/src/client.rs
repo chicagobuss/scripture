@@ -31,6 +31,8 @@ pub struct SendLogEntry {
     pub producer_id: String,
     /// Verse lane.
     pub verse: String,
+    /// Restart incarnation (128-bit hex).
+    pub incarnation: String,
     /// Envelope seq.
     pub seq: u64,
     /// Payload digest.
@@ -176,6 +178,7 @@ pub fn send_log_entry(
     SendLogEntry {
         producer_id: producer_id.to_owned(),
         verse: line.verse.clone(),
+        incarnation: line.incarnation.clone(),
         seq: line.seq,
         payload_digest: line.payload_digest.clone(),
         ack_status,

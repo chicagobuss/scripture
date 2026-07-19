@@ -197,7 +197,10 @@ impl ProducerConfig {
             if source.url.contains('*') || source.url.contains('{') {
                 return Err(ValidateError::WildcardUrl(source.url.clone()));
             }
-            if !(source.url.starts_with("http://") || source.url.starts_with("https://")) {
+            if source.url.starts_with("https://") {
+                return Err(ValidateError::TlsNotSupported(source.url.clone()));
+            }
+            if !source.url.starts_with("http://") {
                 return Err(ValidateError::BadUrl(source.url.clone()));
             }
             if !self
@@ -206,6 +209,23 @@ impl ProducerConfig {
                 .any(|endpoint| endpoint.verse == source.verse)
             {
                 return Err(ValidateError::MissingEndpoint(source.verse.clone()));
+            }
+        }
+        let mut source_verses = BTreeSet::new();
+        for source in &self.scrape.sources {
+            if !source_verses.insert(source.verse.clone()) {
+                return Err(ValidateError::DuplicateSourceVerse(source.verse.clone()));
+            }
+        }
+        let mut endpoint_verses = BTreeSet::new();
+        for endpoint in &self.endpoints {
+            if endpoint.verse.trim().is_empty() {
+                return Err(ValidateError::EmptyVerse);
+            }
+            if !endpoint_verses.insert(endpoint.verse.clone()) {
+                return Err(ValidateError::DuplicateEndpointVerse(
+                    endpoint.verse.clone(),
+                ));
             }
         }
         if self.scrape.max_response_bytes == 0 || self.scrape.max_series_per_scrape == 0 {
@@ -254,11 +274,20 @@ pub enum ValidateError {
     #[error("wildcard/templated scrape URL rejected: {0}")]
     WildcardUrl(String),
     /// Non-http URL.
-    #[error("scrape URL must be http(s): {0}")]
+    #[error("scrape URL must be http:// (plain HTTP): {0}")]
     BadUrl(String),
+    /// TLS not implemented in v1 (in-cluster targets are plain HTTP).
+    #[error("TLS not supported in v1 (use http://): {0}")]
+    TlsNotSupported(String),
     /// Source verse has no ingress endpoint.
     #[error("no ingress endpoint for verse {0}")]
     MissingEndpoint(String),
+    /// Duplicate verse among scrape sources.
+    #[error("duplicate scrape source verse {0}")]
+    DuplicateSourceVerse(String),
+    /// Duplicate verse among ingress endpoints.
+    #[error("duplicate ingress endpoint verse {0}")]
+    DuplicateEndpointVerse(String),
     /// Zero resource cap.
     #[error("resource caps must be >= 1")]
     ZeroCap,
@@ -339,6 +368,55 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ValidateError::WildcardUrl(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_https_url() {
+        let mut config = ProducerConfig::phase1_single_source(
+            "fleet-collector-0",
+            "http://x/metrics",
+            "127.0.0.1:9000",
+        );
+        config.scrape.sources[0].url = "https://x/metrics".into();
+        assert!(matches!(
+            config.validate(),
+            Err(ValidateError::TlsNotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_source_verse() {
+        let mut config = ProducerConfig::phase1_single_source(
+            "fleet-collector-0",
+            "http://x/metrics",
+            "127.0.0.1:9000",
+        );
+        config.scrape.sources.push(ScrapeSource {
+            verse: "node-node-a".into(),
+            kind: SourceKind::NodeExporter,
+            url: "http://y/metrics".into(),
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(ValidateError::DuplicateSourceVerse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_endpoint_verse() {
+        let mut config = ProducerConfig::phase1_single_source(
+            "fleet-collector-0",
+            "http://x/metrics",
+            "127.0.0.1:9000",
+        );
+        config.endpoints.push(IngressEndpoint {
+            verse: "node-node-a".into(),
+            connect: "127.0.0.1:9001".into(),
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(ValidateError::DuplicateEndpointVerse(_))
         ));
     }
 
