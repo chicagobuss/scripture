@@ -457,15 +457,32 @@ wait_jsonpath() {
 }
 
 producer_endpoints_owners() {
-  # Prints owner labels of pods backing scripture-producer Endpoints/EndpointSlice.
-  local slices
-  slices="$(ctx -n "$NAMESPACE" get endpointslices -l kubernetes.io/service-name=scripture-producer \
-    -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\n"}{end}' 2>/dev/null || true)"
-  if [[ -z "$slices" ]]; then
-    slices="$(ctx -n "$NAMESPACE" get endpoints scripture-producer \
-      -o jsonpath='{range .subsets[*].addresses[*]}{.targetRef.name}{"\n"}{end}' 2>/dev/null || true)"
+  # Prints owner labels of *ready* Pods backing scripture-producer. Endpoint
+  # Slices retain not-ready targets for observability, so targetRef alone is
+  # not evidence that the producer Service can route to that Pod.
+  local slices pod owner
+  if slices="$(ctx -n "$NAMESPACE" get endpointslices \
+      -l kubernetes.io/service-name=scripture-producer -o json 2>/dev/null)"; then
+    printf '%s' "$slices" | python3 -c '
+import json, sys
+for item in json.load(sys.stdin).get("items", []):
+    for endpoint in item.get("endpoints", []):
+        if endpoint.get("conditions", {}).get("ready") is True:
+            ref = endpoint.get("targetRef") or {}
+            if ref.get("kind") == "Pod" and ref.get("name"):
+                print(ref["name"])
+' \
+      | while IFS= read -r pod; do
+          owner="$(ctx -n "$NAMESPACE" get pod "$pod" -o jsonpath='{.metadata.labels.scripture\.dev/owner}' 2>/dev/null || true)"
+          printf '%s\n' "${owner:-unknown}"
+        done
+    return
   fi
-  local pod owner
+
+  # Older clusters without EndpointSlice support expose only ready addresses
+  # in the legacy Endpoints subsets.
+  slices="$(ctx -n "$NAMESPACE" get endpoints scripture-producer \
+    -o jsonpath='{range .subsets[*].addresses[*]}{.targetRef.name}{"\n"}{end}' 2>/dev/null || true)"
   for pod in $slices; do
     [[ -z "$pod" ]] && continue
     owner="$(ctx -n "$NAMESPACE" get pod "$pod" -o jsonpath='{.metadata.labels.scripture\.dev/owner}' 2>/dev/null || true)"
