@@ -9,7 +9,6 @@
 //! conformance externally.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use holylog_object_store_register::{ConditionalWrite, ReadConsistency, RegisterCapabilities};
 use object_store::path::Path as ObjectPath;
@@ -154,7 +153,6 @@ impl ConditionalObjectRegister for ObjectStoreConditionalObjectRegister {
 struct ObjectStoreProgressInner {
     register: Arc<dyn ConditionalObjectRegister>,
     root: ObjectPath,
-    version_counter: AtomicU64,
 }
 
 /// Object-store implementation of [`ConsumerProgressStore`].
@@ -175,13 +173,26 @@ impl ObjectStoreProgressStore {
             inner: Arc::new(ObjectStoreProgressInner {
                 register: Arc::new(ObjectStoreConditionalObjectRegister::new(store)),
                 root,
-                version_counter: AtomicU64::new(1),
             }),
         })
     }
 
-    fn next_progress_version(&self) -> ProgressVersion {
-        ProgressVersion::new(self.inner.version_counter.fetch_add(1, Ordering::Relaxed))
+    /// Maps the durable object-store witness into the opaque [`ProgressVersion`].
+    ///
+    /// This is derived from the conditional object's `e_tag`/`version`, never from
+    /// a process-local counter. Lost-reply recovery must re-read the object and
+    /// re-derive this witness; callers must not invent versions.
+    fn progress_version_from_conditional(version: &ConditionalVersion) -> ProgressVersion {
+        let mut data = Vec::with_capacity(64);
+        data.extend_from_slice(b"sprg-v1\0");
+        data.extend_from_slice(version.e_tag.as_deref().unwrap_or("").as_bytes());
+        data.push(0);
+        data.extend_from_slice(version.version.as_deref().unwrap_or("").as_bytes());
+        let digest = blake3::hash(&data);
+        let bytes = digest.as_bytes();
+        ProgressVersion::new(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn register_path_for_key(&self, key: &BindingKey) -> Result<ObjectPath, ProgressError> {
@@ -245,11 +256,7 @@ impl ObjectStoreProgressStore {
     #[cfg(test)]
     fn with_test_register(register: Arc<dyn ConditionalObjectRegister>, root: ObjectPath) -> Self {
         Self {
-            inner: Arc::new(ObjectStoreProgressInner {
-                register,
-                root,
-                version_counter: AtomicU64::new(1),
-            }),
+            inner: Arc::new(ObjectStoreProgressInner { register, root }),
         }
     }
 }
@@ -354,7 +361,9 @@ impl ConsumerProgressStore for ObjectStoreProgressStore {
         Box::pin(async move {
             let key = BindingKey::new(workload_id.clone(), canon_id.clone(), verse_id.clone());
             let observed = self.read_register_for(&key).await?;
-            Ok(observed.map(|(register, _)| (register, self.next_progress_version())))
+            Ok(observed.map(|(register, version)| {
+                (register, Self::progress_version_from_conditional(&version))
+            }))
         })
     }
 
@@ -405,15 +414,16 @@ impl ConsumerProgressStore for ObjectStoreProgressStore {
                 .compare_and_swap(&path, Some(&expected_version), encoded)
                 .await?
             {
-                ConditionalSwap::Applied(_new_version) => {
-                    Ok((intended, self.next_progress_version()))
-                }
+                ConditionalSwap::Applied(new_version) => Ok((
+                    intended,
+                    Self::progress_version_from_conditional(&new_version),
+                )),
                 ConditionalSwap::Conflict => Err(ProgressError::CasConflict),
                 ConditionalSwap::Unknown(detail) => {
                     let reread = self.read_register_for(&key).await?;
                     match reread {
-                        Some((register, _)) if register == intended => {
-                            Ok((intended, self.next_progress_version()))
+                        Some((register, version)) if register == intended => {
+                            Ok((intended, Self::progress_version_from_conditional(&version)))
                         }
                         Some((register, _)) if register == existing => {
                             Err(ProgressError::Indeterminate(format!(
@@ -875,6 +885,57 @@ mod tests {
                 .expect("reread resolves");
         assert_eq!(register.frontier, SourceOffset::new(3));
         assert_eq!(register.last_commit_ref.as_deref(), Some("commit-a"));
+    }
+
+    #[test]
+    fn lost_reply_before_write_is_indeterminate_and_does_not_mutate() {
+        let fake = Arc::new(FakeConditionalRegister::new());
+        let store = store_with_fake(Arc::clone(&fake));
+        let token = BindingToken::new("worker-a").expect("token");
+        let fence = block_on(store.acquire_or_renew(key(), &token)).expect("acquire");
+        fake.arm_fault(FaultMode::UnknownBeforeWrite);
+        let err = block_on(store.advance(&fence, SourceOffset::new(3), "commit-a".into()))
+            .expect_err("lost reply before write");
+        assert!(matches!(err, ProgressError::Indeterminate(_)));
+        let observed =
+            block_on(store.observe(&key().workload_id, &key().canon_id, &key().verse_id))
+                .expect("observe")
+                .expect("present")
+                .0;
+        assert_eq!(observed.frontier, SourceOffset::new(0));
+        assert!(observed.last_commit_ref.is_none());
+    }
+
+    #[test]
+    fn progress_version_tracks_object_store_witness_not_local_counter() {
+        let fake = Arc::new(FakeConditionalRegister::new());
+        let store = store_with_fake(Arc::clone(&fake));
+        let token = BindingToken::new("worker-a").expect("token");
+        let fence = block_on(store.acquire_or_renew(key(), &token)).expect("acquire");
+        let (register, advance_version) =
+            block_on(store.advance(&fence, SourceOffset::new(3), "commit-a".into()))
+                .expect("advance");
+        assert_eq!(register.frontier, SourceOffset::new(3));
+        let (observed, observe_version) =
+            block_on(store.observe(&key().workload_id, &key().canon_id, &key().verse_id))
+                .expect("observe")
+                .expect("present");
+        assert_eq!(observed, register);
+        assert_eq!(
+            advance_version, observe_version,
+            "observe must re-derive the same durable witness as advance"
+        );
+        // Same etag must keep mapping; a new write must change it.
+        let (_, second_version) =
+            block_on(store.advance(&fence, SourceOffset::new(4), "commit-b".into()))
+                .expect("second advance");
+        assert_ne!(advance_version, second_version);
+        let reobserve =
+            block_on(store.observe(&key().workload_id, &key().canon_id, &key().verse_id))
+                .expect("reobserve")
+                .expect("present")
+                .1;
+        assert_eq!(second_version, reobserve);
     }
 
     #[test]
