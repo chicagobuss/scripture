@@ -27,7 +27,7 @@ pub use envelope::{
     EnvelopeContext, MetricEnvelope, MetricPoint, OtelBody, SCHEMA_REF, SeqAllocator,
     format_rfc3339_utc, random_incarnation_hex, unix_nanos_now,
 };
-pub use ledger::{LedgerAuthorityRow, LedgerSendRow, SendLedger, SinkCommitRow, promotion_message};
+pub use ledger::{LedgerFailoverRow, LedgerSendRow, SendLedger, SinkCommitRow, failover_message};
 pub use normalize::{NormalizeCounters, NormalizedBatch, normalize_samples};
 pub use pipeline::{
     DedupResult, PrepareCounters, PreparedRecord, dedup_committed_lines, enqueue, prepare_scrape,

@@ -8,10 +8,18 @@ use tokio::io::AsyncWriteExt;
 
 use crate::client::AckStatus;
 
-/// Builds a greppable per-Verse promotion message (WP §13).
+/// Builds a greppable producer-side failover observation (not a promotion claim).
+///
+/// WP §13 *promotion* with authority scope belongs to the orchestrator / Scribe
+/// fence; this string only records that *this client* advanced its connect chain.
 #[must_use]
-pub fn promotion_message(verse: &str, from_endpoint: &str, to_endpoint: &str) -> String {
-    format!("Verse `{verse}` promoted {from_endpoint}→{to_endpoint}")
+pub fn failover_message(
+    verse: &str,
+    from_endpoint: &str,
+    to_endpoint: &str,
+    reason: &str,
+) -> String {
+    format!("Verse `{verse}` failover {from_endpoint}→{to_endpoint} ({reason})")
 }
 
 /// One send-attempt row.
@@ -77,39 +85,43 @@ impl LedgerSendRow {
     }
 }
 
-/// Per-Verse authority / promotion event (WP §13 scope).
+/// Producer-side failover observation (not Serving Authority / promotion).
+///
+/// Written when this client advances its configured connect chain after
+/// Denied or exhausted Unacked. Correlates with an orchestrator/Scribe
+/// promotion event; it does not *witness* one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LedgerAuthorityRow {
-    /// Discriminator (`authority`).
+pub struct LedgerFailoverRow {
+    /// Discriminator (`failover`).
     pub row_type: String,
-    /// Verse whose serving endpoint changed.
+    /// Verse whose client connection advanced.
     pub verse: String,
-    /// Previous serving endpoint.
+    /// Previous connect target.
     pub from_endpoint: String,
-    /// New serving endpoint.
+    /// New connect target.
     pub to_endpoint: String,
     /// Why the producer advanced (`denied`, `unacked_exhausted`, …).
     pub reason: String,
-    /// Greppable message: `Verse \`name\` promoted A→B`.
+    /// Greppable message: `Verse \`name\` failover A→B (denied)`.
     pub message: String,
 }
 
-impl LedgerAuthorityRow {
-    /// Builds a promotion row with the required per-Verse message shape.
+impl LedgerFailoverRow {
+    /// Builds a failover observation row.
     #[must_use]
-    pub fn verse_promoted(
+    pub fn verse_failover(
         verse: &str,
         from_endpoint: &str,
         to_endpoint: &str,
         reason: &str,
     ) -> Self {
         Self {
-            row_type: "authority".to_owned(),
+            row_type: "failover".to_owned(),
             verse: verse.to_owned(),
             from_endpoint: from_endpoint.to_owned(),
             to_endpoint: to_endpoint.to_owned(),
             reason: reason.to_owned(),
-            message: promotion_message(verse, from_endpoint, to_endpoint),
+            message: failover_message(verse, from_endpoint, to_endpoint, reason),
         }
     }
 }
@@ -141,11 +153,8 @@ impl SendLedger {
         self.append_json(row).await
     }
 
-    /// Appends one authority / promotion row and flushes.
-    pub async fn append_authority(
-        &mut self,
-        row: &LedgerAuthorityRow,
-    ) -> Result<(), std::io::Error> {
+    /// Appends one producer-side failover observation and flushes.
+    pub async fn append_failover(&mut self, row: &LedgerFailoverRow) -> Result<(), std::io::Error> {
         self.append_json(row).await
     }
 
