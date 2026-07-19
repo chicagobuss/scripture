@@ -157,6 +157,15 @@ pub struct RetryPolicy {
     pub ack_timeout: Duration,
     /// Backoff after a Transitioning (recovery-gap) refusal.
     pub transitioning_backoff: Duration,
+    /// Backoff after a connect/transport failure.
+    ///
+    /// Without this an attempt budget is not a time budget: a refused
+    /// connection returns instantly, so every attempt is consumed in
+    /// milliseconds and the send fails long before a promoted peer can open
+    /// its listener. Observed live — during the ~15s window where a killed
+    /// Scribe and a not-yet-promoted peer both refused, 152 records exhausted
+    /// 60 attempts each and never saw the recovered writer.
+    pub transport_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -166,6 +175,7 @@ impl Default for RetryPolicy {
             connect_timeout: Duration::from_secs(2),
             ack_timeout: Duration::from_secs(5),
             transitioning_backoff: Duration::from_millis(50),
+            transport_backoff: Duration::from_millis(50),
         }
     }
 }
@@ -438,6 +448,14 @@ impl<S: RouteSource> RoutingProducer<S> {
         }
 
         let mut last_failure = String::from("no attempt completed");
+        // Endpoints already tried during *this* send. Refreshing the directory
+        // is not enough on its own: a Scribe that has just died stays `fresh`
+        // in the roster for a full TTL and keeps ranking first, so re-ranking
+        // returns the same dead endpoint and the send burns every attempt on
+        // it without ever reaching a live peer. Observed live — a SIGKILL of
+        // the serving Scribe cost 176 records to exhaustion against the dead
+        // endpoint while a promoted peer was serving.
+        let mut tried: Vec<String> = Vec::new();
         for attempt in 1..=self.policy.max_attempts {
             if self.route.candidates.is_empty() {
                 last_failure = format!(
@@ -447,10 +465,28 @@ impl<S: RouteSource> RoutingProducer<S> {
                 let _ = self.refresh_route().await;
                 continue;
             }
-            if self.next_candidate >= self.route.candidates.len() {
-                self.next_candidate = 0;
+            // Prefer the best-ranked candidate not yet tried. When every
+            // candidate has failed, clear the set and start over: by then the
+            // roster has had time to change and the top choice is worth
+            // another look.
+            if self
+                .route
+                .candidates
+                .iter()
+                .all(|c| tried.contains(&c.endpoint))
+            {
+                tried.clear();
             }
+            self.next_candidate = self
+                .route
+                .candidates
+                .iter()
+                .position(|c| !tried.contains(&c.endpoint))
+                .unwrap_or(0);
             let endpoint = self.route.candidates[self.next_candidate].endpoint.clone();
+            if !tried.contains(&endpoint) {
+                tried.push(endpoint.clone());
+            }
 
             match self.exchange_once(&endpoint, &record.payload).await {
                 Ok((first_offset, next_offset)) => {
@@ -470,8 +506,11 @@ impl<S: RouteSource> RoutingProducer<S> {
                         | AttemptFailure::Other { .. } => {
                             // Directory may have a better candidate after a
                             // promote or peer death; HA ingress gives no hint.
+                            // `tried` decides which candidate comes next, so
+                            // a refresh that returns the same stale ranking
+                            // cannot pin this send to a dead endpoint.
                             let _ = self.refresh_route().await;
-                            self.next_candidate = 0;
+                            sleep(self.policy.transport_backoff).await;
                         }
                         AttemptFailure::Transitioning { .. } => {
                             // Recovery gap is transient; back off and retry
@@ -621,6 +660,7 @@ mod tests {
             connect_timeout: Duration::from_millis(200),
             ack_timeout: Duration::from_millis(500),
             transitioning_backoff: Duration::from_millis(5),
+            transport_backoff: Duration::from_millis(1),
         }
     }
 
@@ -961,6 +1001,46 @@ mod tests {
             seen[0], seen[1],
             "retry must preserve the same record bytes/identity"
         );
+    }
+
+    /// A stale roster must not pin a send to a dead endpoint.
+    ///
+    /// This is the live failure the scripted-refresh tests could not reach: a
+    /// Scribe killed mid-load stays `fresh` in the directory for a full TTL and
+    /// keeps ranking first, so every refresh returns the *same* dead endpoint
+    /// at the top. A send that trusts the ranking alone burns its whole attempt
+    /// budget on a corpse while a promoted peer is serving. Observed cost:
+    /// 176 records lost to exhaustion in a SIGKILL drill.
+    #[tokio::test]
+    async fn stale_top_ranked_dead_endpoint_does_not_starve_a_live_peer() {
+        // Dead endpoint: bind then drop, so connections are refused.
+        let (dead_listener, dead_endpoint) = bind_local().await;
+        drop(dead_listener);
+        let (live_listener, live_endpoint) = bind_local().await;
+        let handle =
+            spawn_scripted_ingress(live_listener, vec![IngressStep::Ok { first: 7, next: 8 }])
+                .await;
+
+        // Every resolve returns the dead endpoint ranked FIRST, exactly as a
+        // directory does inside the TTL after an ungraceful death.
+        let stale = || route_with(&[dead_endpoint.as_str(), live_endpoint.as_str()]);
+        let source = ScriptedSource::new(vec![stale(), stale(), stale(), stale(), stale()]);
+
+        let mut producer =
+            RoutingProducer::open_with_source(source, "canon-a", "verse-a", policy_fast())
+                .await
+                .expect("open");
+
+        let record = OutboundRecord::new(b"survives-stale-roster".to_vec());
+        let ack = producer
+            .send(&record)
+            .await
+            .expect("must reach the live peer despite the stale ranking");
+        assert_eq!(ack.endpoint, live_endpoint);
+        assert_eq!((ack.first_offset, ack.next_offset), (7, 8));
+
+        let seen = handle.await.expect("join");
+        assert_eq!(seen, vec![b"survives-stale-roster".to_vec()]);
     }
 
     #[tokio::test]

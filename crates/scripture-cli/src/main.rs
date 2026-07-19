@@ -16,6 +16,7 @@ mod config;
 mod directory_cmd;
 mod doctor;
 mod ha_activate;
+mod produce_lab;
 mod promote;
 mod replace;
 mod scribe;
@@ -122,6 +123,11 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
             doctor::doctor(config, format).await
         }
+        "produce-lab" => {
+            let (config_path, options) = parse_produce_lab_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            produce_lab::produce_lab(config, options).await
+        }
         "--help" | "-h" | "help" => {
             print_help();
             Ok(())
@@ -131,6 +137,48 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+/// Parses `produce-lab --config <p> --canon <c> --verse <v> [--workers N]
+/// [--per-worker N] [--payload-bytes N]`.
+fn parse_produce_lab_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, produce_lab::LabOptions), Box<dyn Error>> {
+    let mut config_path = None;
+    let (mut canon, mut verse) = (None, None);
+    let (mut workers, mut per_worker, mut payload_bytes) = (3usize, 200u64, 64usize);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => config_path = Some(arguments.next().ok_or("--config requires a path")?),
+            "--canon" => canon = Some(arguments.next().ok_or("--canon requires an id")?),
+            "--verse" => verse = Some(arguments.next().ok_or("--verse requires an id")?),
+            "--workers" => workers = arguments.next().ok_or("--workers requires N")?.parse()?,
+            "--per-worker" => {
+                per_worker = arguments.next().ok_or("--per-worker requires N")?.parse()?;
+            }
+            "--payload-bytes" => {
+                payload_bytes = arguments
+                    .next()
+                    .ok_or("--payload-bytes requires N")?
+                    .parse()?;
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("produce-lab: unexpected argument {other}").into()),
+        }
+    }
+    Ok((
+        config_path.ok_or("produce-lab requires --config")?,
+        produce_lab::LabOptions {
+            canon: canon.ok_or("produce-lab requires --canon")?,
+            verse: verse.ok_or("produce-lab requires --verse")?,
+            workers,
+            per_worker,
+            payload_bytes,
+        },
+    ))
 }
 
 /// Config path plus the optional `(canon, verse)` filter for `directory`.
