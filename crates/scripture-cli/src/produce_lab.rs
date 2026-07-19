@@ -45,7 +45,6 @@ pub struct LabOptions {
     pub payload_bytes: usize,
 }
 
-
 /// Object-store request counts scraped from a Scribe's `/status`.
 ///
 /// Read before and after a run so the report states requests *per record*

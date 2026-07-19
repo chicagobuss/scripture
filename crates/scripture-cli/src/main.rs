@@ -13,6 +13,7 @@ mod bootstrap;
 #[cfg(feature = "campaign-faults")]
 mod campaign_faults;
 mod config;
+mod consume_lab;
 mod directory_cmd;
 mod doctor;
 mod ha_activate;
@@ -128,6 +129,11 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
             produce_lab::produce_lab(config, options).await
         }
+        "consume-lab" => {
+            let (config_path, options) = parse_consume_lab_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            consume_lab::consume_lab(config, options).await
+        }
         "--help" | "-h" | "help" => {
             print_help();
             Ok(())
@@ -177,6 +183,44 @@ fn parse_produce_lab_args(
             workers,
             per_worker,
             payload_bytes,
+        },
+    ))
+}
+
+/// Parses `consume-lab --config <p> --canon <c> --verse <v> [--seconds N]
+/// [--until-records N]`.
+fn parse_consume_lab_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, consume_lab::ConsumeOptions), Box<dyn Error>> {
+    let mut config_path = None;
+    let (mut canon, mut verse) = (None, None);
+    let (mut seconds, mut until_records) = (60u64, 0u64);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => config_path = Some(arguments.next().ok_or("--config requires a path")?),
+            "--canon" => canon = Some(arguments.next().ok_or("--canon requires an id")?),
+            "--verse" => verse = Some(arguments.next().ok_or("--verse requires an id")?),
+            "--seconds" => seconds = arguments.next().ok_or("--seconds requires N")?.parse()?,
+            "--until-records" => {
+                until_records = arguments
+                    .next()
+                    .ok_or("--until-records requires N")?
+                    .parse()?;
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("consume-lab: unexpected argument {other}").into()),
+        }
+    }
+    Ok((
+        config_path.ok_or("consume-lab requires --config")?,
+        consume_lab::ConsumeOptions {
+            canon: canon.ok_or("consume-lab requires --canon")?,
+            verse: verse.ok_or("consume-lab requires --verse")?,
+            seconds,
+            until_records,
         },
     ))
 }
