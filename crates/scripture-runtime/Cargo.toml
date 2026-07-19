@@ -8,6 +8,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 getrandom.workspace = true

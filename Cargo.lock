@@ -2003,6 +2003,7 @@ dependencies = [
 name = "scripture-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "getrandom 0.3.4",

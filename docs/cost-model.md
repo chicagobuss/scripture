@@ -131,30 +131,51 @@ bound, not bandwidth bound. At `R ≈ 3` and ~240 records/second the writer is
 completing roughly 80 durable batches/second, which is the depth-one bound this
 document already states — `K`-window pipelining remains unimplemented.
 
-### The counters are incomplete, and the gap is the interesting part
+### Complete ledger, including authority
 
-Per "Counter scope" above, these numbers cover the **LogDrive data path only**.
-`ObjectStorePartsFactory` receives the shared `ObjectStoreMetrics`;
-`ObjectStoreConditionalRegister` and `ObjectStoreExclusiveClaim` are
-constructed without metrics and Holylog's register has no metrics support at
-all. Authority work is therefore absent from the table.
+The adapter metrics cover the LogDrive data path only:
+`ObjectStorePartsFactory` receives them, while
+`ObjectStoreConditionalRegister` and `ObjectStoreExclusiveClaim` are built
+without any, and Holylog's register has no metrics support to thread.
 
-By code path rather than measurement: `HaServingSession::submit` calls
-`ensure_root_authority` twice per submission — once before admission and again
-before the receipt resolves — and each call reaches `observe_membership` →
-`read_register`, one register GET. That is **two register GETs per record**.
+Rather than restructure Holylog, the register and claim stores are now wrapped
+in a counting `ObjectStore` decorator (`scripture-runtime::counting_store`),
+reported as `authority_*` on `/status`. Counting at the call boundary means the
+ledger cannot silently omit a path added later.
 
-The consequence matters more than the number: those GETs are **per record and
-do not amortise with batching**. At `R ≈ 3` the measured data path contributes
-about 0.33 GET/record while authority contributes 2, so authority is roughly
-85% of read requests and grows as a share whenever batching improves. Batching
-is the stated economic defence against API cost, and it cannot touch the
-dominant term.
+Measured with both halves, same runs:
 
-Do not quote dollars from the table above. Instrumenting the register is the
-prerequisite, and it is a Holylog change: `ObjectStoreConditionalRegister::new`
-would need to accept an `ObjectStoreMetrics` the way `ObjectStorePartsFactory`
-already does.
+| workers | data PUT | data GET | authority GET | total requests/record |
+|---|---|---|---|---|
+| 1 | 1.000 | 1.000 | 4.010 | 6.010 |
+| 8 | 0.379 | 0.379 | 4.003 | 4.761 |
+| 32 | 0.353 | 0.353 | 3.980 | 4.686 |
+
+**Authority costs four GETs per record and is flat across concurrency.** A
+first estimate derived from reading `HaServingSession::submit` predicted two —
+one per `ensure_root_authority` call. Measurement says four, so the gate does
+more store work per call than the call count suggests. The estimate was wrong
+by 2x, which is the argument for instrumenting rather than reasoning.
+
+The consequence is the important part. Those reads are **per record and do not
+amortise with batching**: at 32 workers authority is 3.98 of 4.69 total
+requests, about **85% of all object-store traffic**, and its share rises
+whenever batching improves. Batching is this document's stated first-class
+economic defence against API cost, and between one and 32 workers it reduced
+total requests per record only from 6.01 to 4.69 — roughly 22% — because it
+cannot touch the dominant term.
+
+This also reconciles the latency observations: ~6 requests/record at 21ms on
+rustfs is ~3.5ms per request, and ~6 requests/record at the 556ms measured on
+Cloudflare R2 is ~93ms per request. Both are plausible for their transport,
+which the earlier round-trip-count guesses were not.
+
+Reducing authority reads is therefore the only lever that moves the cost line
+materially, and it is a safety trade: the current design re-observes the root
+on every admission and every acknowledgement, which is what makes a deposed
+writer fail closed. Any caching introduces a staleness window the fencing
+argument does not currently have to reason about, and should be modelled before
+it is implemented.
 
 ### Not a verdict against a target
 

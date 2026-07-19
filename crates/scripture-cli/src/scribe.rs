@@ -340,6 +340,7 @@ pub async fn bootstrap_multi_assignment(
         supervisor,
         Arc::clone(&shared.store),
         Arc::clone(&shared.metrics),
+        Arc::clone(&shared.authority_counters),
         listeners,
     )
     .await
@@ -404,6 +405,7 @@ pub async fn promote_multi_assignment(
         supervisor,
         Arc::clone(&shared.store),
         Arc::clone(&shared.metrics),
+        Arc::clone(&shared.authority_counters),
         listeners,
     )
     .await
@@ -494,6 +496,7 @@ async fn run_multi_ingress(
     supervisor: ScribeSupervisor,
     store: Arc<dyn ObjectStore>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
+    authority: Arc<scripture_runtime::counting_store::RequestCounters>,
     mut prebound: HashMap<String, TcpListener>,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
@@ -509,8 +512,9 @@ async fn run_multi_ingress(
         let supervisor = Arc::clone(&supervisor);
         let alive = Arc::clone(&alive);
         let metrics = Arc::clone(&metrics);
+        let authority = Arc::clone(&authority);
         tokio::spawn(async move {
-            serve_probe_loop(listener, supervisor, alive, metrics).await;
+            serve_probe_loop(listener, supervisor, alive, metrics, authority).await;
         });
     }
 
@@ -664,6 +668,7 @@ async fn serve_probe_loop(
     supervisor: Arc<ScribeSupervisor>,
     alive: Arc<AtomicBool>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
+    authority: Arc<scripture_runtime::counting_store::RequestCounters>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -672,8 +677,9 @@ async fn serve_probe_loop(
         let supervisor = Arc::clone(&supervisor);
         let alive = Arc::clone(&alive);
         let metrics = Arc::clone(&metrics);
+        let authority = Arc::clone(&authority);
         tokio::spawn(async move {
-            serve_probe_connection(stream, supervisor, alive, metrics).await;
+            serve_probe_connection(stream, supervisor, alive, metrics, authority).await;
         });
     }
 }
@@ -683,6 +689,7 @@ async fn serve_probe_connection(
     supervisor: Arc<ScribeSupervisor>,
     alive: Arc<AtomicBool>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
+    authority: Arc<scripture_runtime::counting_store::RequestCounters>,
 ) {
     let mut buf = [0_u8; 1024];
     let _ = stream.read(&mut buf).await;
@@ -726,6 +733,10 @@ async fn serve_probe_connection(
                 store.objects_listed,
                 store.uploaded_bytes,
                 store.downloaded_bytes,
+            ));
+            let (a_puts, a_gets, a_lists, a_deletes) = authority.snapshot();
+            body.push_str(&format!(
+                "authority_puts={a_puts} authority_gets={a_gets} authority_lists={a_lists} authority_deletes={a_deletes}\n"
             ));
             body.push_str("live authority (re-observed from the root):\n");
             for (id, effective) in supervisor.effective_writers().await {

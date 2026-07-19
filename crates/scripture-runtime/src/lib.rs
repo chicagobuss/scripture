@@ -7,6 +7,7 @@
 mod assignment_root;
 mod authority_bootstrap;
 mod authority_gate;
+pub mod counting_store;
 mod credentials;
 pub mod directory;
 mod ha_session;

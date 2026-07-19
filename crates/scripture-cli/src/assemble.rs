@@ -9,6 +9,7 @@ use holylog_object_store::{ObjectStoreExclusiveClaim, ObjectStoreMetrics, WriteP
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::ObjectStore;
 use object_store::path::Path;
+use scripture_runtime::counting_store::{CountingStore, RequestCounters};
 use scripture_runtime::{
     BackendProfile, NodeIdentity, ObjectStorePartsFactory, PartsFactory, ProcessLogletResolver,
     VerseNodeSupervisor, connect_s3_compat, resolve_credentials,
@@ -32,6 +33,8 @@ pub struct AssembledNode {
 /// Shared object-store connection reused across multi-assignment roots.
 pub struct SharedStore {
     pub store: Arc<dyn ObjectStore>,
+    /// Request counts for the Serving-Authority register / claim paths.
+    pub authority_counters: Arc<RequestCounters>,
     pub backend: BackendProfile,
     /// Process-level advertise (single-assignment / SharedStore identity).
     /// Multi-assignment seams must use each assignment's advertise instead.
@@ -61,6 +64,7 @@ pub fn connect_shared_store(config: &ScriptureConfig) -> Result<SharedStore, Box
     drop(credentials);
     Ok(SharedStore {
         store,
+        authority_counters: Arc::new(RequestCounters::default()),
         backend,
         advertise,
         owner_id,
@@ -76,13 +80,21 @@ pub fn assemble_assignment_seams(
     advertise: scripture::OwnerEndpoint,
 ) -> Result<AssembledNode, Box<dyn Error>> {
     let store_root = store_root.trim_end_matches('/').to_owned();
-    let register = Arc::new(ObjectStoreConditionalRegister::new(
+    // The register and claim store carry the Serving-Authority traffic, which
+    // Holylog cannot count: neither type takes metrics. Wrap the store for
+    // those two paths only, so authority requests are attributable separately
+    // from the LogDrive data path that ObjectStorePartsFactory already counts.
+    let authority_store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new(
         Arc::clone(&shared.store),
+        Arc::clone(&shared.authority_counters),
+    ));
+    let register = Arc::new(ObjectStoreConditionalRegister::new(
+        Arc::clone(&authority_store),
         Path::from(store_root.clone()).join(register_path("verse").as_ref()),
         shared.backend.register_capabilities(),
     )?) as Arc<dyn ConditionalRegister>;
     let claims = Arc::new(ObjectStoreExclusiveClaim::new(
-        Arc::clone(&shared.store),
+        Arc::clone(&authority_store),
         shared.backend.drive_capabilities(),
     )?) as Arc<dyn ExclusiveClaimStore>;
     let parts = Arc::new(ObjectStorePartsFactory::new(
