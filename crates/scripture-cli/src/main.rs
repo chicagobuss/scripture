@@ -16,6 +16,7 @@ mod config;
 mod ha_activate;
 mod promote;
 mod replace;
+mod scribe;
 mod serve;
 
 use std::error::Error;
@@ -60,15 +61,33 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let _ = config.owner_id()?;
             let _ = config.advertise()?;
             let _ = config.backend()?;
-            let _ = config.verse_runtime_config()?;
-            eprintln!(
-                "scripture: validate ok version={} owner={} advertise={} backend={} prefix={}",
-                config.version,
-                config.node.owner_id,
-                config.node.advertise,
-                config.store.backend,
-                config.store.prefix.trim_end_matches('/'),
-            );
+            if config.is_multi_assignment() {
+                let scribe = config.scribe.as_ref().expect("multi");
+                for assignment in &scribe.assignments {
+                    let _ = config.assignment_runtime_config(assignment)?;
+                    let _ = config.assignment_advertise(assignment)?;
+                    let _ = config.assignment_store_root(assignment)?;
+                }
+                eprintln!(
+                    "scripture: validate ok version={} owner={} advertise={} backend={} prefix={} assignments={}",
+                    config.version,
+                    config.node.owner_id,
+                    config.node.advertise,
+                    config.store.backend,
+                    config.store.prefix.trim_end_matches('/'),
+                    scribe.assignments.len(),
+                );
+            } else {
+                let _ = config.verse_runtime_config()?;
+                eprintln!(
+                    "scripture: validate ok version={} owner={} advertise={} backend={} prefix={}",
+                    config.version,
+                    config.node.owner_id,
+                    config.node.advertise,
+                    config.store.backend,
+                    config.store.prefix.trim_end_matches('/'),
+                );
+            }
             Ok(())
         }
         "serve" => {
@@ -87,9 +106,9 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             replace::replace(config, successor).await
         }
         "promote" => {
-            let (config_path, term) = parse_promote_args(&mut arguments)?;
+            let (config_path, term, assignment_id) = parse_promote_args(&mut arguments)?;
             let config = ScriptureConfig::load(&config_path)?;
-            promote::promote(config, term).await
+            promote::promote(config, term, assignment_id.as_deref()).await
         }
         "--help" | "-h" | "help" => {
             print_help();
@@ -209,9 +228,10 @@ fn parse_replace_args(
 
 fn parse_promote_args(
     arguments: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-) -> Result<(PathBuf, u64), Box<dyn Error>> {
+) -> Result<(PathBuf, u64, Option<String>), Box<dyn Error>> {
     let mut config = None;
     let mut term = None;
+    let mut assignment_id = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--config" => {
@@ -222,6 +242,9 @@ fn parse_promote_args(
                 term = Some(raw.parse::<u64>().map_err(|error| {
                     format!("--candidate-term must be a positive integer: {error}")
                 })?);
+            }
+            "--assignment" => {
+                assignment_id = Some(required(arguments, "--assignment")?);
             }
             "--access-key" | "--secret-key" | "--loglet-id" | "--successor-loglet-id" => {
                 return Err("secrets and loglet ids must not be passed on promote argv".into());
@@ -236,6 +259,7 @@ fn parse_promote_args(
     Ok((
         config.ok_or("promote requires --config PATH")?,
         term.ok_or("promote requires --candidate-term N")?,
+        assignment_id,
     ))
 }
 
@@ -259,19 +283,38 @@ Usage:
   scripture bootstrap --config /path/to/scripture.yaml [--initial-term N]   # HA mode
   scripture replace --config /path/to/scripture.yaml --successor-loglet-id <ID>
   scripture promote --config /path/to/scripture.yaml --candidate-term <N>
+  scripture promote --config multi.yaml --assignment <ID> --candidate-term <N>
   scripture serve --config /path/to/scripture.yaml
 validate:  load + validate non-secret YAML; no network; no ownership.
 bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
            long-lived bootstrap-and-serve (one-record VirtualLog root fence).
+           With scribe.assignments: multi-assignment Scribe supervisor (one
+           independent authority root / listener per assignment).
 replace:   legacy empty open-generation activation; exits; never opens ingress.
 promote:   long-lived promote-and-serve under ha.mode: serving-authority.
+           Single-assignment: --candidate-term only (unchanged).
+           Multi-assignment: --assignment ID --candidate-term N (targeted Verse
+           promote only; siblings keep posture — standby is a dormant candidate).
 serve:     long-running legacy Canon path; refused under Serving-Authority mode
            (writables cannot cross process exit — use bootstrap/promote).
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority
+Multi-assignment YAML (requires Serving Authority; omits top-level listener/verse):
+  scribe:
+    assignments:
+      - id: example
+        canon: \"................\"
+        verse: \"................\"
+        cohort_id: \"................\"
+        writer_id: \"................\"
+        posture: bootstrap-if-empty   # or standby (dormant candidate)
+        advertise: \"tcp://10.0.0.1:9000\"
+        ingress:
+          bind: \"10.0.0.1:9000\"
 Authority is membership + Scripture fence on the Holylog VirtualLog root only.
 There is no separate ServingAuthorityStore / CRD backend.
+No live SSH/ZeroTier drill until deterministic multi-assignment HA tests are green.
 
 Non-secret settings come from the YAML file. Object-store credentials come from
 the process environment only:

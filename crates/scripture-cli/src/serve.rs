@@ -25,12 +25,20 @@ use crate::assemble;
 use crate::config::{HaMode, ScriptureConfig};
 
 pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
+    if config.is_multi_assignment() {
+        return Err(
+            "refusing plain `scripture serve` for scribe.assignments — use \
+             `scripture bootstrap --config …` under ha.mode: serving-authority"
+                .into(),
+        );
+    }
     if config.ha.mode == HaMode::ServingAuthority {
         return Err(
             "refusing plain `scripture serve` under ha.mode: serving-authority — \
              Holylog open writables cannot cross process exit. Use long-lived \
              `scripture bootstrap --config …` (Empty→Serving) or \
-             `scripture promote --config … --candidate-term N` (promote-and-serve). \
+             `scripture promote --config … --candidate-term N` (single-assignment) or \
+             `scripture promote --config … --assignment ID --candidate-term N` (multi). \
              Authority is the VirtualLog root fence (no separate authority store)."
                 .into(),
         );
@@ -65,7 +73,7 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
         "scripture: ha_mode=legacy disposition={disposition} ready={ready} owner={} advertise={} bind={} backend={} prefix={}",
         config.node.owner_id,
         advertise.as_str(),
-        config.listener.bind,
+        config.listener_bind()?,
         backend.label(),
         store_root,
     );
@@ -135,7 +143,7 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
     }
 
     let runtime = runtime.ok_or("runtime missing after start")?;
-    let listener = TcpListener::bind(&config.listener.bind).await?;
+    let listener = TcpListener::bind(config.listener_bind()?).await?;
     eprintln!(
         "scripture: listening on {} (temporary ingress; not a public producer protocol)",
         listener.local_addr()?

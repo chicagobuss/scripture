@@ -4,6 +4,10 @@ These dependency-free Python scripts exercise transport bytes during local and
 fleet drills. They are deliberately **not** the Scripture client SDK and do not
 define a stable application protocol.
 
+`scribe-drill-preflight.sh` validates ignored multi-assignment SSH/ZeroTier
+drill templates under `config/local/scribe-drills/` without printing secrets or
+starting processes.
+
 `scripture_send.py` targets the current provisional raw-lines TCP listener:
 
 ```sh

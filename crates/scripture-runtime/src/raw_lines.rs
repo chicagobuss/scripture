@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::scribe::IngressBudgets;
 use bytes::Bytes;
 use scripture::{
     AttributeValue, DriverMetrics, ProducerId, Receipt, ReceiptFuture, Record, Submission,
@@ -164,6 +165,7 @@ impl BatchingSnapshot {
 struct Pending {
     receipt: ReceiptFuture,
     payload_bytes: usize,
+    budget_reserved: bool,
 }
 
 /// Admit + flush surface shared by chunk-service and VerseRuntime paths.
@@ -180,6 +182,7 @@ pub(crate) async fn serve_raw_lines_pipeline<R, W, S>(
     config: RawLinesConfig,
     mut sequence: u64,
     metrics: Option<Arc<RawLinesConnectionMetrics>>,
+    budgets: Option<IngressBudgets>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -197,8 +200,12 @@ where
         // A line is read before its exact payload size is known, so merely
         // checking `pending_bytes < max_pending_bytes` could overshoot the
         // advertised byte cap by one complete line.
-        let under_cap = pending.len() < config.max_pending_records
+        let under_local_cap = pending.len() < config.max_pending_records
             && pending_bytes <= config.max_pending_bytes - config.max_line_bytes;
+        let under_budget = budgets
+            .as_ref()
+            .is_none_or(|budget| budget.can_admit(1, config.max_line_bytes));
+        let under_cap = under_local_cap && under_budget;
 
         if pending.is_empty() {
             match read_capped_line(&mut reader, config.max_line_bytes).await {
@@ -219,6 +226,7 @@ where
                         &config.attributes,
                         payload,
                         &metrics,
+                        &budgets,
                     )
                     .await
                     {
@@ -240,8 +248,10 @@ where
                 biased;
                 result = &mut head.receipt => {
                     let payload_bytes = head.payload_bytes;
+                    let budget_reserved = head.budget_reserved;
                     let _ = pending.pop_front();
                     pending_bytes = pending_bytes.saturating_sub(payload_bytes);
+                    release_budget(&budgets, budget_reserved, payload_bytes);
                     match result {
                         Ok(receipt) => {
                             write_ok(&mut writer, &receipt).await?;
@@ -265,6 +275,7 @@ where
                                 &mut pending,
                                 &mut pending_bytes,
                                 &metrics,
+                                &budgets,
                             )
                             .await;
                         }
@@ -279,6 +290,7 @@ where
                                 &config.attributes,
                                 payload,
                                 &metrics,
+                                &budgets,
                             )
                             .await
                             {
@@ -287,6 +299,7 @@ where
                                     &mut pending,
                                     &mut pending_bytes,
                                     &metrics,
+                                    &budgets,
                                 )
                                 .await?;
                                 return fail_closed(&mut writer, &metrics, &reason).await;
@@ -301,6 +314,7 @@ where
                                 &mut pending,
                                 &mut pending_bytes,
                                 &metrics,
+                                &budgets,
                             )
                             .await?;
                             return fail_closed(&mut writer, &metrics, &error.to_string()).await;
@@ -323,8 +337,10 @@ where
             let head = pending.front_mut().expect("non-empty");
             let result = (&mut head.receipt).await;
             let payload_bytes = head.payload_bytes;
+            let budget_reserved = head.budget_reserved;
             let _ = pending.pop_front();
             pending_bytes = pending_bytes.saturating_sub(payload_bytes);
+            release_budget(&budgets, budget_reserved, payload_bytes);
             match result {
                 Ok(receipt) => {
                     write_ok(&mut writer, &receipt).await?;
@@ -341,6 +357,12 @@ where
                     .await;
             }
         }
+    }
+}
+
+fn release_budget(budgets: &Option<IngressBudgets>, reserved: bool, payload_bytes: usize) {
+    if reserved && let Some(budgets) = budgets {
+        budgets.release_pending(1, payload_bytes);
     }
 }
 
@@ -390,11 +412,20 @@ async fn admit_line<S: RawLinesSink>(
     attributes: &BTreeMap<String, AttributeValue>,
     payload: Vec<u8>,
     metrics: &Option<Arc<RawLinesConnectionMetrics>>,
+    budgets: &Option<IngressBudgets>,
 ) -> Result<(), String> {
     if *exhausted {
         return Err("producer sequence space exhausted".into());
     }
     let payload_bytes = payload.len();
+    let budget_reserved = if let Some(budgets) = budgets {
+        if !budgets.try_reserve_pending(1, payload_bytes) {
+            return Err("node/assignment pending budget exhausted".into());
+        }
+        true
+    } else {
+        false
+    };
     let submission = Submission {
         producer_id,
         producer_epoch: 0,
@@ -408,10 +439,17 @@ async fn admit_line<S: RawLinesSink>(
         Some(next) => *sequence = next,
         None => *exhausted = true,
     }
-    let receipt = sink.submit(submission).await?;
+    let receipt = match sink.submit(submission).await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            release_budget(budgets, budget_reserved, payload_bytes);
+            return Err(error);
+        }
+    };
     pending.push_back(Pending {
         receipt,
         payload_bytes,
+        budget_reserved,
     });
     *pending_bytes = pending_bytes.saturating_add(payload_bytes);
     if let Some(metrics) = metrics {
@@ -427,9 +465,11 @@ async fn drain_all<W: AsyncWrite + Unpin>(
     pending: &mut VecDeque<Pending>,
     pending_bytes: &mut usize,
     metrics: &Option<Arc<RawLinesConnectionMetrics>>,
+    budgets: &Option<IngressBudgets>,
 ) -> io::Result<()> {
     while let Some(mut front) = pending.pop_front() {
         *pending_bytes = pending_bytes.saturating_sub(front.payload_bytes);
+        release_budget(budgets, front.budget_reserved, front.payload_bytes);
         match (&mut front.receipt).await {
             Ok(receipt) => {
                 write_ok(writer, &receipt).await?;
@@ -582,7 +622,7 @@ mod tests {
             let sink = Arc::clone(&sink);
             let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
-                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics), None).await
             })
         };
 
@@ -647,7 +687,7 @@ mod tests {
             let sink = Arc::clone(&sink);
             let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
-                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics), None).await
             })
         };
         client.write_all(b"toolong\n").await.expect("write");
@@ -683,7 +723,7 @@ mod tests {
             let sink = Arc::clone(&sink);
             let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
-                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics)).await
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics), None).await
             })
         };
         client

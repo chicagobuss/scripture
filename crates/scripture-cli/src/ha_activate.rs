@@ -109,7 +109,7 @@ pub async fn bootstrap_and_serve_cli(
         "scripture: ha_mode=serving-authority action=bootstrap-and-serve ready=true owner={} advertise={} bind={} backend={} prefix={}",
         config.node.owner_id,
         assembled.advertise.as_str(),
-        config.listener.bind,
+        config.listener_bind()?,
         assembled.backend.label(),
         assembled.store_root,
     );
@@ -194,7 +194,7 @@ pub async fn promote_and_serve_cli(
         "scripture: ha_mode=serving-authority action=promote-and-serve ready=true owner={} advertise={} bind={} backend={} prefix={} candidate_term={candidate_term}",
         config.node.owner_id,
         assembled.advertise.as_str(),
-        config.listener.bind,
+        config.listener_bind()?,
         assembled.backend.label(),
         assembled.store_root,
     );
@@ -221,7 +221,7 @@ async fn run_ha_ingress(
         });
     }
 
-    let listener = TcpListener::bind(&config.listener.bind).await?;
+    let listener = TcpListener::bind(config.listener_bind()?).await?;
     eprintln!(
         "scripture: listening on {} (temporary ingress; authority-gated; not a public producer protocol)",
         listener.local_addr()?

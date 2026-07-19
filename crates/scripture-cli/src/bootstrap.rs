@@ -17,6 +17,10 @@ pub async fn bootstrap(
     loglet_id: Option<String>,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    if config.is_multi_assignment() {
+        return crate::scribe::bootstrap_multi_assignment(config, initial_term).await;
+    }
+
     if config.ha.mode == HaMode::ServingAuthority {
         return ha_activate::bootstrap_and_serve_cli(config, initial_term).await;
     }

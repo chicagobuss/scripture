@@ -4,6 +4,7 @@
 //! resolution, and the temporary Canon-gated ingress used for HA testing.
 //! Lab-only fleet orchestration does not live here.
 
+mod assignment_root;
 mod authority_bootstrap;
 mod authority_gate;
 mod credentials;
@@ -13,8 +14,10 @@ mod ingress;
 mod node;
 mod object_store;
 mod raw_lines;
+mod scribe;
 mod status;
 
+pub use assignment_root::assignment_durable_root;
 pub use authority_bootstrap::bootstrap_authority_domain;
 pub use authority_gate::{AuthorityGateDecision, AuthorityGateDenial, evaluate_authority_gate};
 pub use credentials::{CredentialError, StoreCredentials, resolve_credentials};
@@ -30,6 +33,7 @@ pub use holylog_foundation::{
 pub use ingress::{
     serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,
     serve_canon_raw_lines_connection_with_spool, serve_ha_raw_lines_connection,
+    serve_ha_raw_lines_connection_with_budgets,
 };
 pub use node::{
     DurableLogletParts, InMemoryPartsFactory, NodeIdentity, PartsFactory, PartsFactoryError,
@@ -41,5 +45,10 @@ pub use object_store::{
 };
 pub use raw_lines::{
     BatchingSnapshot, RawLinesConfig, RawLinesConnectionMetrics, RawLinesConnectionSnapshot,
+};
+pub use scribe::{
+    AssignmentDisposition, AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime,
+    IngressBudgets, NodeResourceBudget, NodeResourceSnapshot, ScribeError, ScribeResourceLimits,
+    ScribeSupervisor,
 };
 pub use status::{disposition_label, is_ready_to_serve, status_body};

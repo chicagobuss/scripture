@@ -16,6 +16,7 @@ use crate::ha_session::HaServingSession;
 use crate::raw_lines::{
     RawLinesConfig, RawLinesConnectionMetrics, RawLinesSink, serve_raw_lines_pipeline,
 };
+use crate::scribe::IngressBudgets;
 
 struct CanonSink {
     runtime: Arc<VerseRuntime>,
@@ -113,11 +114,30 @@ pub async fn serve_ha_raw_lines_connection(
     session: Arc<HaServingSession>,
     config: RawLinesConfig,
 ) -> io::Result<()> {
+    serve_ha_raw_lines_connection_with_budgets(stream, session, config, None).await
+}
+
+/// Like [`serve_ha_raw_lines_connection`], with node/assignment pending budgets.
+pub async fn serve_ha_raw_lines_connection_with_budgets(
+    stream: TcpStream,
+    session: Arc<HaServingSession>,
+    config: RawLinesConfig,
+    budgets: Option<IngressBudgets>,
+) -> io::Result<()> {
     if let Err(reason) = config.validate() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
     }
     let (reader, writer) = stream.into_split();
-    serve_raw_lines_pipeline(reader, writer, HaAuthoritySink { session }, config, 0, None).await
+    serve_raw_lines_pipeline(
+        reader,
+        writer,
+        HaAuthoritySink { session },
+        config,
+        0,
+        None,
+        budgets,
+    )
+    .await
 }
 
 /// Canon-gated raw-lines admission over a started [`VerseRuntime`].
@@ -142,8 +162,16 @@ pub async fn serve_canon_raw_lines_connection_with_metrics(
     let (reader, mut writer) = stream.into_split();
     match runtime.resolve_route().await {
         Ok(CanonRoute::Serve { .. }) => {
-            serve_raw_lines_pipeline(reader, writer, CanonSink { runtime }, config, 0, metrics)
-                .await
+            serve_raw_lines_pipeline(
+                reader,
+                writer,
+                CanonSink { runtime },
+                config,
+                0,
+                metrics,
+                None,
+            )
+            .await
         }
         Ok(CanonRoute::NotOwner {
             canon_revision,
@@ -200,6 +228,7 @@ pub async fn serve_canon_raw_lines_connection_with_spool(
                 SpoolCanonSink { runtime, spool },
                 config,
                 0,
+                None,
                 None,
             )
             .await

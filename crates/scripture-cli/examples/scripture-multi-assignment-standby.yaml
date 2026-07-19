@@ -1,0 +1,57 @@
+# Complementary multi-assignment standby candidate (non-secret, redacted).
+#
+# Distinct owner_id / node.advertise. Each assignment also has its own advertise
+# writer route. Assignments that are Serving on the primary are Standby here
+# (and vice versa for complementary drills).
+#
+# Durable roots match the primary for the same canon/verse (Canon/Verse-derived,
+# not assignment-id-derived).
+#
+# After SSH-terminating a serving scribe, promote the relevant Verse only:
+#   scripture promote --config … --assignment ID --candidate-term N
+# Standby posture is a dormant candidate (not warm). Never claim “the scribe
+# failed over” when only one Verse was promoted.
+#
+# No live SSH drill until deterministic multi-assignment HA tests are green.
+
+version: 1
+
+node:
+  owner_id: "scripture-own-b!"
+  advertise: "tcp://10.0.0.2:9000"
+
+store:
+  backend: rustfs
+  endpoint: "http://REPLACE_WITH_RUSTFS_ENDPOINT"
+  bucket: "scripture"
+  region: us-east-1
+  prefix: "scripture/drills/REPLACE_WITH_RUN_PREFIX"
+
+ha:
+  mode: serving-authority
+
+metrics:
+  status_bind: "127.0.0.1:9100"
+
+scribe:
+  limits:
+    max_assignments: 4
+  assignments:
+    - id: telemetry-host-a
+      canon: "telemetry-jrnl!!"
+      verse: "telemetry-host-a"
+      cohort_id: "telemetry-cohrt!"
+      writer_id: "telemetry-wrtr!!"
+      posture: standby
+      advertise: "tcp://10.0.0.2:9001"
+      ingress:
+        bind: "10.0.0.2:9001"
+    - id: audit-ingress
+      canon: "audit-journal!!!"
+      verse: "audit-ingress-0!"
+      cohort_id: "audit-cohort!!!!"
+      writer_id: "audit-writer!!!!"
+      posture: standby
+      advertise: "tcp://10.0.0.2:9002"
+      ingress:
+        bind: "10.0.0.2:9002"
