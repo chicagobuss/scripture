@@ -1,6 +1,7 @@
 //! OTel-shaped JSON envelope (internal; not OTLP).
 
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,9 @@ use crate::config::SourceKind;
 use crate::normalize::NormalizedSample;
 
 /// Schema reference stamped on every record.
+///
+/// v1 includes `incarnation` in the dedup key before any durable Phase 2
+/// records exist. Bump on incompatible changes.
 pub const SCHEMA_REF: &str = "otel-shaped-metrics.v1";
 
 /// One newline-delimited telemetry record.
@@ -23,9 +27,11 @@ pub struct MetricEnvelope {
     pub canon: String,
     /// Verse lane.
     pub verse: String,
-    /// Per-Verse monotonic sequence (idempotency key component).
+    /// Process/restart incarnation — disambiguates `seq` across restarts.
+    pub incarnation: u64,
+    /// Per-Verse monotonic sequence within one incarnation.
     pub seq: u64,
-    /// Collection time (RFC3339).
+    /// Collection time (RFC3339 UTC, e.g. `2026-07-19T04:12:30Z`).
     pub collected_at: String,
     /// Source identity.
     pub source: SourceMeta,
@@ -86,20 +92,31 @@ pub struct DataPoint {
     pub as_double: f64,
 }
 
+/// Inputs for [`MetricEnvelope::from_sample`] (keeps the call site under clippy's arg limit).
+#[derive(Debug, Clone)]
+pub struct EnvelopeContext<'a> {
+    /// Stable producer identity.
+    pub producer_id: &'a str,
+    /// Canon name.
+    pub canon: &'a str,
+    /// Verse lane.
+    pub verse: &'a str,
+    /// Restart incarnation.
+    pub incarnation: u64,
+    /// Sequence within the incarnation.
+    pub seq: u64,
+    /// RFC3339 collection timestamp.
+    pub collected_at: &'a str,
+    /// Source kind.
+    pub kind: SourceKind,
+    /// Resource attributes.
+    pub resource: BTreeMap<String, String>,
+}
+
 impl MetricEnvelope {
     /// Builds an envelope for one normalized sample.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_sample(
-        producer_id: &str,
-        canon: &str,
-        verse: &str,
-        seq: u64,
-        collected_at: &str,
-        kind: SourceKind,
-        sample: &NormalizedSample,
-        resource: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn from_sample(ctx: EnvelopeContext<'_>, sample: &NormalizedSample) -> Self {
         let (metric_type, monotonic) = match sample.metric_type.as_str() {
             "counter" => ("sum".to_owned(), Some(true)),
             "gauge" => ("gauge".to_owned(), None),
@@ -107,24 +124,25 @@ impl MetricEnvelope {
         };
         let time_unix_nano = sample
             .timestamp_ms
-            .map(|ms| (ms as i128 * 1_000_000).to_string())
+            .map(|ms| (i128::from(ms) * 1_000_000).to_string())
             .unwrap_or_else(|| "0".to_owned());
         Self {
             envelope_version: 1,
             schema_ref: SCHEMA_REF.to_owned(),
-            producer_id: producer_id.to_owned(),
-            canon: canon.to_owned(),
-            verse: verse.to_owned(),
-            seq,
-            collected_at: collected_at.to_owned(),
+            producer_id: ctx.producer_id.to_owned(),
+            canon: ctx.canon.to_owned(),
+            verse: ctx.verse.to_owned(),
+            incarnation: ctx.incarnation,
+            seq: ctx.seq,
+            collected_at: ctx.collected_at.to_owned(),
             source: SourceMeta {
-                kind: kind.as_str().to_owned(),
-                target: verse.to_owned(),
+                kind: ctx.kind.as_str().to_owned(),
+                target: ctx.verse.to_owned(),
             },
             otel: OtelBody {
-                resource,
+                resource: ctx.resource,
                 scope: ScopeMeta {
-                    name: format!("scripture.scrape.{}", kind.as_str()),
+                    name: format!("scripture.scrape.{}", ctx.kind.as_str()),
                 },
                 metric: MetricPoint {
                     name: sample.name.clone(),
@@ -140,10 +158,15 @@ impl MetricEnvelope {
         }
     }
 
-    /// Dedup key `(producer_id, verse, seq)`.
+    /// Dedup key `(producer_id, verse, incarnation, seq)`.
     #[must_use]
-    pub fn dedup_key(&self) -> (String, String, u64) {
-        (self.producer_id.clone(), self.verse.clone(), self.seq)
+    pub fn dedup_key(&self) -> (String, String, u64, u64) {
+        (
+            self.producer_id.clone(),
+            self.verse.clone(),
+            self.incarnation,
+            self.seq,
+        )
     }
 
     /// Serializes to a single raw-lines payload (no embedded newlines).
@@ -161,19 +184,78 @@ impl MetricEnvelope {
     }
 }
 
-/// Assigns monotonic `seq` values within one `(producer_id, verse)` stream.
-#[derive(Debug, Default)]
+/// Assigns monotonic `seq` values within one `(producer_id, verse, incarnation)`.
+#[derive(Debug)]
 pub struct SeqAllocator {
+    /// Process/restart incarnation (unix millis at construction by default).
+    pub incarnation: u64,
     next: u64,
 }
 
 impl SeqAllocator {
-    /// Returns the next sequence number (starts at 0).
+    /// Creates an allocator with a fresh incarnation from wall-clock millis.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            incarnation: wall_millis(),
+            next: 0,
+        }
+    }
+
+    /// Creates an allocator with an explicit incarnation (tests / injected clocks).
+    #[must_use]
+    pub fn with_incarnation(incarnation: u64) -> Self {
+        Self {
+            incarnation,
+            next: 0,
+        }
+    }
+
+    /// Returns the next sequence number within this incarnation (starts at 0).
     pub fn allocate(&mut self) -> u64 {
         let seq = self.next;
         self.next = self.next.saturating_add(1);
         seq
     }
+}
+
+impl Default for SeqAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn wall_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Formats a unix-second timestamp as RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+#[must_use]
+pub fn format_rfc3339_utc(secs: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    const DAYS_FROM_UNIX_TO_CIVIL: i64 = 719_468; // 1970-01-01 relative to civil algorithm epoch
+
+    let days = (secs / SECS_PER_DAY) as i64;
+    let tod = secs % SECS_PER_DAY;
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+
+    let z = days + DAYS_FROM_UNIX_TO_CIVIL;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 #[cfg(test)]
@@ -191,14 +273,17 @@ mod tests {
             timestamp_ms: Some(1_000),
         };
         let envelope = MetricEnvelope::from_sample(
-            "fleet-collector-0",
-            "fleet-telemetry",
-            "node-node-a",
-            7,
-            "2026-07-19T04:12:30Z",
-            SourceKind::NodeExporter,
+            EnvelopeContext {
+                producer_id: "fleet-collector-0",
+                canon: "fleet-telemetry",
+                verse: "node-node-a",
+                incarnation: 42,
+                seq: 7,
+                collected_at: "2026-07-19T04:12:30Z",
+                kind: SourceKind::NodeExporter,
+                resource: BTreeMap::from([("host.name".into(), "node-a".into())]),
+            },
             &sample,
-            BTreeMap::from([("host.name".into(), "node-a".into())]),
         );
         let line = envelope.to_line().expect("line");
         assert!(!line.contains('\n'));
@@ -206,7 +291,22 @@ mod tests {
         assert_eq!(parsed.schema_ref, SCHEMA_REF);
         assert_eq!(
             parsed.dedup_key(),
-            ("fleet-collector-0".into(), "node-node-a".into(), 7)
+            ("fleet-collector-0".into(), "node-node-a".into(), 42, 7)
         );
+    }
+
+    #[test]
+    fn rfc3339_formats_known_instant() {
+        // 2026-07-19T04:12:30Z
+        assert_eq!(format_rfc3339_utc(1_784_434_350), "2026-07-19T04:12:30Z");
+    }
+
+    #[test]
+    fn distinct_incarnations_do_not_collide() {
+        let mut a = SeqAllocator::with_incarnation(1);
+        let mut b = SeqAllocator::with_incarnation(2);
+        assert_eq!(a.allocate(), 0);
+        assert_eq!(b.allocate(), 0);
+        assert_ne!(a.incarnation, b.incarnation);
     }
 }

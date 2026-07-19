@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::buffer::{BufferedLine, DropOldestBuffer};
 use crate::config::{ProducerConfig, SourceKind};
-use crate::envelope::{MetricEnvelope, SeqAllocator};
+use crate::envelope::{EnvelopeContext, MetricEnvelope, SeqAllocator, format_rfc3339_utc};
 use crate::normalize::normalize_samples;
 use crate::scrape::parse_openmetrics;
 
@@ -18,6 +18,17 @@ pub struct PreparedRecord {
     pub buffered: BufferedLine,
 }
 
+/// Counters from prepare.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PrepareCounters {
+    /// Series dropped by the per-scrape cap.
+    pub dropped_series: u64,
+    /// Series dropped because metric was not allowlisted.
+    pub dropped_metric_not_allowlisted: u64,
+    /// Malformed sample lines skipped by the parser.
+    pub unparseable_lines: u64,
+}
+
 /// Turns an OpenMetrics body into buffered lines for one verse/source.
 pub fn prepare_scrape(
     config: &ProducerConfig,
@@ -25,7 +36,7 @@ pub fn prepare_scrape(
     kind: SourceKind,
     body: &str,
     seqs: &mut SeqAllocator,
-) -> Result<(Vec<PreparedRecord>, u64, u64), PrepareError> {
+) -> Result<(Vec<PreparedRecord>, PrepareCounters), PrepareError> {
     let source = config
         .scrape
         .sources
@@ -35,10 +46,9 @@ pub fn prepare_scrape(
     if source.kind != kind {
         return Err(PrepareError::KindMismatch);
     }
-    let samples =
-        parse_openmetrics(body).map_err(|error| PrepareError::Parse(error.to_string()))?;
+    let parsed = parse_openmetrics(body).map_err(|error| PrepareError::Parse(error.to_string()))?;
     let batch = normalize_samples(
-        &samples,
+        &parsed.samples,
         &config.normalize,
         config.scrape.max_series_per_scrape,
     );
@@ -47,14 +57,17 @@ pub fn prepare_scrape(
     for sample in &batch.samples {
         let seq = seqs.allocate();
         let envelope = MetricEnvelope::from_sample(
-            &config.producer_id,
-            &config.canon,
-            verse,
-            seq,
-            &collected_at,
-            kind,
+            EnvelopeContext {
+                producer_id: &config.producer_id,
+                canon: &config.canon,
+                verse,
+                incarnation: seqs.incarnation,
+                seq,
+                collected_at: &collected_at,
+                kind,
+                resource: BTreeMap::from([("host.name".into(), verse.to_owned())]),
+            },
             sample,
-            BTreeMap::from([("host.name".into(), verse.to_owned())]),
         );
         let line = envelope
             .to_line()
@@ -72,8 +85,11 @@ pub fn prepare_scrape(
     }
     Ok((
         prepared,
-        batch.counters.dropped_series,
-        batch.counters.dropped_metric_not_allowlisted,
+        PrepareCounters {
+            dropped_series: batch.counters.dropped_series,
+            dropped_metric_not_allowlisted: batch.counters.dropped_metric_not_allowlisted,
+            unparseable_lines: parsed.unparseable_lines,
+        },
     ))
 }
 
@@ -92,13 +108,24 @@ pub fn enqueue(buffer: &mut DropOldestBuffer, records: &[PreparedRecord]) -> usi
     dropped
 }
 
-/// Deduplicates committed payloads by `(producer_id, verse, seq)`.
+/// Result of deduplicating committed payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupResult {
+    /// First occurrence of each `(producer_id, verse, incarnation, seq)`.
+    pub lines: Vec<String>,
+    /// Committed lines that were not valid envelopes.
+    pub unparseable_committed: u64,
+}
+
+/// Deduplicates committed payloads by `(producer_id, verse, incarnation, seq)`.
 #[must_use]
-pub fn dedup_committed_lines(lines: &[String]) -> Vec<String> {
-    let mut seen: BTreeSet<(String, String, u64)> = BTreeSet::new();
+pub fn dedup_committed_lines(lines: &[String]) -> DedupResult {
+    let mut seen: BTreeSet<(String, String, u64, u64)> = BTreeSet::new();
     let mut out = Vec::new();
+    let mut unparseable_committed = 0_u64;
     for line in lines {
         let Ok(envelope) = serde_json::from_str::<MetricEnvelope>(line) else {
+            unparseable_committed += 1;
             continue;
         };
         let key = envelope.dedup_key();
@@ -106,7 +133,10 @@ pub fn dedup_committed_lines(lines: &[String]) -> Vec<String> {
             out.push(line.clone());
         }
     }
-    out
+    DedupResult {
+        lines: out,
+        unparseable_committed,
+    }
 }
 
 fn rfc3339_now() -> String {
@@ -114,8 +144,7 @@ fn rfc3339_now() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    // Fixed Zulu formatting without chrono dependency.
-    format!("{secs}Z")
+    format_rfc3339_utc(secs)
 }
 
 /// Prepare failures.
@@ -133,4 +162,18 @@ pub enum PrepareError {
     /// JSON serialize failure.
     #[error("serialize: {0}")]
     Serialize(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collected_at_is_rfc3339() {
+        let stamp = rfc3339_now();
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && stamp.contains('T'),
+            "got {stamp}"
+        );
+    }
 }

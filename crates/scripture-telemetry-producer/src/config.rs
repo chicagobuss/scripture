@@ -255,17 +255,18 @@ pub(crate) mod humantime_serde_compat {
         }
 
         fn parse(raw: &str) -> Result<Duration, String> {
-            if let Some(seconds) = raw.strip_suffix('s') {
-                let n: u64 = seconds
-                    .parse()
-                    .map_err(|_| format!("invalid duration {raw}"))?;
-                return Ok(Duration::from_secs(n));
-            }
+            // Check "ms" before bare "s" — every "Nms" also ends in 's'.
             if let Some(millis) = raw.strip_suffix("ms") {
                 let n: u64 = millis
                     .parse()
                     .map_err(|_| format!("invalid duration {raw}"))?;
                 return Ok(Duration::from_millis(n));
+            }
+            if let Some(seconds) = raw.strip_suffix('s') {
+                let n: u64 = seconds
+                    .parse()
+                    .map_err(|_| format!("invalid duration {raw}"))?;
+                return Ok(Duration::from_secs(n));
             }
             Err(format!("expected Ns or Nms, got {raw}"))
         }
@@ -302,5 +303,33 @@ mod tests {
             config.validate(),
             Err(ValidateError::WildcardUrl(_))
         ));
+    }
+
+    #[test]
+    fn duration_ms_round_trips() {
+        use super::humantime_serde_compat::duration;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Wrap {
+            #[serde(with = "duration")]
+            d: std::time::Duration,
+        }
+
+        let original = Wrap {
+            d: std::time::Duration::from_millis(1500),
+        };
+        let yaml = serde_yaml::to_string(&original).expect("ser");
+        assert!(yaml.contains("1500ms"), "serialized as {yaml}");
+        let parsed: Wrap = serde_yaml::from_str(&yaml).expect("de");
+        assert_eq!(parsed, original);
+
+        let secs = Wrap {
+            d: std::time::Duration::from_secs(3),
+        };
+        let yaml = serde_yaml::to_string(&secs).expect("ser");
+        assert!(yaml.contains("3s"), "serialized as {yaml}");
+        let parsed: Wrap = serde_yaml::from_str(&yaml).expect("de");
+        assert_eq!(parsed, secs);
     }
 }

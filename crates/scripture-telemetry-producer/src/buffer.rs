@@ -61,6 +61,17 @@ impl DropOldestBuffer {
             line,
             payload_digest,
         };
+        // A single record larger than the byte cap is dropped immediately
+        // without evicting the existing buffer.
+        if incoming.line.len() > self.max_bytes {
+            self.dropped_records += 1;
+            dropped.push(DroppedRecord {
+                verse: incoming.verse,
+                seq: incoming.seq,
+                payload_digest: incoming.payload_digest,
+            });
+            return dropped;
+        }
         while self.would_exceed(&incoming) {
             match self.records.pop_front() {
                 Some(old) => {
@@ -74,17 +85,6 @@ impl DropOldestBuffer {
                 }
                 None => break,
             }
-        }
-        // If a single record exceeds max_bytes, still keep only that record
-        // after clearing — caller should size envelopes under the cap.
-        if incoming.line.len() > self.max_bytes && self.records.is_empty() {
-            self.dropped_records += 1;
-            dropped.push(DroppedRecord {
-                verse: incoming.verse.clone(),
-                seq: incoming.seq,
-                payload_digest: incoming.payload_digest.clone(),
-            });
-            return dropped;
         }
         self.bytes += incoming.line.len();
         self.records.push_back(incoming);
@@ -139,5 +139,16 @@ mod tests {
         assert_eq!(buffer.dropped_records, 1);
         assert_eq!(buffer.len(), 2);
         assert_eq!(buffer.front().map(|line| line.seq), Some(1));
+    }
+
+    #[test]
+    fn oversized_record_does_not_evict_buffer() {
+        let mut buffer = DropOldestBuffer::new("node-node-a", 10, 4);
+        assert!(buffer.push(0, "abcd".into(), "d0".into()).is_empty());
+        let dropped = buffer.push(1, "too-big".into(), "d1".into());
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].seq, 1);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.front().map(|line| line.seq), Some(0));
     }
 }
