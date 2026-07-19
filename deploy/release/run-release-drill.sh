@@ -518,6 +518,11 @@ spec:
           command: ["/bin/sh","-eu","-c"]
           args:
             - |
+              # RustFS is intentionally addressed through its in-cluster
+              # Service, not a wildcard virtual-host endpoint.  Force
+              # path-style S3 requests so the bucket name never becomes part
+              # of DNS/Host routing during bootstrap.
+              aws configure set default.s3.addressing_style path
               endpoint="http://rustfs.${NAMESPACE}.svc.cluster.local:9000"
               for i in \$(seq 1 60); do
                 if aws --endpoint-url "\$endpoint" s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
