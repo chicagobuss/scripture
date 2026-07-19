@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scripture_runtime::{OutboundRecord, RetryPolicy, RoutingProducer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::assemble;
 use crate::config::ScriptureConfig;
@@ -44,6 +45,62 @@ pub struct LabOptions {
     pub payload_bytes: usize,
 }
 
+
+/// Object-store request counts scraped from a Scribe's `/status`.
+///
+/// Read before and after a run so the report states requests *per record*
+/// rather than leaving an operator to diff two snapshots by hand. Throughput
+/// without the request count is only half the cost picture: on this path the
+/// authority reads dominate and do not amortise with batching, so a run that
+/// reports only records/second hides the term that actually bills.
+#[derive(Debug, Clone, Copy, Default)]
+struct StoreCounters {
+    data_puts: u64,
+    data_gets: u64,
+    authority_puts: u64,
+    authority_gets: u64,
+}
+
+impl StoreCounters {
+    fn total(&self) -> u64 {
+        self.data_puts + self.data_gets + self.authority_puts + self.authority_gets
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            data_puts: self.data_puts.saturating_sub(before.data_puts),
+            data_gets: self.data_gets.saturating_sub(before.data_gets),
+            authority_puts: self.authority_puts.saturating_sub(before.authority_puts),
+            authority_gets: self.authority_gets.saturating_sub(before.authority_gets),
+        }
+    }
+}
+
+/// Scrapes `/status`; returns `None` when no status bind is configured or the
+/// Scribe is unreachable, so a lab run still reports throughput without it.
+async fn scrape_counters(status_bind: Option<&String>) -> Option<StoreCounters> {
+    let bind = status_bind?;
+    let mut stream = tokio::net::TcpStream::connect(bind).await.ok()?;
+    stream
+        .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .ok()?;
+    let mut body = String::new();
+    stream.read_to_string(&mut body).await.ok()?;
+
+    let field = |key: &str| -> u64 {
+        body.split_whitespace()
+            .find_map(|token| token.strip_prefix(key)?.parse().ok())
+            .unwrap_or(0)
+    };
+    Some(StoreCounters {
+        data_puts: field("store_puts="),
+        data_gets: field("store_gets="),
+        authority_puts: field("authority_puts="),
+        authority_gets: field("authority_gets="),
+    })
+}
+
 /// Runs concurrent producers and reports throughput plus correctness evidence.
 pub async fn produce_lab(
     config: ScriptureConfig,
@@ -57,6 +114,8 @@ pub async fn produce_lab(
         options.canon, options.verse, options.workers, options.per_worker, options.payload_bytes
     );
     println!("scripture produce-lab: this is a lab instrument; nothing here is optimised");
+
+    let before = scrape_counters(config.metrics.status_bind.as_ref()).await;
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(options.workers);
@@ -125,8 +184,10 @@ pub async fn produce_lab(
         failures.extend(worker_failures);
     }
     let wall = start.elapsed().as_secs_f64();
+    let after = scrape_counters(config.metrics.status_bind.as_ref()).await;
 
     report(&acks, &failures, &options, wall);
+    report_cost(before, after, acks.len());
     Ok(())
 }
 
@@ -247,6 +308,45 @@ fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f
         println!(
             "  worker {worker}: committed={count}/{} highest_seq={max_seq:?}",
             options.per_worker
+        );
+    }
+}
+
+/// Reports object-store requests per committed record, split by path.
+fn report_cost(before: Option<StoreCounters>, after: Option<StoreCounters>, committed: usize) {
+    let (Some(before), Some(after)) = (before, after) else {
+        println!("\n=== object-store cost ===");
+        println!("unavailable: no metrics.status_bind configured, or /status unreachable");
+        return;
+    };
+    if committed == 0 {
+        return;
+    }
+    let d = after.delta(before);
+    let n = committed as f64;
+    println!("\n=== object-store cost (requests per committed record) ===");
+    println!(
+        "data_put={:.3} data_get={:.3}",
+        d.data_puts as f64 / n,
+        d.data_gets as f64 / n
+    );
+    println!(
+        "authority_put={:.3} authority_get={:.3}",
+        d.authority_puts as f64 / n,
+        d.authority_gets as f64 / n
+    );
+    println!("total_requests_per_record={:.3}", d.total() as f64 / n);
+    let authority = (d.authority_puts + d.authority_gets) as f64;
+    if d.total() > 0 {
+        println!(
+            "authority_share={:.0}%  (does not amortise with batching)",
+            100.0 * authority / d.total() as f64
+        );
+    }
+    if d.data_puts > 0 {
+        println!(
+            "records_per_batch={:.2}  (data PUTs are the batch count)",
+            n / d.data_puts as f64
         );
     }
 }

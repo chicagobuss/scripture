@@ -200,3 +200,61 @@ object-store durability, real control-plane lease packets, or producer retry
 and outbox behavior. Those properties remain obligations of the companion
 models and runtime evidence; a passing arbitration run must never be cited as
 proof of no-loss cutover by itself.
+
+## Can a writer cache its authority observation?
+
+Measured on a live fleet, the Serving-Authority path costs about four register
+GETs per record, flat across concurrency, roughly 86% of all object-store
+requests (`docs/cost-model.md`). Those reads do not amortise with batching, so
+the only lever that moves the cost line materially is re-observing the root
+less often — which trades against the property that makes a deposed writer fail
+closed.
+
+`CachedAuthorityAppend.tla` prices that trade before anyone implements it.
+`AuthorityCacheBound` is how many appends a writer may make on one observation
+(0 = today's re-observe-every-time). `SealFencesAppends` is whether an append
+into a sealed generation fails at the storage layer regardless of what the
+writer believes.
+
+| Cache | Seal fences appends | Distinct states | Result |
+|---|---|---|---|
+| off | yes | 48 | safe |
+| **on** | **yes** | 76 | **safe** |
+| on | no | 30 | `NoCommitIntoSealedGeneration` violated |
+| off | no | 48 | safe |
+
+**Caching is safe if and only if the seal independently fences appends.**
+
+The fourth row is the one that reframes the design. With no caching, safety
+holds *even without* a seal fence, because re-observing catches the deposition
+before the append lands. So today's four reads per record are self-sufficient:
+they carry the safety property on their own. Turning caching on moves that
+burden onto the seal — the authority read stops being what makes a deposed
+writer safe and becomes an optimisation for *how quickly* it is refused.
+
+The counterexample is three steps: B recovers, sealing generation 0 and taking
+generation 1; A, still holding its cached observation, appends into the sealed
+generation 0. No two writers ever share a generation — `OneWriterPerGeneration`
+holds throughout — so the classic split-brain statement does not catch this.
+The loss is silent: a reader honouring the sealed tail never returns the
+record.
+
+Both safe-with-seal rows were checked for vacuity with a probe asserting
+`~(Cardinality(committed) >= 2 /\ sealed # {})`; TLC reports it violated in
+both, so those runs really do commit records with a seal in play.
+
+### What this makes an empirical question
+
+The model does not say whether Holylog's seal actually fences appends. That is
+now the deciding fact for whether the cost lever exists at all, and it is
+testable rather than arguable: Holylog already carries a `SealRaceHoldSealRead`
+fault for the seal-versus-in-flight-append race, which suggests the intent, but
+intent is not evidence. Until an append into a sealed generation is *observed*
+to fail, `AuthorityCacheBound > 0` must not ship.
+
+```sh
+for cfg in CacheOffSealOn CacheOnSealOn CacheOnSealOff CacheOffSealOff; do
+  java -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
+    -config "$cfg.cfg" CachedAuthorityAppend.tla
+done
+```
