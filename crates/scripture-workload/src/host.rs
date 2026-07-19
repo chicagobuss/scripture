@@ -47,18 +47,19 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
     ///
     /// Epoch is assigned by the progress register (bump on every fresh token).
     /// Must succeed before any `reconcile` / `apply`.
-    pub fn acquire_binding(
+    pub async fn acquire_binding(
         &self,
         key: BindingKey,
         owner_token: &BindingToken,
     ) -> Result<AcquiredBinding, HostError> {
         self.progress
             .acquire_or_renew(key, owner_token)
+            .await
             .map_err(HostError::from)
     }
 
     /// Processes one bounded, validated source range under an acquired fence.
-    pub fn process_range(
+    pub async fn process_range(
         &self,
         workload: &dyn Workload,
         range: &SourceRange,
@@ -86,6 +87,7 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
         let observed = self
             .progress
             .observe(&metadata.workload_id, &range.canon_id, &range.verse_id)
+            .await
             .map_err(HostError::from)?
             .ok_or(HostError::StaleBinding)?;
         let (register, _version) = observed;
@@ -127,6 +129,7 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
                 range.next_offset,
                 commit.last_commit_ref().to_owned(),
             )
+            .await
             .map_err(HostError::from)?;
 
         Ok(if replayed {

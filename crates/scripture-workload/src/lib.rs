@@ -10,6 +10,7 @@ mod config;
 mod host;
 mod materializer;
 mod progress;
+mod progress_object_store;
 mod types;
 mod workload;
 
@@ -22,6 +23,11 @@ pub use materializer::{JsonArrowParquetMaterializer, MaterializerError, ParquetC
 pub use progress::{
     AcquiredBinding, BindingKey, BindingToken, ConsumerBinding, ConsumerProgressStore,
     InMemoryProgressStore, ProgressError, ProgressRegister, ProgressVersion,
+};
+pub use progress_object_store::{
+    MAX_PROGRESS_COMMIT_REF_BYTES, MAX_PROGRESS_KEY_COMPONENT_BYTES, MAX_PROGRESS_RECORD_BYTES,
+    MAX_PROGRESS_TOKEN_BYTES, ObjectStoreProgressStore, PROGRESS_CODEC_HEADER_BYTES,
+    ProgressStoreConfigError,
 };
 pub use types::{
     CanonRecord, CanonRef, SchemaRef, SourceOffset, SourceRange, TypeError, VerseRef, WorkloadId,
