@@ -1606,6 +1606,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "scripture-telemetry-producer"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
