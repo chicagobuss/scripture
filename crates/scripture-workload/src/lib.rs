@@ -20,8 +20,8 @@ pub use config::{
 pub use host::{HostError, ProcessOutcome, WorkloadHost};
 pub use materializer::{JsonArrowParquetMaterializer, MaterializerError, ParquetCommitManifest};
 pub use progress::{
-    AcquiredBinding, BindingToken, ConsumerBinding, ConsumerCheckpoint, ConsumerProgressStore,
-    InMemoryProgressStore, ProgressError, ProgressVersion,
+    AcquiredBinding, BindingKey, BindingToken, ConsumerBinding, ConsumerProgressStore,
+    InMemoryProgressStore, ProgressError, ProgressRegister, ProgressVersion,
 };
 pub use types::{
     CanonRecord, CanonRef, SchemaRef, SourceOffset, SourceRange, TypeError, VerseRef, WorkloadId,

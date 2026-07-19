@@ -85,9 +85,11 @@ impl JsonArrowParquetMaterializer {
         })
     }
 
-    /// Stable path-safe key derived from workload + Canon + Verse + range.
+    /// Stable path-safe key derived from workload + Canon + Verse + epoch + range.
+    ///
+    /// Epoch is part of the key so stale-epoch PUTs cannot clobber a valid object.
     #[must_use]
-    pub fn object_key(&self, range: &SourceRange) -> String {
+    pub fn object_key(&self, range: &SourceRange, binding_epoch: u64) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.metadata.workload_id.as_str().as_bytes());
         hasher.update(b"\0");
@@ -95,19 +97,23 @@ impl JsonArrowParquetMaterializer {
         hasher.update(b"\0");
         hasher.update(range.verse_id.as_str().as_bytes());
         hasher.update(b"\0");
+        hasher.update(&binding_epoch.to_le_bytes());
+        hasher.update(b"\0");
         hasher.update(&range.first_offset.get().to_le_bytes());
         hasher.update(&range.next_offset.get().to_le_bytes());
         hasher.finalize().to_hex().to_string()
     }
 
-    fn parquet_path(&self, range: &SourceRange) -> PathBuf {
+    fn parquet_path(&self, range: &SourceRange, binding_epoch: u64) -> PathBuf {
         self.output_dir
-            .join(format!("{}.parquet", self.object_key(range)))
+            .join(format!("{}.parquet", self.object_key(range, binding_epoch)))
     }
 
-    fn manifest_path(&self, range: &SourceRange) -> PathBuf {
-        self.output_dir
-            .join(format!("{}.commit.json", self.object_key(range)))
+    fn manifest_path(&self, range: &SourceRange, binding_epoch: u64) -> PathBuf {
+        self.output_dir.join(format!(
+            "{}.commit.json",
+            self.object_key(range, binding_epoch)
+        ))
     }
 
     fn decode_batch(&self, range: &SourceRange) -> Result<RecordBatch, WorkloadError> {
@@ -152,11 +158,13 @@ impl JsonArrowParquetMaterializer {
     fn write_parquet_publish(
         &self,
         range: &SourceRange,
+        fence: &AcquiredBinding,
         batch: &RecordBatch,
     ) -> Result<(String, String), WorkloadError> {
         fs::create_dir_all(&self.output_dir)
             .map_err(|error| WorkloadError::OutputIo(format!("create output dir: {error}")))?;
-        let final_path = self.parquet_path(range);
+        let epoch = fence.binding.binding_epoch;
+        let final_path = self.parquet_path(range, epoch);
         if final_path.exists() {
             return Err(WorkloadError::Indeterminate(
                 "final parquet already exists without successful reconcile".into(),
@@ -164,7 +172,7 @@ impl JsonArrowParquetMaterializer {
         }
 
         let unique = BindingUnique::new();
-        let tmp_name = format!("{}.{unique}.parquet.tmp", self.object_key(range));
+        let tmp_name = format!("{}.{unique}.parquet.tmp", self.object_key(range, epoch));
         let tmp_path = self.output_dir.join(tmp_name);
         {
             let file = File::create(&tmp_path)
@@ -217,7 +225,7 @@ impl JsonArrowParquetMaterializer {
             parquet_file: parquet_file.to_owned(),
             parquet_digest: digest.to_owned(),
         };
-        let path = self.manifest_path(range);
+        let path = self.manifest_path(range, fence.binding.binding_epoch);
         if path.exists() {
             return Err(WorkloadError::Indeterminate(
                 "commit manifest already exists".into(),
@@ -226,7 +234,7 @@ impl JsonArrowParquetMaterializer {
         let unique = BindingUnique::new();
         let tmp = self.output_dir.join(format!(
             "{}.{unique}.commit.json.tmp",
-            self.object_key(range)
+            self.object_key(range, fence.binding.binding_epoch)
         ));
         let body = serde_json::to_vec_pretty(&manifest)
             .map_err(|error| WorkloadError::OutputIo(format!("encode manifest: {error}")))?;
@@ -258,8 +266,12 @@ impl JsonArrowParquetMaterializer {
         Ok(Some(manifest))
     }
 
-    fn any_tmp_for_key(&self, range: &SourceRange) -> Result<bool, WorkloadError> {
-        let prefix = format!("{}.", self.object_key(range));
+    fn any_tmp_for_key(
+        &self,
+        range: &SourceRange,
+        binding_epoch: u64,
+    ) -> Result<bool, WorkloadError> {
+        let prefix = format!("{}.", self.object_key(range, binding_epoch));
         let entries = fs::read_dir(&self.output_dir)
             .map_err(|error| WorkloadError::Indeterminate(format!("list output dir: {error}")))?;
         for entry in entries {
@@ -319,14 +331,14 @@ impl Workload for JsonArrowParquetMaterializer {
         }
 
         // Never delete unknown partials; their presence is indeterminate.
-        if self.any_tmp_for_key(range)? {
+        if self.any_tmp_for_key(range, fence.binding.binding_epoch)? {
             return Ok(ReconcileOutcome::Indeterminate {
                 detail: "partial/tmp output artifacts present; fail closed (not deleted)".into(),
             });
         }
 
-        let manifest_path = self.manifest_path(range);
-        let parquet_path = self.parquet_path(range);
+        let manifest_path = self.manifest_path(range, fence.binding.binding_epoch);
+        let parquet_path = self.parquet_path(range, fence.binding.binding_epoch);
 
         match self.read_manifest(&manifest_path)? {
             None => {
@@ -338,17 +350,26 @@ impl Workload for JsonArrowParquetMaterializer {
                 Ok(ReconcileOutcome::Absent)
             }
             Some(manifest) => {
-                // Epoch must match the current fence. Owner token in the
-                // manifest is provenance of the writer; a renewed fence under
-                // the same epoch may adopt the commit after crash-before-CAS.
+                // Epoch must match the current fence. Stale-epoch objects live
+                // under different keys and are never adopted here.
                 if manifest.workload_id != self.metadata.workload_id.as_str()
                     || manifest.canon_id != range.canon_id.as_str()
                     || manifest.verse_id != range.verse_id.as_str()
                     || manifest.first_offset != range.first_offset.get()
                     || manifest.next_offset != range.next_offset.get()
+                    || manifest.schema_ref != range.schema_ref.as_str()
                     || manifest.schema_ref != self.schema_ref.as_str()
                     || manifest.binding_epoch != fence.binding.binding_epoch
                 {
+                    // schema_ref / identity mismatch: refuse reconcile adoption.
+                    if manifest.schema_ref != range.schema_ref.as_str()
+                        || manifest.schema_ref != self.schema_ref.as_str()
+                    {
+                        return Err(WorkloadError::Schema(format!(
+                            "commit manifest schema_ref {} does not match range/materializer",
+                            manifest.schema_ref
+                        )));
+                    }
                     return Ok(ReconcileOutcome::Indeterminate {
                         detail: "commit manifest does not match delivered range/fence epoch".into(),
                     });
@@ -398,7 +419,7 @@ impl Workload for JsonArrowParquetMaterializer {
             }
         }
         let batch = self.decode_batch(range)?;
-        let (file_name, digest) = self.write_parquet_publish(range, &batch)?;
+        let (file_name, digest) = self.write_parquet_publish(range, fence, &batch)?;
         self.write_manifest_publish(range, fence, &file_name, &digest)?;
         Ok(OutputCommit {
             workload_id: self.metadata.workload_id.clone(),

@@ -15,7 +15,17 @@ pub struct OutputCommit {
     /// Exact source range covered by this commit.
     pub source_range: SourceRange,
     /// Non-secret opaque output identity (path, digest, snapshot id, …).
+    ///
+    /// Written into the progress register as `last_commit_ref` on advance.
     pub output_identity: String,
+}
+
+impl OutputCommit {
+    /// Opaque commit reference stored on the progress register after advance.
+    #[must_use]
+    pub fn last_commit_ref(&self) -> &str {
+        &self.output_identity
+    }
 }
 
 /// Result of reconciling a possibly previously completed range.

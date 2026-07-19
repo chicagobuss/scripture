@@ -1,9 +1,9 @@
-//! Host lifecycle: acquire fence → reconcile → apply → CAS checkpoint.
+//! Host lifecycle: acquire fence → reconcile → apply → CAS register advance.
 
 use crate::config::BatchBoundsConfig;
 use crate::progress::{
-    AcquiredBinding, BindingToken, ConsumerBinding, ConsumerCheckpoint, ConsumerProgressStore,
-    ProgressError, ProgressVersion,
+    AcquiredBinding, BindingKey, BindingToken, ConsumerProgressStore, ProgressError,
+    ProgressVersion,
 };
 use crate::types::{SourceOffset, SourceRange};
 use crate::workload::{
@@ -43,17 +43,17 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
         Self { progress }
     }
 
-    /// Acquires or renews the durable fence for this binding.
+    /// Acquires or renews the durable fence for this binding key.
     ///
-    /// Must succeed before any `reconcile` / `apply`. Race losers receive
-    /// [`HostError::FenceHeld`].
+    /// Epoch is assigned by the progress register (bump on every fresh token).
+    /// Must succeed before any `reconcile` / `apply`.
     pub fn acquire_binding(
         &self,
-        binding: ConsumerBinding,
+        key: BindingKey,
         owner_token: &BindingToken,
     ) -> Result<AcquiredBinding, HostError> {
         self.progress
-            .acquire_or_renew(binding, owner_token)
+            .acquire_or_renew(key, owner_token)
             .map_err(HostError::from)
     }
 
@@ -81,48 +81,37 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
             return Err(HostError::StaleBinding);
         }
 
-        // Re-assert fence ownership before any output side effect.
-        let fence = self
-            .progress
-            .acquire_or_renew(fence.binding.clone(), &fence.owner_token)
-            .map_err(HostError::from)?;
-
+        // Re-assert fence ownership without takeover. A zombie must not bump the
+        // epoch by calling acquire_or_renew after another process has taken over.
         let observed = self
             .progress
             .observe(&metadata.workload_id, &range.canon_id, &range.verse_id)
-            .map_err(HostError::from)?;
-        let expected_version = match &observed {
-            Some((checkpoint, version)) => {
-                if checkpoint.binding.binding_epoch != fence.binding.binding_epoch {
-                    return Err(HostError::StaleBinding);
-                }
-                if checkpoint.binding.workload_id != metadata.workload_id
-                    || checkpoint.binding.canon_id != range.canon_id
-                    || checkpoint.binding.verse_id != range.verse_id
-                {
-                    return Err(HostError::StaleBinding);
-                }
-                if checkpoint.next_offset != range.first_offset {
-                    return Err(HostError::NonContiguous {
-                        checkpoint_next: checkpoint.next_offset,
-                        range_first: range.first_offset,
-                    });
-                }
-                Some(*version)
-            }
-            None => None,
-        };
+            .map_err(HostError::from)?
+            .ok_or(HostError::StaleBinding)?;
+        let (register, _version) = observed;
+        if register.binding_token != fence.owner_token {
+            return Err(HostError::FenceHeld);
+        }
+        if register.binding.binding_epoch != fence.binding.binding_epoch {
+            return Err(HostError::StaleBinding);
+        }
+        if register.frontier != range.first_offset {
+            return Err(HostError::NonContiguous {
+                checkpoint_next: register.frontier,
+                range_first: range.first_offset,
+            });
+        }
 
-        let reconcile = workload.reconcile(range, &fence)?;
+        let reconcile = workload.reconcile(range, fence)?;
         let (commit, replayed) = match reconcile {
             ReconcileOutcome::Absent => {
-                let commit = workload.apply(range, &fence)?;
-                validate_output_commit(&commit, range, &fence, &metadata.workload_id)
+                let commit = workload.apply(range, fence)?;
+                validate_output_commit(&commit, range, fence, &metadata.workload_id)
                     .map_err(|error| HostError::OutputMismatch(error.to_string()))?;
                 (commit, false)
             }
             ReconcileOutcome::AlreadyCommitted(commit) => {
-                validate_output_commit(&commit, range, &fence, &metadata.workload_id)
+                validate_output_commit(&commit, range, fence, &metadata.workload_id)
                     .map_err(|error| HostError::OutputMismatch(error.to_string()))?;
                 (commit, true)
             }
@@ -131,14 +120,13 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
             }
         };
 
-        let checkpoint = ConsumerCheckpoint {
-            binding: fence.binding.clone(),
-            owner_token: fence.owner_token.clone(),
-            next_offset: range.next_offset,
-        };
-        let progress_version = self
+        let (_register, progress_version) = self
             .progress
-            .compare_and_swap(checkpoint, expected_version, &fence.owner_token)
+            .advance(
+                fence,
+                range.next_offset,
+                commit.last_commit_ref().to_owned(),
+            )
             .map_err(HostError::from)?;
 
         Ok(if replayed {

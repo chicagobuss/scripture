@@ -1,4 +1,11 @@
-//! Consumer binding fence and durable progress (never Serving Authority).
+//! Consumer binding fence and progress register (never Serving Authority).
+//!
+//! One logical register record per binding:
+//! `{ binding_epoch, binding_token, frontier, last_commit_ref }`.
+//!
+//! This in-memory store is a model/proof only — it does not claim durability.
+//! An ObjectStore conditional-register adapter should map `acquire_or_renew` /
+//! `advance` onto a single-object read + conditional put of [`ProgressRegister`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -7,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{CanonRef, SourceOffset, VerseRef, WorkloadId};
 
-/// Opaque compare-and-swap version for a progress or lease observation.
+/// Opaque compare-and-swap version (etag stand-in for a future register adapter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProgressVersion(u64);
 
@@ -26,6 +33,10 @@ impl ProgressVersion {
 }
 
 /// Opaque owner token for a fenced consumer binding.
+///
+/// Process-lifetime only: generated at process start, never persisted as a
+/// renewal identity across process death. A restart always presents a fresh
+/// token and therefore always bumps the epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BindingToken(String);
 
@@ -54,6 +65,29 @@ impl BindingToken {
     }
 }
 
+/// Binding identity without epoch (epoch is assigned by the progress register).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BindingKey {
+    /// Workload identity.
+    pub workload_id: WorkloadId,
+    /// Source Canon.
+    pub canon_id: CanonRef,
+    /// Source Verse.
+    pub verse_id: VerseRef,
+}
+
+impl BindingKey {
+    /// Builds a key from validated identities.
+    #[must_use]
+    pub fn new(workload_id: WorkloadId, canon_id: CanonRef, verse_id: VerseRef) -> Self {
+        Self {
+            workload_id,
+            canon_id,
+            verse_id,
+        }
+    }
+}
+
 /// Binding that authorizes a workload to consume a specific Canon/Verse lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumerBinding {
@@ -63,7 +97,7 @@ pub struct ConsumerBinding {
     pub canon_id: CanonRef,
     /// Source Verse.
     pub verse_id: VerseRef,
-    /// Binding epoch; must be nonzero; stale epochs fail closed.
+    /// Binding epoch; must be nonzero; assigned by acquire, never caller-chosen.
     pub binding_epoch: u64,
 }
 
@@ -75,61 +109,84 @@ impl ConsumerBinding {
         }
         Ok(())
     }
+
+    /// Identity key without epoch.
+    #[must_use]
+    pub fn key(&self) -> BindingKey {
+        BindingKey {
+            workload_id: self.workload_id.clone(),
+            canon_id: self.canon_id.clone(),
+            verse_id: self.verse_id.clone(),
+        }
+    }
 }
 
 /// Durable fenced ownership of one `(workload, Canon, Verse)` binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcquiredBinding {
-    /// Binding identity + epoch.
+    /// Binding identity + store-assigned epoch.
     pub binding: ConsumerBinding,
     /// Owner token required for checkpoint advancement and output commits.
     pub owner_token: BindingToken,
 }
 
-/// Consumer-owned next-offset progress for one binding.
+/// One logical progress register record per binding.
+///
+/// Serializes as a single conditional-register value for a future ObjectStore
+/// adapter. Tokens are carried in the live register while held; they are not a
+/// durable renewal identity across process death.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConsumerCheckpoint {
-    /// Binding this checkpoint belongs to (includes epoch).
+pub struct ProgressRegister {
+    /// Binding identity + epoch.
     pub binding: ConsumerBinding,
-    /// Owner token that held the fence when this checkpoint was written.
-    pub owner_token: BindingToken,
-    /// Next source offset to consume (never last-processed).
-    pub next_offset: SourceOffset,
+    /// Process-lifetime holder token (not a cross-restart renewal identity).
+    pub binding_token: BindingToken,
+    /// Next source offset to consume (forward-only).
+    pub frontier: SourceOffset,
+    /// Opaque identity of the output commit that justified the latest advance.
+    pub last_commit_ref: Option<String>,
 }
 
-/// Observe + acquire/renew fence + opaque-version CAS for checkpoints.
+/// Observe + acquire/renew + single-record CAS advance.
 pub trait ConsumerProgressStore: Send + Sync {
-    /// Acquires exclusive ownership of the binding, or renews if `owner_token` already holds it.
+    /// Acquires exclusive ownership of the binding, or renews if `owner_token`
+    /// already holds it.
     ///
-    /// Losers of a race receive [`ProgressError::FenceHeld`] and must not call
-    /// `reconcile` / `apply`.
+    /// - Absent → install epoch `1`, frontier `0`, no commit ref.
+    /// - Same token → renew; epoch / frontier / last_commit_ref unchanged.
+    /// - Different token → takeover: bump epoch, install token, carry frontier
+    ///   and last_commit_ref forward unchanged.
+    ///
+    /// Tokens are never persisted as renewal identities; a restarted process
+    /// must present a fresh token and therefore always bumps.
     fn acquire_or_renew(
         &self,
-        binding: ConsumerBinding,
+        key: BindingKey,
         owner_token: &BindingToken,
     ) -> Result<AcquiredBinding, ProgressError>;
 
-    /// Reads the current checkpoint and version for a binding key.
+    /// Reads the current register record and opaque CAS version.
     fn observe(
         &self,
         workload_id: &WorkloadId,
         canon_id: &CanonRef,
         verse_id: &VerseRef,
-    ) -> Result<Option<(ConsumerCheckpoint, ProgressVersion)>, ProgressError>;
+    ) -> Result<Option<(ProgressRegister, ProgressVersion)>, ProgressError>;
 
-    /// Compare-and-swaps progress when `expected` matches and `owner_token` holds the fence.
-    fn compare_and_swap(
+    /// Single-record CAS advance: require matching epoch+token, move frontier
+    /// strictly forward, and write `last_commit_ref`.
+    fn advance(
         &self,
-        checkpoint: ConsumerCheckpoint,
-        expected: Option<ProgressVersion>,
-        owner_token: &BindingToken,
-    ) -> Result<ProgressVersion, ProgressError>;
+        fence: &AcquiredBinding,
+        new_frontier: SourceOffset,
+        last_commit_ref: String,
+    ) -> Result<(ProgressRegister, ProgressVersion), ProgressError>;
 }
 
 /// Progress / fence store failures.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProgressError {
-    /// CAS lost a race or used a stale version.
+    /// CAS lost a race or used a stale observation.
     #[error("progress CAS conflict")]
     CasConflict,
     /// Another owner holds the durable fence for this binding.
@@ -141,25 +198,22 @@ pub enum ProgressError {
     /// Binding epoch must be nonzero.
     #[error("binding_epoch must be nonzero")]
     InvalidEpoch,
+    /// Frontier must move strictly forward.
+    #[error("frontier must advance strictly forward")]
+    FrontierRegression,
     /// Underlying store I/O failed.
     #[error("progress store I/O: {0}")]
     Io(String),
 }
 
-#[derive(Debug, Clone)]
-struct LeaseRecord {
-    binding: ConsumerBinding,
-    owner_token: BindingToken,
-}
-
 #[derive(Debug, Default)]
 struct MemoryState {
-    leases: HashMap<(String, String, String), LeaseRecord>,
-    checkpoints: HashMap<(String, String, String), (ConsumerCheckpoint, ProgressVersion)>,
+    /// One register record per binding key.
+    records: HashMap<(String, String, String), (ProgressRegister, ProgressVersion)>,
     next_version: u64,
 }
 
-/// In-process progress + fence store for deterministic contract tests.
+/// In-process progress register for deterministic contract tests (not durable).
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryProgressStore {
     inner: Arc<Mutex<MemoryState>>,
@@ -176,53 +230,85 @@ impl InMemoryProgressStore {
 impl ConsumerProgressStore for InMemoryProgressStore {
     fn acquire_or_renew(
         &self,
-        binding: ConsumerBinding,
+        key: BindingKey,
         owner_token: &BindingToken,
     ) -> Result<AcquiredBinding, ProgressError> {
-        binding.validate()?;
-        let key = key_of(&binding.workload_id, &binding.canon_id, &binding.verse_id);
+        let map_key = key_of(&key.workload_id, &key.canon_id, &key.verse_id);
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| ProgressError::Io("progress lock poisoned".into()))?;
-        match guard.leases.get(&key) {
+        match guard.records.get(&map_key).cloned() {
             None => {
-                guard.leases.insert(
-                    key,
-                    LeaseRecord {
-                        binding: binding.clone(),
-                        owner_token: owner_token.clone(),
-                    },
-                );
+                let binding = ConsumerBinding {
+                    workload_id: key.workload_id,
+                    canon_id: key.canon_id,
+                    verse_id: key.verse_id,
+                    binding_epoch: 1,
+                };
+                binding.validate()?;
+                let register = ProgressRegister {
+                    binding: binding.clone(),
+                    binding_token: owner_token.clone(),
+                    frontier: SourceOffset::new(0),
+                    last_commit_ref: None,
+                };
+                let version = ProgressVersion::new(guard.next_version);
+                guard.next_version = guard.next_version.saturating_add(1);
+                guard.records.insert(map_key, (register, version));
                 Ok(AcquiredBinding {
                     binding,
                     owner_token: owner_token.clone(),
                 })
             }
-            Some(existing) if existing.owner_token == *owner_token => {
-                if existing.binding.binding_epoch != binding.binding_epoch {
-                    return Err(ProgressError::StaleBinding);
-                }
-                if existing.binding.workload_id != binding.workload_id
-                    || existing.binding.canon_id != binding.canon_id
-                    || existing.binding.verse_id != binding.verse_id
+            Some((existing, version)) if existing.binding_token == *owner_token => {
+                // Same-token renewal during one process lifetime: retain epoch.
+                if existing.binding.workload_id != key.workload_id
+                    || existing.binding.canon_id != key.canon_id
+                    || existing.binding.verse_id != key.verse_id
                 {
                     return Err(ProgressError::StaleBinding);
                 }
-                // Renew: refresh recorded binding (same token).
-                guard.leases.insert(
-                    key,
-                    LeaseRecord {
-                        binding: binding.clone(),
-                        owner_token: owner_token.clone(),
-                    },
-                );
+                // Touch version so adapters see a successful renew write.
+                let new_version = ProgressVersion::new(guard.next_version);
+                guard.next_version = guard.next_version.saturating_add(1);
+                let _ = version;
+                guard
+                    .records
+                    .insert(map_key, (existing.clone(), new_version));
+                Ok(AcquiredBinding {
+                    binding: existing.binding,
+                    owner_token: owner_token.clone(),
+                })
+            }
+            Some((existing, _)) => {
+                // Fresh process token / takeover: always bump epoch; carry frontier.
+                let next_epoch = existing
+                    .binding
+                    .binding_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| ProgressError::Io("binding_epoch overflow".into()))?;
+                let binding = ConsumerBinding {
+                    workload_id: key.workload_id,
+                    canon_id: key.canon_id,
+                    verse_id: key.verse_id,
+                    binding_epoch: next_epoch,
+                };
+                binding.validate()?;
+                let register = ProgressRegister {
+                    binding: binding.clone(),
+                    binding_token: owner_token.clone(),
+                    frontier: existing.frontier,
+                    last_commit_ref: existing.last_commit_ref,
+                };
+                let version = ProgressVersion::new(guard.next_version);
+                guard.next_version = guard.next_version.saturating_add(1);
+                guard.records.insert(map_key, (register, version));
                 Ok(AcquiredBinding {
                     binding,
                     owner_token: owner_token.clone(),
                 })
             }
-            Some(_) => Err(ProgressError::FenceHeld),
         }
     }
 
@@ -231,62 +317,64 @@ impl ConsumerProgressStore for InMemoryProgressStore {
         workload_id: &WorkloadId,
         canon_id: &CanonRef,
         verse_id: &VerseRef,
-    ) -> Result<Option<(ConsumerCheckpoint, ProgressVersion)>, ProgressError> {
+    ) -> Result<Option<(ProgressRegister, ProgressVersion)>, ProgressError> {
         let key = key_of(workload_id, canon_id, verse_id);
         let guard = self
             .inner
             .lock()
             .map_err(|_| ProgressError::Io("progress lock poisoned".into()))?;
-        Ok(guard.checkpoints.get(&key).cloned())
+        Ok(guard.records.get(&key).cloned())
     }
 
-    fn compare_and_swap(
+    fn advance(
         &self,
-        checkpoint: ConsumerCheckpoint,
-        expected: Option<ProgressVersion>,
-        owner_token: &BindingToken,
-    ) -> Result<ProgressVersion, ProgressError> {
-        checkpoint.binding.validate()?;
-        if checkpoint.owner_token != *owner_token {
-            return Err(ProgressError::StaleBinding);
+        fence: &AcquiredBinding,
+        new_frontier: SourceOffset,
+        last_commit_ref: String,
+    ) -> Result<(ProgressRegister, ProgressVersion), ProgressError> {
+        fence.binding.validate()?;
+        if last_commit_ref.trim().is_empty() {
+            return Err(ProgressError::Io("empty last_commit_ref".into()));
         }
         let key = key_of(
-            &checkpoint.binding.workload_id,
-            &checkpoint.binding.canon_id,
-            &checkpoint.binding.verse_id,
+            &fence.binding.workload_id,
+            &fence.binding.canon_id,
+            &fence.binding.verse_id,
         );
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| ProgressError::Io("progress lock poisoned".into()))?;
-        let lease = guard.leases.get(&key).ok_or(ProgressError::StaleBinding)?;
-        if lease.owner_token != *owner_token {
+        let (existing, _) = guard
+            .records
+            .get(&key)
+            .cloned()
+            .ok_or(ProgressError::StaleBinding)?;
+        if existing.binding_token != fence.owner_token {
             return Err(ProgressError::FenceHeld);
         }
-        if lease.binding.binding_epoch != checkpoint.binding.binding_epoch {
+        if existing.binding.binding_epoch != fence.binding.binding_epoch {
             return Err(ProgressError::StaleBinding);
         }
-        match (guard.checkpoints.get(&key), expected) {
-            (None, None) => {}
-            (Some((_, version)), Some(expected)) if *version == expected => {
-                let (existing, _) = guard
-                    .checkpoints
-                    .get(&key)
-                    .cloned()
-                    .ok_or(ProgressError::CasConflict)?;
-                if existing.binding.binding_epoch != checkpoint.binding.binding_epoch {
-                    return Err(ProgressError::StaleBinding);
-                }
-                if existing.binding != checkpoint.binding {
-                    return Err(ProgressError::StaleBinding);
-                }
-            }
-            _ => return Err(ProgressError::CasConflict),
+        if existing.binding.workload_id != fence.binding.workload_id
+            || existing.binding.canon_id != fence.binding.canon_id
+            || existing.binding.verse_id != fence.binding.verse_id
+        {
+            return Err(ProgressError::StaleBinding);
         }
+        if new_frontier.get() <= existing.frontier.get() {
+            return Err(ProgressError::FrontierRegression);
+        }
+        let register = ProgressRegister {
+            binding: existing.binding,
+            binding_token: fence.owner_token.clone(),
+            frontier: new_frontier,
+            last_commit_ref: Some(last_commit_ref),
+        };
         let version = ProgressVersion::new(guard.next_version);
         guard.next_version = guard.next_version.saturating_add(1);
-        guard.checkpoints.insert(key, (checkpoint, version));
-        Ok(version)
+        guard.records.insert(key, (register.clone(), version));
+        Ok((register, version))
     }
 }
 
@@ -317,58 +405,88 @@ mod hex {
 mod tests {
     use super::*;
 
-    fn binding(epoch: u64) -> ConsumerBinding {
-        ConsumerBinding {
-            workload_id: WorkloadId::new("wl-1").expect("id"),
-            canon_id: CanonRef::new("canon-a").expect("canon"),
-            verse_id: VerseRef::new("verse-1").expect("verse"),
-            binding_epoch: epoch,
-        }
+    fn key() -> BindingKey {
+        BindingKey::new(
+            WorkloadId::new("wl-1").expect("id"),
+            CanonRef::new("canon-a").expect("canon"),
+            VerseRef::new("verse-1").expect("verse"),
+        )
     }
 
     #[test]
-    fn acquire_race_second_loses_before_any_output() {
+    fn acquire_race_second_token_takeovers_and_bumps_epoch() {
         let store = InMemoryProgressStore::new();
         let t1 = BindingToken::new("token-a").expect("t");
         let t2 = BindingToken::new("token-b").expect("t");
-        store.acquire_or_renew(binding(1), &t1).expect("first wins");
-        assert_eq!(
-            store.acquire_or_renew(binding(1), &t2),
-            Err(ProgressError::FenceHeld)
-        );
+        let a = store.acquire_or_renew(key(), &t1).expect("first");
+        assert_eq!(a.binding.binding_epoch, 1);
+        let b = store.acquire_or_renew(key(), &t2).expect("takeover");
+        assert_eq!(b.binding.binding_epoch, 2);
+        let observed = store
+            .observe(&key().workload_id, &key().canon_id, &key().verse_id)
+            .expect("observe")
+            .expect("present");
+        assert_eq!(observed.0.binding.binding_epoch, 2);
+        assert_eq!(observed.0.binding_token, t2);
+        assert_eq!(observed.0.frontier, SourceOffset::new(0));
     }
 
     #[test]
-    fn renew_same_token_ok_zero_epoch_rejected() {
+    fn renew_same_token_retains_epoch() {
         let store = InMemoryProgressStore::new();
         let token = BindingToken::new("token-a").expect("t");
-        store.acquire_or_renew(binding(1), &token).expect("acquire");
-        store.acquire_or_renew(binding(1), &token).expect("renew");
-        assert_eq!(
-            store.acquire_or_renew(binding(0), &token),
-            Err(ProgressError::InvalidEpoch)
-        );
+        let first = store.acquire_or_renew(key(), &token).expect("acquire");
+        let renewed = store.acquire_or_renew(key(), &token).expect("renew");
+        assert_eq!(first.binding.binding_epoch, renewed.binding.binding_epoch);
+        assert_eq!(renewed.binding.binding_epoch, 1);
     }
 
     #[test]
-    fn cas_requires_fence_token() {
+    fn advance_requires_fence_token_and_rejects_regression() {
         let store = InMemoryProgressStore::new();
         let token = BindingToken::new("token-a").expect("t");
         let other = BindingToken::new("token-b").expect("t");
-        store.acquire_or_renew(binding(1), &token).expect("acquire");
-        let cp = ConsumerCheckpoint {
-            binding: binding(1),
-            owner_token: token.clone(),
-            next_offset: SourceOffset::new(0),
-        };
-        store.compare_and_swap(cp, None, &token).expect("cas");
-        let forged = ConsumerCheckpoint {
-            binding: binding(1),
-            owner_token: other.clone(),
-            next_offset: SourceOffset::new(1),
+        let fence = store.acquire_or_renew(key(), &token).expect("acquire");
+        store
+            .advance(&fence, SourceOffset::new(3), "commit-a".into())
+            .expect("advance");
+        let forged = AcquiredBinding {
+            binding: fence.binding.clone(),
+            owner_token: other,
         };
         assert_eq!(
-            store.compare_and_swap(forged, Some(ProgressVersion::new(0)), &other),
+            store.advance(&forged, SourceOffset::new(4), "commit-b".into()),
+            Err(ProgressError::FenceHeld)
+        );
+        assert_eq!(
+            store.advance(&fence, SourceOffset::new(3), "commit-c".into()),
+            Err(ProgressError::FrontierRegression)
+        );
+        assert_eq!(
+            store.advance(&fence, SourceOffset::new(2), "commit-d".into()),
+            Err(ProgressError::FrontierRegression)
+        );
+    }
+
+    #[test]
+    fn restart_token_always_bumps_epoch_and_carries_frontier() {
+        let store = InMemoryProgressStore::new();
+        let t1 = BindingToken::new("proc-1").expect("t");
+        let fence = store.acquire_or_renew(key(), &t1).expect("acquire");
+        store
+            .advance(&fence, SourceOffset::new(10), "c1".into())
+            .expect("advance");
+        let t2 = BindingToken::new("proc-2").expect("t");
+        let restarted = store.acquire_or_renew(key(), &t2).expect("restart");
+        assert_eq!(restarted.binding.binding_epoch, 2);
+        let observed = store
+            .observe(&key().workload_id, &key().canon_id, &key().verse_id)
+            .expect("observe")
+            .expect("present");
+        assert_eq!(observed.0.frontier, SourceOffset::new(10));
+        assert_eq!(observed.0.last_commit_ref.as_deref(), Some("c1"));
+        assert_eq!(
+            store.advance(&fence, SourceOffset::new(11), "stale".into()),
             Err(ProgressError::FenceHeld)
         );
     }
