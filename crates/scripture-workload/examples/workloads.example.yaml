@@ -1,0 +1,26 @@
+# Example workloads fragment (optional). Existing single-scribe configs stay valid
+# when this section is absent or empty. No field claims exactly-once delivery.
+workloads:
+  - id: parquet-events
+    kind: json_arrow_parquet
+    canon_id: events
+    verse_id: v0
+    binding_epoch: 1
+    checkpoint:
+      identity: local://checkpoints/parquet-events
+    batch:
+      max_records: 100
+      max_bytes: 1048576
+    decoder:
+      kind: newline_json
+      schema_ref: events.v1
+      arrow_schema:
+        fields:
+          - name: id
+            data_type: utf8
+          - name: amount
+            data_type: int64
+            nullable: true
+    output:
+      directory: /tmp/scripture-parquet-example
+    malformed: fail_batch

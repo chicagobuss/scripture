@@ -1,0 +1,5 @@
+# Example Cargo config for the private `fleet` registry (Kellnr).
+# Copy to ignored .cargo/config.toml. Never commit tokens or real endpoints.
+#
+# [registries.fleet]
+# index = "sparse+REPLACE_WITH_KELLNR_SPARSE_INDEX"
