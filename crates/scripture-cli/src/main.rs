@@ -127,10 +127,13 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Config path plus the optional `(canon, verse)` filter for `directory`.
+type DirectoryArgs = (String, Option<String>, Option<String>);
+
 /// Parses `directory --config <path> [--canon <id> --verse <id>]`.
 fn parse_directory_args(
     arguments: &mut impl Iterator<Item = String>,
-) -> Result<(String, Option<String>, Option<String>), Box<dyn Error>> {
+) -> Result<DirectoryArgs, Box<dyn Error>> {
     let mut config_path = None;
     let mut canon = None;
     let mut verse = None;
