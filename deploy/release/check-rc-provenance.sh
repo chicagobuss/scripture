@@ -84,10 +84,16 @@ regs = builder.get("cargo_registries") or []
 if "fleet" not in regs:
     fail("builder.cargo_registries must include fleet")
 
+# The shipped image/package source and the operator runner are distinct
+# inputs.  A runner-only correction must not make us relabel an existing
+# registry-built artifact as if it had been rebuilt from that later commit.
 src = manifest.get("source_commit")
 att_src = att.get("source_commit")
-if src != head or att_src != head:
-    fail(f"source_commit mismatch manifest={src!r} attestation={att_src!r} HEAD={head!r}")
+runner_src = manifest.get("runner_commit")
+if src != att_src:
+    fail(f"artifact source_commit mismatch manifest={src!r} attestation={att_src!r}")
+if runner_src != head:
+    fail(f"runner_commit mismatch manifest={runner_src!r} HEAD={head!r}")
 
 cargo = manifest.get("cargo") or {}
 if cargo.get("lockfile_hash") != lock_hash:
