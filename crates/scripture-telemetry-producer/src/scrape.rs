@@ -22,7 +22,16 @@ pub struct OpenMetricsSample {
     pub metric_type: String,
 }
 
-/// OpenMetrics parse failures.
+/// Result of parsing an exposition body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseResult {
+    /// Successfully parsed samples.
+    pub samples: Vec<OpenMetricsSample>,
+    /// Malformed sample lines skipped (counted, not fatal).
+    pub unparseable_lines: u64,
+}
+
+/// OpenMetrics parse failures (reserved for whole-body fatals; sample lines are counted).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// Truncated or malformed body that must fail closed.
@@ -55,54 +64,60 @@ pub enum ScrapeError {
 
 /// Parses Prometheus / OpenMetrics text exposition format.
 ///
-/// Exemplars are ignored. Malformed sample lines fail the whole scrape closed
-/// (no half-parsed garbage). `# HELP` / `# TYPE` / `# EOF` / blank lines are
-/// metadata only.
-pub fn parse_openmetrics(body: &str) -> Result<Vec<OpenMetricsSample>, ParseError> {
+/// Exemplars are ignored. Individual malformed sample lines are counted in
+/// [`ParseResult::unparseable_lines`] and skipped — a single odd series must
+/// not blank an otherwise healthy scrape. `# HELP` / `# TYPE` / `# EOF` /
+/// blank lines are metadata only.
+pub fn parse_openmetrics(body: &str) -> Result<ParseResult, ParseError> {
     let mut samples = Vec::new();
+    let mut unparseable_lines = 0_u64;
     let mut types: BTreeMap<String, String> = BTreeMap::new();
 
-    for (line_no, raw) in body.lines().enumerate() {
+    for raw in body.lines() {
         let line = raw.trim();
         if line.is_empty() || line == "# EOF" {
             continue;
         }
         if let Some(rest) = line.strip_prefix("# TYPE ") {
             let mut parts = rest.split_whitespace();
-            let name = parts
-                .next()
-                .ok_or_else(|| ParseError::Malformed(format!("type line {line_no}")))?;
-            let ty = parts
-                .next()
-                .ok_or_else(|| ParseError::Malformed(format!("type line {line_no}")))?;
+            let Some(name) = parts.next() else {
+                unparseable_lines += 1;
+                continue;
+            };
+            let Some(ty) = parts.next() else {
+                unparseable_lines += 1;
+                continue;
+            };
             types.insert(name.to_owned(), ty.to_owned());
             continue;
         }
         if line.starts_with('#') {
-            // HELP / UNIT / comments — ignore.
             continue;
         }
-        let sample = parse_sample_line(line)
-            .map_err(|message| ParseError::Malformed(format!("line {}: {message}", line_no + 1)))?;
-        let metric_type = types
-            .get(&sample.name)
-            .cloned()
-            .unwrap_or_else(|| "untyped".to_owned());
-        samples.push(OpenMetricsSample {
-            metric_type,
-            ..sample
-        });
+        match parse_sample_line(line) {
+            Ok(sample) => {
+                let metric_type = types
+                    .get(&sample.name)
+                    .cloned()
+                    .unwrap_or_else(|| "untyped".to_owned());
+                samples.push(OpenMetricsSample {
+                    metric_type,
+                    ..sample
+                });
+            }
+            Err(_) => {
+                unparseable_lines += 1;
+            }
+        }
     }
-    Ok(samples)
+    Ok(ParseResult {
+        samples,
+        unparseable_lines,
+    })
 }
 
 fn parse_sample_line(line: &str) -> Result<OpenMetricsSample, String> {
-    // Drop exemplars: `... # {…} value`
-    let line = match line.find(" # ") {
-        Some(idx) => &line[..idx],
-        None => line,
-    };
-
+    let line = strip_exemplar_outside_quotes(line);
     let (name_and_labels, value_and_ts) = split_metric_and_value(line)?;
     let (name, labels) = parse_name_labels(name_and_labels)?;
     let (value, timestamp_ms) = parse_value_timestamp(value_and_ts)?;
@@ -115,37 +130,89 @@ fn parse_sample_line(line: &str) -> Result<OpenMetricsSample, String> {
     })
 }
 
-fn split_metric_and_value(line: &str) -> Result<(&str, &str), String> {
-    // Value starts at the last whitespace-separated token group. Labels may
-    // contain spaces inside quotes, so walk carefully.
+/// Drops an exemplar suffix (` # {…}`) only when the ` # ` is outside quotes.
+fn strip_exemplar_outside_quotes(line: &str) -> &str {
     let mut in_quotes = false;
-    let mut last_space = None;
-    for (idx, ch) in line.char_indices() {
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        let ch = bytes[i] as char;
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
         match ch {
+            '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
-            ' ' | '\t' if !in_quotes => last_space = Some(idx),
+            ' ' if !in_quotes && bytes[i + 1] == b'#' && bytes[i + 2] == b' ' => {
+                return &line[..i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+fn split_metric_and_value(line: &str) -> Result<(&str, &str), String> {
+    // Quote-aware scan: find the closing `}` of the label set (if any), then
+    // take the remainder as value (+ optional timestamp).
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut brace_depth = 0_i32;
+    let mut labels_end = None;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '{' if !in_quotes => brace_depth += 1,
+            '}' if !in_quotes => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    labels_end = Some(idx + ch.len_utf8());
+                    break;
+                }
+            }
             _ => {}
         }
     }
-    // May have "value" or "value timestamp". Find the first space after labels.
-    let brace_end = line.find('}').map(|idx| idx + 1).unwrap_or(0);
-    let search_from = if line.contains('{') { brace_end } else { 0 };
-    let rest = line
-        .get(search_from..)
-        .ok_or_else(|| "truncated sample".to_owned())?;
-    let trimmed = rest.trim_start();
-    if trimmed.is_empty() {
-        // Name-only before value — use last_space path for no-label metrics.
-        let space = last_space.ok_or_else(|| "missing value".to_owned())?;
-        return Ok((line[..space].trim(), line[space + 1..].trim()));
+    if brace_depth != 0 {
+        return Err("unbalanced label braces".into());
     }
-    if line.contains('{') {
-        let name_and_labels = line[..search_from].trim();
-        Ok((name_and_labels, trimmed))
-    } else {
-        let space = last_space.ok_or_else(|| "missing value".to_owned())?;
-        Ok((line[..space].trim(), line[space + 1..].trim()))
+
+    if let Some(end) = labels_end {
+        let name_and_labels = line[..end].trim();
+        let value_and_ts = line[end..].trim_start();
+        if value_and_ts.is_empty() {
+            return Err("missing value".into());
+        }
+        return Ok((name_and_labels, value_and_ts));
     }
+
+    // No labels: split on first whitespace.
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ' ' | '\t' if !in_quotes => {
+                return Ok((line[..idx].trim(), line[idx + 1..].trim()));
+            }
+            _ => {}
+        }
+    }
+    Err("missing value".into())
 }
 
 fn parse_name_labels(raw: &str) -> Result<(String, BTreeMap<String, String>), String> {
@@ -196,7 +263,6 @@ fn parse_labels(inner: &str) -> Result<BTreeMap<String, String>, String> {
                 other => value.push(other),
             }
         }
-        // Advance rest past consumed value.
         let consumed = find_closing_quote(rest)?;
         rest = rest[consumed + 1..].trim_start();
         if rest.starts_with(',') {
@@ -235,10 +301,7 @@ fn parse_value_timestamp(raw: &str) -> Result<(f64, Option<i64>), String> {
             .map_err(|_| format!("bad value {other}"))?,
     };
     let timestamp_ms = match parts.next() {
-        Some(ts) => Some(
-            ts.parse::<i64>()
-                .map_err(|_| format!("bad timestamp {ts}"))?,
-        ),
+        Some(ts) => Some(parse_timestamp_to_millis(ts)?),
         None => None,
     };
     if parts.next().is_some() {
@@ -247,7 +310,21 @@ fn parse_value_timestamp(raw: &str) -> Result<(f64, Option<i64>), String> {
     Ok((value, timestamp_ms))
 }
 
-/// Minimal HTTP/1.1 GET against `url`, enforcing `max_response_bytes` and timeout.
+/// Prometheus uses integer milliseconds; OpenMetrics allows float seconds.
+fn parse_timestamp_to_millis(raw: &str) -> Result<i64, String> {
+    if raw.contains('.') {
+        let secs: f64 = raw.parse().map_err(|_| format!("bad timestamp {raw}"))?;
+        Ok((secs * 1000.0).round() as i64)
+    } else {
+        raw.parse::<i64>()
+            .map_err(|_| format!("bad timestamp {raw}"))
+    }
+}
+
+/// Minimal HTTP/1.0 GET against `url`, enforcing `max_response_bytes` and timeout.
+///
+/// HTTP/1.0 forbids chunked transfer encoding on responses, which keeps the
+/// hand-rolled client honest against Go exporters (node-exporter, etc.).
 pub async fn scrape_url(
     url: &str,
     max_response_bytes: usize,
@@ -261,7 +338,7 @@ pub async fn scrape_url(
         .map_err(ScrapeError::Io)?;
     let mut stream = connect;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: text/plain\r\n\r\n"
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\nAccept: text/plain\r\n\r\n"
     );
     timeout(request_timeout, stream.write_all(request.as_bytes()))
         .await
@@ -344,19 +421,52 @@ node_cpu_seconds_total{cpu="0",mode="idle"} 12.5 # {span_id="abc"} 1.0
 # TYPE node_memory_MemAvailable_bytes gauge
 node_memory_MemAvailable_bytes 1024
 "#;
-        let samples = parse_openmetrics(body).expect("parse");
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].name, "node_cpu_seconds_total");
-        assert_eq!(samples[0].labels.get("cpu").map(String::as_str), Some("0"));
-        assert!((samples[0].value - 12.5).abs() < f64::EPSILON);
-        assert_eq!(samples[0].metric_type, "counter");
-        assert_eq!(samples[1].name, "node_memory_MemAvailable_bytes");
-        assert_eq!(samples[1].metric_type, "gauge");
+        let result = parse_openmetrics(body).expect("parse");
+        assert_eq!(result.samples.len(), 2);
+        assert_eq!(result.unparseable_lines, 0);
+        assert_eq!(result.samples[0].name, "node_cpu_seconds_total");
+        assert_eq!(
+            result.samples[0].labels.get("cpu").map(String::as_str),
+            Some("0")
+        );
+        assert!((result.samples[0].value - 12.5).abs() < f64::EPSILON);
+        assert_eq!(result.samples[0].metric_type, "counter");
+        assert_eq!(result.samples[1].name, "node_memory_MemAvailable_bytes");
+        assert_eq!(result.samples[1].metric_type, "gauge");
     }
 
     #[test]
-    fn malformed_line_fails_closed() {
-        let body = "not_a_valid_sample\n";
-        assert!(parse_openmetrics(body).is_err());
+    fn quoted_brace_and_hash_in_labels_are_legal() {
+        let body = r#"weird{path="a}b",note="x # y"} 1
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 2
+"#;
+        let result = parse_openmetrics(body).expect("parse");
+        assert_eq!(result.samples.len(), 2);
+        assert_eq!(
+            result.samples[0].labels.get("path").map(String::as_str),
+            Some("a}b")
+        );
+        assert_eq!(
+            result.samples[0].labels.get("note").map(String::as_str),
+            Some("x # y")
+        );
+    }
+
+    #[test]
+    fn float_timestamp_seconds_accepted() {
+        let body = r#"node_memory_MemAvailable_bytes 1024 1710000000.5
+"#;
+        let result = parse_openmetrics(body).expect("parse");
+        assert_eq!(result.samples.len(), 1);
+        assert_eq!(result.samples[0].timestamp_ms, Some(1_710_000_000_500));
+    }
+
+    #[test]
+    fn malformed_line_is_counted_not_fatal() {
+        let body = "not_a_valid_sample\nnode_memory_MemAvailable_bytes 1\n";
+        let result = parse_openmetrics(body).expect("parse");
+        assert_eq!(result.unparseable_lines, 1);
+        assert_eq!(result.samples.len(), 1);
     }
 }

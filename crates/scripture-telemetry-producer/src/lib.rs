@@ -21,7 +21,14 @@ pub use config::{
     BufferConfig, IngressEndpoint, NormalizeConfig, ProducerConfig, ScrapeConfig, ScrapeSource,
     SourceKind, ValidateError,
 };
-pub use envelope::{MetricEnvelope, MetricPoint, OtelBody, SCHEMA_REF, SeqAllocator};
+pub use envelope::{
+    EnvelopeContext, MetricEnvelope, MetricPoint, OtelBody, SCHEMA_REF, SeqAllocator,
+    format_rfc3339_utc,
+};
 pub use normalize::{NormalizeCounters, NormalizedBatch, normalize_samples};
-pub use pipeline::{PreparedRecord, dedup_committed_lines, enqueue, prepare_scrape};
-pub use scrape::{OpenMetricsSample, ParseError, ScrapeError, parse_openmetrics, scrape_url};
+pub use pipeline::{
+    DedupResult, PrepareCounters, PreparedRecord, dedup_committed_lines, enqueue, prepare_scrape,
+};
+pub use scrape::{
+    OpenMetricsSample, ParseError, ParseResult, ScrapeError, parse_openmetrics, scrape_url,
+};

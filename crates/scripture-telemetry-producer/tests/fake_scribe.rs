@@ -70,7 +70,6 @@ async fn run_fake_scribe(
                                 let mut guard = state.lock().await;
                                 guard.committed.push(payload);
                             }
-                            // Drop connection without writing OK.
                             break;
                         }
                         let first = next_offset;
@@ -108,8 +107,8 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     );
     config.validate().expect("valid");
 
-    let mut seqs = SeqAllocator::default();
-    let (prepared, dropped_series, dropped_unlisted) = prepare_scrape(
+    let mut seqs = SeqAllocator::with_incarnation(1001);
+    let (prepared, counters) = prepare_scrape(
         &config,
         "node-node-a",
         SourceKind::NodeExporter,
@@ -117,9 +116,13 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
         &mut seqs,
     )
     .expect("prepare");
-    assert_eq!(dropped_series, 0);
-    assert_eq!(dropped_unlisted, 0);
+    assert_eq!(counters.dropped_series, 0);
+    assert_eq!(counters.dropped_metric_not_allowlisted, 0);
+    assert_eq!(counters.unparseable_lines, 0);
     assert_eq!(prepared.len(), 2);
+    assert!(prepared[0].envelope.collected_at.ends_with('Z'));
+    assert!(prepared[0].envelope.collected_at.contains('T'));
+    assert_eq!(prepared[0].envelope.incarnation, 1001);
 
     let mut buffer = DropOldestBuffer::new(
         "node-node-a",
@@ -132,27 +135,23 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     let mut send_log = Vec::new();
     let mut acked = BTreeSet::new();
 
-    // First record: server drops before ACK → Unacked; payload may already be committed.
     let first = buffer.pop_front().expect("first");
     let status = client.send_await_ack(&first).await.expect("send");
     assert_eq!(status, AckStatus::Unacked);
     send_log.push((first.seq, status, first.payload_digest.clone()));
 
-    // Resend same seq/line (at-least-once).
     client.disconnect();
     let status = client.send_await_ack(&first).await.expect("resend");
     assert!(matches!(status, AckStatus::Committed { .. }));
     acked.insert(first.seq);
     send_log.push((first.seq, status, first.payload_digest.clone()));
 
-    // Remaining record commits cleanly.
     let second = buffer.pop_front().expect("second");
     let status = client.send_await_ack(&second).await.expect("second");
     assert!(matches!(status, AckStatus::Committed { .. }));
     acked.insert(second.seq);
 
     let committed = state.lock().await.committed.clone();
-    // At least one duplicate of seq 0 should exist in the Canon log.
     let seq0_count = committed
         .iter()
         .filter(|line| line.contains("\"seq\":0"))
@@ -163,8 +162,10 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     );
 
     let deduped = dedup_committed_lines(&committed);
-    assert_eq!(deduped.len(), 2, "dedup should collapse to sent set");
+    assert_eq!(deduped.unparseable_committed, 0);
+    assert_eq!(deduped.lines.len(), 2, "dedup should collapse to sent set");
     let dedup_seqs: BTreeSet<u64> = deduped
+        .lines
         .iter()
         .filter_map(|line| {
             serde_json::from_str::<serde_json::Value>(line)
@@ -174,8 +175,7 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
         .collect();
     assert_eq!(dedup_seqs, acked);
 
-    // All duplicates share the same producer_id/verse/seq key for seq 0.
-    let keys: BTreeSet<(String, String, u64)> = committed
+    let keys: BTreeSet<(String, String, u64, u64)> = committed
         .iter()
         .filter_map(|line| {
             let value: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -185,6 +185,7 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
             Some((
                 value.get("producer_id")?.as_str()?.to_owned(),
                 value.get("verse")?.as_str()?.to_owned(),
+                value.get("incarnation")?.as_u64()?,
                 0,
             ))
         })
@@ -192,10 +193,51 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     assert_eq!(keys.len(), 1);
     assert_eq!(
         keys.iter().next().expect("key"),
-        &("fleet-collector-0".into(), "node-node-a".into(), 0)
+        &("fleet-collector-0".into(), "node-node-a".into(), 1001, 0)
     );
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
-    let _ = send_log;
+    assert_eq!(send_log.len(), 2);
+}
+
+#[tokio::test]
+async fn restart_incarnation_keeps_seq_zero_distinct() {
+    let config = ProducerConfig::phase1_single_source(
+        "fleet-collector-0",
+        "http://127.0.0.1/metrics",
+        "127.0.0.1:9",
+    );
+    let mut first_life = SeqAllocator::with_incarnation(1);
+    let mut second_life = SeqAllocator::with_incarnation(2);
+    let (a, _) = prepare_scrape(
+        &config,
+        "node-node-a",
+        SourceKind::NodeExporter,
+        SAMPLE_BODY,
+        &mut first_life,
+    )
+    .expect("first");
+    let (b, _) = prepare_scrape(
+        &config,
+        "node-node-a",
+        SourceKind::NodeExporter,
+        SAMPLE_BODY,
+        &mut second_life,
+    )
+    .expect("second");
+    assert_eq!(a[0].envelope.seq, 0);
+    assert_eq!(b[0].envelope.seq, 0);
+    assert_ne!(a[0].envelope.incarnation, b[0].envelope.incarnation);
+    assert_ne!(a[0].envelope.dedup_key(), b[0].envelope.dedup_key());
+
+    let mut committed = vec![a[0].buffered.line.clone(), b[0].buffered.line.clone()];
+    // Same seq across incarnations must both survive dedup.
+    let deduped = dedup_committed_lines(&committed);
+    assert_eq!(deduped.lines.len(), 2);
+
+    committed.push("not-json".into());
+    let with_garbage = dedup_committed_lines(&committed);
+    assert_eq!(with_garbage.unparseable_committed, 1);
+    assert_eq!(with_garbage.lines.len(), 2);
 }
