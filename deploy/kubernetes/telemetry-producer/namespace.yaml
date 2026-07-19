@@ -1,0 +1,8 @@
+# Dedicated prototype namespace — never scripture-lab, never Tracker RustFS.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scripture-prototype
+  labels:
+    app.kubernetes.io/part-of: scripture
+    scripture.dev/purpose: telemetry-prototype

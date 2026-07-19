@@ -14,10 +14,19 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "scripture-telemetry-producer"
+path = "src/main.rs"
+
+[[bin]]
+name = "raw-lines-lab-sink"
+path = "src/bin/raw_lines_lab_sink.rs"
+doc = false
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

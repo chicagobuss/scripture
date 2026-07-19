@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scripture-telemetry-producer
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: scripture-telemetry-producer
+data:
+  telemetry-producer.yaml: |
+    telemetry_producer:
+      producer_id: fleet-collector-0
+      canon: fleet-telemetry
+      endpoints:
+        - verse: node-node-a
+          connect: raw-lines-lab-sink.scripture-prototype.svc:9101
+        - verse: node-node-b
+          connect: raw-lines-lab-sink.scripture-prototype.svc:9101
+        - verse: cluster-state
+          connect: raw-lines-lab-sink.scripture-prototype.svc:9101
+      scrape:
+        interval: 15s
+        timeout: 5s
+        max_response_bytes: 8000000
+        max_series_per_scrape: 5000
+        sources:
+          - verse: node-node-a
+            kind: node-exporter
+            url: "http://node-exporter-node-a.scripture-prototype.svc:9100/metrics"
+          - verse: node-node-b
+            kind: node-exporter
+            url: "http://node-exporter-node-b.scripture-prototype.svc:9100/metrics"
+          - verse: cluster-state
+            kind: kube-state-metrics
+            url: "http://kube-state-metrics.scripture-prototype.svc:8080/metrics"
+      normalize:
+        schema_ref: otel-shaped-metrics.v1
+        metric_allowlist:
+          - node_cpu_seconds_total
+          - node_memory_MemAvailable_bytes
+          - kube_pod_status_phase
+          - kube_node_status_condition
+        label_allowlist:
+          - instance
+          - cpu
+          - mode
+          - namespace
+          - phase
+          - node
+          - condition
+          - status
+          - pod
+        label_drop:
+          - pod_uid
+          - container_id
+          - id
+          - uid
+          - __address__
+      buffer:
+        max_records_per_verse: 20000
+        max_bytes_per_verse: 33554432
+      connect_timeout: 3s
+      resend_unacked_on_reconnect: true
+---
+# Finite Phase 2 drill Job (lab sink; not Canon/Oracle).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scripture-telemetry-producer-drill
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: scripture-telemetry-producer
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scripture-telemetry-producer
+        app.kubernetes.io/part-of: scripture
+    spec:
+      serviceAccountName: scripture-telemetry-producer
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      containers:
+        - name: producer
+          image: scripture-telemetry-producer:0.1.0
+          imagePullPolicy: Never
+          args:
+            - --config
+            - /etc/scripture-telemetry/telemetry-producer.yaml
+            - --ledger
+            - /var/lib/scripture-telemetry/send-ledger.jsonl
+            - --ack-timeout
+            - 5s
+            - --max-iterations
+            - "3"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/scripture-telemetry
+              readOnly: true
+            - name: ledger
+              mountPath: /var/lib/scripture-telemetry
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+      volumes:
+        - name: config
+          configMap:
+            name: scripture-telemetry-producer
+        - name: ledger
+          emptyDir: {}

@@ -107,7 +107,30 @@ pub struct ProducerConfig {
     pub resend_unacked_on_reconnect: bool,
 }
 
+/// On-disk YAML root (`telemetry_producer:`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerConfigFile {
+    /// Nested producer config.
+    pub telemetry_producer: ProducerConfig,
+}
+
 impl ProducerConfig {
+    /// Loads and validates a YAML config file with a `telemetry_producer:` root.
+    pub fn load_yaml_path(path: impl AsRef<std::path::Path>) -> Result<Self, LoadError> {
+        let raw = std::fs::read_to_string(path.as_ref()).map_err(LoadError::Io)?;
+        Self::from_yaml_str(&raw)
+    }
+
+    /// Parses YAML text with a `telemetry_producer:` root and validates.
+    pub fn from_yaml_str(raw: &str) -> Result<Self, LoadError> {
+        let file: ProducerConfigFile =
+            serde_yaml::from_str(raw).map_err(|error| LoadError::Yaml(error.to_string()))?;
+        file.telemetry_producer
+            .validate()
+            .map_err(LoadError::Validate)?;
+        Ok(file.telemetry_producer)
+    }
+
     /// Minimal Phase-1 single-source config for tests / local drills.
     #[must_use]
     pub fn phase1_single_source(producer_id: &str, scrape_url: &str, connect: &str) -> Self {
@@ -193,6 +216,20 @@ impl ProducerConfig {
         }
         Ok(())
     }
+}
+
+/// YAML load failures.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    /// Filesystem read failure.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// YAML parse failure.
+    #[error("yaml: {0}")]
+    Yaml(String),
+    /// Semantic validation failure.
+    #[error(transparent)]
+    Validate(#[from] ValidateError),
 }
 
 /// Config validation failures.
@@ -331,5 +368,39 @@ mod tests {
         assert!(yaml.contains("3s"), "serialized as {yaml}");
         let parsed: Wrap = serde_yaml::from_str(&yaml).expect("de");
         assert_eq!(parsed, secs);
+    }
+
+    #[test]
+    fn loads_telemetry_producer_yaml_root() {
+        let yaml = r#"
+telemetry_producer:
+  producer_id: fleet-collector-0
+  canon: fleet-telemetry
+  endpoints:
+    - verse: node-node-a
+      connect: 127.0.0.1:9101
+  scrape:
+    interval: 30s
+    timeout: 5s
+    max_response_bytes: 8000000
+    max_series_per_scrape: 5000
+    sources:
+      - verse: node-node-a
+        kind: node-exporter
+        url: "http://127.0.0.1:9100/metrics"
+  normalize:
+    schema_ref: otel-shaped-metrics.v1
+    metric_allowlist: [node_cpu_seconds_total]
+    label_allowlist: [cpu, mode]
+    label_drop: [pod_uid]
+  buffer:
+    max_records_per_verse: 100
+    max_bytes_per_verse: 1048576
+  connect_timeout: 3s
+  resend_unacked_on_reconnect: true
+"#;
+        let config = ProducerConfig::from_yaml_str(yaml).expect("load");
+        assert_eq!(config.producer_id, "fleet-collector-0");
+        assert_eq!(config.scrape.sources[0].kind, SourceKind::NodeExporter);
     }
 }
