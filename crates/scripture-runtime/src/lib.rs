@@ -14,6 +14,7 @@ mod holylog_foundation;
 mod ingress;
 mod node;
 mod object_store;
+mod producer_routing;
 mod raw_lines;
 mod scribe;
 mod status;
@@ -43,6 +44,10 @@ pub use node::{
 };
 pub use object_store::{
     BackendProfile, ObjectStoreError, ObjectStorePartsFactory, connect_s3_compat,
+};
+pub use producer_routing::{
+    CommittedAck, DirectoryRouteSource, OutboundRecord, ProducerRoute, ProducerRoutingError,
+    RecordId, RetryPolicy, RouteSource, RoutingProducer, resolve_route,
 };
 pub use raw_lines::{
     BatchingSnapshot, RawLinesConfig, RawLinesConnectionMetrics, RawLinesConnectionSnapshot,
