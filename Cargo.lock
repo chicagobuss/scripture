@@ -2013,6 +2013,8 @@ dependencies = [
  "object_store",
  "scripture",
  "scripture-service",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
