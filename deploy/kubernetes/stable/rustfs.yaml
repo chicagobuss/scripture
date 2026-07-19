@@ -30,6 +30,21 @@ spec:
             - name: s3
               containerPort: 9000
           env:
+            # Keep this disposable lab store aligned with the RustFS profile
+            # exercised by the correctness campaign.  It is intentionally
+            # separate from Tracker storage and never a production claim.
+            - name: RUSTFS_VOLUMES
+              value: /data/rustfs0
+            - name: RUSTFS_ADDRESS
+              value: 0.0.0.0:9000
+            - name: RUSTFS_CONSOLE_ADDRESS
+              value: 0.0.0.0:9001
+            - name: RUSTFS_CONSOLE_ENABLE
+              value: "true"
+            - name: RUSTFS_OBS_LOGGER_LEVEL
+              value: warn
+            - name: RUSTFS_UNSAFE_BYPASS_DISK_CHECK
+              value: "true"
             - name: RUSTFS_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -42,7 +57,13 @@ spec:
                   key: RUSTFS_SECRET_KEY
           volumeMounts:
             - name: data
-              mountPath: /data
+              mountPath: /data/rustfs0
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 3
           securityContext:
             allowPrivilegeEscalation: false
       volumes:
