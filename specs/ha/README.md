@@ -26,6 +26,17 @@ evidence, rather than every physical byte-level duplicate. Repeated retries in
 the same generation are intentionally collapsed to keep exhaustive checking
 small; a retry crossing A→B remains visible as distinct generation evidence.
 
+`TwoScribeVerseRecoveryNetwork.tla` is the next refinement. It makes route
+snapshots, lease-expiry observations, producer sends, and ACKs explicit packet
+objects. Their delivery order is arbitrary; any packet may be dropped, and a
+producer may send a retry before an older request is delivered. Its TLC model
+uses a two-packet in-flight bound to preserve exhaustive exploration. That is a
+model-state-space bound, not a product network capacity.
+
+The first complete network-model run checked 7,627,560 distinct states and
+74,470,427 transitions without an invariant failure. It uses TLC symmetry
+reduction for the three interchangeable clients and four checker workers.
+
 The core algorithm in prose is:
 
 ```text
@@ -75,3 +86,10 @@ java -cp "$TLA_TOOLS_JAR" tlc2.TLC -config TwoScribeVerseRecovery.cfg \
 `TLA_TOOLS_JAR` should point to the standard `tla2tools.jar`. The repository
 does not vendor the checker. CI integration is intentionally deferred until
 the first model and its intended bounded state space are reviewed.
+
+Run the network refinement with:
+
+```sh
+java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
+  -config TwoScribeVerseRecoveryNetwork.cfg TwoScribeVerseRecoveryNetwork.tla
+```
