@@ -10,9 +10,9 @@ use bytes::Bytes;
 use scripture_workload::{
     ArrowFieldConfig, ArrowSchemaConfig, BatchBoundsConfig, BindingKey, BindingToken, CanonRecord,
     CanonRef, ConsumerProgressStore, HostError, InMemoryProgressStore,
-    JsonArrowParquetMaterializer, MalformedPolicy, OutputCommit, ProcessOutcome, ProgressError,
-    ProgressRegister, ReconcileOutcome, SchemaRef, SourceOffset, SourceRange, VerseRef, Workload,
-    WorkloadError, WorkloadHost, WorkloadId, WorkloadMetadata,
+    JsonArrowParquetMaterializer, MalformedPolicy, OutputCommit, ParquetCommitManifest,
+    ProcessOutcome, ProgressError, ProgressRegister, ReconcileOutcome, SchemaRef, SourceOffset,
+    SourceRange, VerseRef, Workload, WorkloadError, WorkloadHost, WorkloadId, WorkloadMetadata,
 };
 use tempfile::tempdir;
 
@@ -187,6 +187,39 @@ fn crash_after_output_before_checkpoint_replays_without_duplicate() {
         .count();
     // Epoch-1 garbage + epoch-2 canonical file may both sit; register is the index.
     assert_eq!(parquet_count, 2);
+}
+
+#[test]
+fn manifest_with_wrong_owner_token_is_not_adopted() {
+    let dir = tempdir().expect("temp");
+    let workload = materializer(dir.path());
+    let batch = range(0, &[r#"{"id":"a","amount":1}"#]);
+    let store = InMemoryProgressStore::new();
+    let host = WorkloadHost::new(store);
+    let token = BindingToken::new("worker-a").expect("token");
+    let fence = acquire(&host, &token);
+
+    workload.apply(&batch, &fence).expect("publish output");
+    let manifest_path = fs::read_dir(dir.path())
+        .expect("list output")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().ends_with(".commit.json"))
+        .expect("manifest");
+    let mut manifest: ParquetCommitManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("decode manifest");
+    manifest.owner_token = "not-the-fence-holder".into();
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode tampered manifest"),
+    )
+    .expect("write tampered manifest");
+
+    assert!(matches!(
+        workload.reconcile(&batch, &fence).expect("reconcile"),
+        ReconcileOutcome::Indeterminate { .. }
+    ));
 }
 
 #[test]

@@ -360,6 +360,7 @@ impl Workload for JsonArrowParquetMaterializer {
                     || manifest.schema_ref != range.schema_ref.as_str()
                     || manifest.schema_ref != self.schema_ref.as_str()
                     || manifest.binding_epoch != fence.binding.binding_epoch
+                    || manifest.owner_token != fence.owner_token.as_str()
                 {
                     // schema_ref / identity mismatch: refuse reconcile adoption.
                     if manifest.schema_ref != range.schema_ref.as_str()
