@@ -4,7 +4,7 @@
 //! independently so a slow or Denied lane cannot stall other Verses' sends or
 //! couple retry latency to the scrape interval. Phase 3 adds exponential
 //! backoff, ordered failover connects (A→B), a bounded shutdown drain, and
-//! per-Verse authority ledger rows.
+//! per-Verse *failover* ledger rows (producer observation — not authority).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +17,7 @@ use crate::buffer::DropOldestBuffer;
 use crate::client::{AckStatus, ClientError, RawLinesClient};
 use crate::config::{ProducerConfig, ScrapeSource};
 use crate::envelope::SeqAllocator;
-use crate::ledger::{LedgerAuthorityRow, LedgerSendRow, SendLedger};
+use crate::ledger::{LedgerFailoverRow, LedgerSendRow, SendLedger};
 use crate::pipeline::{enqueue, prepare_scrape};
 use crate::scrape::scrape_url;
 
@@ -38,8 +38,8 @@ pub struct RunnerCounters {
     pub committed: u64,
     /// Unacked / denied attempts (may later commit on resend).
     pub unacked_attempts: u64,
-    /// Per-Verse A→B (or further) promotions recorded.
-    pub promotions: u64,
+    /// Per-Verse connect-chain advances (producer-side failover observations).
+    pub failovers: u64,
     /// Pending records abandoned after drain deadline.
     pub abandoned_on_drain_deadline: u64,
 }
@@ -364,7 +364,7 @@ async fn verse_send_loop(
                     continue;
                 }
 
-                let promote = match status {
+                let advance = match status {
                     AckStatus::Denied => true,
                     AckStatus::Unacked => {
                         consecutive_unacked = consecutive_unacked.saturating_add(1);
@@ -373,22 +373,18 @@ async fn verse_send_loop(
                     AckStatus::Committed { .. } => false,
                 };
 
-                if promote && endpoint_index + 1 < connect_chain.len() {
+                if advance && endpoint_index + 1 < connect_chain.len() {
                     let from = connect_chain[endpoint_index].clone();
                     endpoint_index += 1;
                     let to = connect_chain[endpoint_index].clone();
-                    let authority = LedgerAuthorityRow::verse_promoted(
-                        &verse,
-                        &from,
-                        &to,
-                        match status {
-                            AckStatus::Denied => "denied",
-                            _ => "unacked_exhausted",
-                        },
-                    );
-                    eprintln!("scripture-telemetry-producer: {}", authority.message);
-                    ledger.lock().await.append_authority(&authority).await?;
-                    counters.lock().await.promotions += 1;
+                    let reason = match status {
+                        AckStatus::Denied => "denied",
+                        _ => "unacked_exhausted",
+                    };
+                    let failover = LedgerFailoverRow::verse_failover(&verse, &from, &to, reason);
+                    eprintln!("scripture-telemetry-producer: {}", failover.message);
+                    ledger.lock().await.append_failover(&failover).await?;
+                    counters.lock().await.failovers += 1;
                     client.retarget(to);
                     consecutive_unacked = 0;
                     backoff = retry_initial_backoff;

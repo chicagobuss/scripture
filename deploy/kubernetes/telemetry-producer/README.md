@@ -6,8 +6,10 @@
 #
 # Phase 3: per-Verse `failover_connects` enables lab A→B cutover. On Denied
 # (or exhausted Unacked), the producer advances to the next endpoint and
-# appends an authority ledger row:
-#   Verse `node-node-a` promoted A→B
+# appends a *failover* ledger row (producer observation, not authority):
+#   Verse `node-node-a` failover A→B (denied)
+# The WP §13 promotion event with authority scope belongs to the drill
+# orchestrator / Scribe fence, correlated with this client observation.
 # Drain is bounded by `drain_deadline` (default 10s) so a down endpoint at
 # exit leaves honest unacked/abandoned rows instead of hanging the Job.
 #

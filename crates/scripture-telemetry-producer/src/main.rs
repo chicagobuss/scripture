@@ -89,10 +89,10 @@ fn main() -> ExitCode {
         match run_producer(config, &ledger_path, options).await {
             Ok(counters) => {
                 eprintln!(
-                    "scripture-telemetry-producer: done committed={} unacked_attempts={} promotions={} abandoned={} scrapes_ok={:?} scrape_errors={:?} dropped_records={:?} dropped_series={:?}",
+                    "scripture-telemetry-producer: done committed={} unacked_attempts={} failovers={} abandoned={} scrapes_ok={:?} scrape_errors={:?} dropped_records={:?} dropped_series={:?}",
                     counters.committed,
                     counters.unacked_attempts,
-                    counters.promotions,
+                    counters.failovers,
                     counters.abandoned_on_drain_deadline,
                     counters.scrapes_ok,
                     counters.scrape_errors,

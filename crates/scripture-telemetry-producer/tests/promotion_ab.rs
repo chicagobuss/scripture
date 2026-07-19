@@ -1,11 +1,12 @@
-//! Phase 3: A→B promotion keeps identity; authority ledger is per-Verse.
+//! Phase 3: A→B connect-chain failover keeps identity; failover ledger is
+//! a producer observation (not a promotion / authority claim).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use scripture_telemetry_producer::{
     AckStatus, ProducerConfig, RawLinesClient, RunOptions, SeqAllocator, SourceKind,
-    dedup_committed_lines, prepare_scrape, promotion_message, run_producer,
+    dedup_committed_lines, failover_message, prepare_scrape, run_producer,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -102,7 +103,7 @@ async fn serve_metrics(listener: TcpListener, mut shutdown: oneshot::Receiver<()
 }
 
 #[tokio::test]
-async fn a_to_b_promotion_records_authority_and_keeps_dedup_key() {
+async fn a_to_b_failover_records_observation_and_keeps_dedup_key() {
     let metrics = TcpListener::bind("127.0.0.1:0").await.expect("metrics");
     let metrics_addr = metrics.local_addr().expect("addr");
     let (m_tx, m_rx) = oneshot::channel();
@@ -154,22 +155,24 @@ async fn a_to_b_promotion_records_authority_and_keeps_dedup_key() {
     .expect("run");
 
     assert!(counters.committed >= 2, "counters={counters:?}");
-    assert!(counters.promotions >= 1, "expected A→B promotion");
+    assert!(counters.failovers >= 1, "expected A→B failover");
 
     let ledger = std::fs::read_to_string(&ledger_path).expect("ledger");
-    let expected = promotion_message("node-node-a", &addr_a, &addr_b);
+    let expected = failover_message("node-node-a", &addr_a, &addr_b, "denied");
     assert!(
         ledger.contains(&expected),
-        "missing authority message {expected} in {ledger}"
+        "missing failover message {expected} in {ledger}"
     );
-    assert!(ledger.contains("\"row_type\":\"authority\""));
+    assert!(ledger.contains("\"row_type\":\"failover\""));
+    assert!(!ledger.contains("\"row_type\":\"authority\""));
+    assert!(!ledger.contains(" promoted "));
 
     let mut committed = state_a.lock().await.committed.clone();
     committed.extend(state_b.lock().await.committed.clone());
     assert!(!committed.is_empty());
     let deduped = dedup_committed_lines(&committed);
     assert_eq!(deduped.unparseable_committed, 0);
-    // All records share the same incarnation (process-stable across promotion).
+    // All records share the same incarnation (process-stable across failover).
     let incarnations: std::collections::BTreeSet<_> = committed
         .iter()
         .filter_map(|line| {
