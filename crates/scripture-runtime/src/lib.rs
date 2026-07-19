@@ -8,6 +8,7 @@ mod assignment_root;
 mod authority_bootstrap;
 mod authority_gate;
 mod credentials;
+pub mod directory;
 mod ha_session;
 mod holylog_foundation;
 mod ingress;

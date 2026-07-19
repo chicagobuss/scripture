@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use holylog::virtual_log::LogletResolver;
+use object_store::ObjectStore;
 use scripture::serving_authority::{AuthorityKey, JournalGenerationRef, RouteHint, WriterTerm};
 use scripture_runtime::{
     AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime, HaServingSession,
@@ -300,7 +301,7 @@ pub async fn bootstrap_multi_assignment(
         shared.backend.label(),
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor).await
+    run_multi_ingress(config, supervisor, Arc::clone(&shared.store)).await
 }
 
 /// Targeted promote for one assignment inside a multi-assignment Scribe.
@@ -350,12 +351,93 @@ pub async fn promote_multi_assignment(
         assignment_id,
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor).await
+    run_multi_ingress(config, supervisor, Arc::clone(&shared.store)).await
+}
+
+/// Publishes this node's fleet-directory record on a heartbeat (decision 0014).
+///
+/// Soft state only: a failure degrades discovery and can never affect
+/// authority, so errors are reported and the loop continues.
+fn spawn_directory_heartbeat(
+    config: &ScriptureConfig,
+    supervisor: Arc<ScribeSupervisor>,
+    store: Arc<dyn ObjectStore>,
+) {
+    let Some(scribe) = config.scribe.as_ref() else {
+        return;
+    };
+    let assignments = scribe.assignments.clone();
+    let owner_id = config.node.owner_id.clone();
+    let node_advertise = config.node.advertise.clone();
+    let prefix = config.store.prefix.clone();
+
+    // Beat well inside the validity window so ordinary scheduling jitter
+    // cannot expire a live node.
+    let valid_for_ms = 15_000u64;
+    let beat = std::time::Duration::from_millis(3_000);
+
+    tokio::spawn(async move {
+        loop {
+            let mut entries: Vec<scripture_runtime::directory::DirectoryAssignment> = Vec::new();
+            for assignment in &assignments {
+                let runtime = supervisor.assignment(&assignment.id);
+                // Evidence, not cached activation state. `admits_committed_acks`
+                // reports the disposition this assignment started with and stays
+                // true on a deposed-but-alive node, which would advertise a
+                // Scribe that can no longer commit. Re-observe the root instead.
+                let (disposition, admits) = match runtime {
+                    Some(runtime) => match runtime.session.as_ref() {
+                        Some(session) => {
+                            let effective = session.is_effective_writer().await;
+                            (
+                                if effective {
+                                    "Serving"
+                                } else {
+                                    "NotEffectiveWriter"
+                                },
+                                effective,
+                            )
+                        }
+                        None => (runtime.disposition.label(), false),
+                    },
+                    None => ("Unknown", false),
+                };
+                entries.push(scripture_runtime::directory::DirectoryAssignment {
+                    canon: assignment.canon.clone(),
+                    verse: assignment.verse.clone(),
+                    advertise: assignment.advertise.clone(),
+                    posture: match assignment.posture {
+                        AssignmentPosture::BootstrapIfEmpty => "bootstrap-if-empty".to_owned(),
+                        AssignmentPosture::Standby => "standby".to_owned(),
+                    },
+                    disposition: disposition.to_owned(),
+                    admits_committed_acks: admits,
+                });
+            }
+
+            let record = scripture_runtime::directory::DirectoryRecord {
+                format_version: 1,
+                owner_id: owner_id.clone(),
+                node_advertise: node_advertise.clone(),
+                published_at_ms: scripture_runtime::directory::now_ms(),
+                valid_for_ms,
+                assignments: entries,
+            };
+
+            if let Err(error) =
+                scripture_runtime::directory::publish(&store, &prefix, &record).await
+            {
+                eprintln!("scripture: directory heartbeat failed (discovery only): {error}");
+            }
+            tokio::time::sleep(beat).await;
+        }
+    });
 }
 
 async fn run_multi_ingress(
     config: ScriptureConfig,
     supervisor: ScribeSupervisor,
+    store: Arc<dyn ObjectStore>,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
     let alive = Arc::new(AtomicBool::new(true));
@@ -430,6 +512,8 @@ async fn run_multi_ingress(
             .await;
         });
     }
+
+    spawn_directory_heartbeat(&config, Arc::clone(&supervisor), store);
 
     // Keep the process alive; dispositions remain as activated (no auto-promote).
     loop {

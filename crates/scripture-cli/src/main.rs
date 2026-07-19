@@ -13,6 +13,7 @@ mod bootstrap;
 #[cfg(feature = "campaign-faults")]
 mod campaign_faults;
 mod config;
+mod directory_cmd;
 mod ha_activate;
 mod promote;
 mod replace;
@@ -110,6 +111,11 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(&config_path)?;
             promote::promote(config, term, assignment_id.as_deref()).await
         }
+        "directory" => {
+            let (config_path, canon, verse) = parse_directory_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            directory_cmd::directory(config, canon.as_deref(), verse.as_deref()).await
+        }
         "--help" | "-h" | "help" => {
             print_help();
             Ok(())
@@ -119,6 +125,38 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+/// Parses `directory --config <path> [--canon <id> --verse <id>]`.
+fn parse_directory_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, Option<String>, Option<String>), Box<dyn Error>> {
+    let mut config_path = None;
+    let mut canon = None;
+    let mut verse = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => {
+                config_path = Some(arguments.next().ok_or("--config requires a path")?);
+            }
+            "--canon" => {
+                canon = Some(arguments.next().ok_or("--canon requires an id")?);
+            }
+            "--verse" => {
+                verse = Some(arguments.next().ok_or("--verse requires an id")?);
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("directory: unexpected argument {other}").into()),
+        }
+    }
+    let config_path = config_path.ok_or("directory requires --config")?;
+    if canon.is_some() != verse.is_some() {
+        return Err("directory: --canon and --verse must be given together".into());
+    }
+    Ok((config_path, canon, verse))
 }
 
 fn parse_config_only_args(
