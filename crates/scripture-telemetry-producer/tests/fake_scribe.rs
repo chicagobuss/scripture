@@ -117,7 +117,7 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     );
     config.validate().expect("valid");
 
-    let mut seqs = SeqAllocator::with_incarnation(1001);
+    let mut seqs = SeqAllocator::with_incarnation("incarnation-test-1001");
     let (prepared, counters) = prepare_scrape(
         &config,
         "node-node-a",
@@ -132,7 +132,11 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     assert_eq!(prepared.len(), 2);
     assert!(prepared[0].envelope.collected_at.ends_with('Z'));
     assert!(prepared[0].envelope.collected_at.contains('T'));
-    assert_eq!(prepared[0].envelope.incarnation, 1001);
+    assert_eq!(prepared[0].envelope.incarnation, "incarnation-test-1001");
+    assert_ne!(
+        prepared[0].envelope.otel.metric.data_point.time_unix_nano,
+        "0"
+    );
 
     let mut buffer = DropOldestBuffer::new(
         "node-node-a",
@@ -185,7 +189,7 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
         .collect();
     assert_eq!(dedup_seqs, acked);
 
-    let keys: BTreeSet<(String, String, u64, u64)> = committed
+    let keys: BTreeSet<(String, String, String, u64)> = committed
         .iter()
         .filter_map(|line| {
             let value: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -195,7 +199,7 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
             Some((
                 value.get("producer_id")?.as_str()?.to_owned(),
                 value.get("verse")?.as_str()?.to_owned(),
-                value.get("incarnation")?.as_u64()?,
+                value.get("incarnation")?.as_str()?.to_owned(),
                 0,
             ))
         })
@@ -203,7 +207,12 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     assert_eq!(keys.len(), 1);
     assert_eq!(
         keys.iter().next().expect("key"),
-        &("fleet-collector-0".into(), "node-node-a".into(), 1001, 0)
+        &(
+            "fleet-collector-0".into(),
+            "node-node-a".into(),
+            "incarnation-test-1001".into(),
+            0
+        )
     );
 
     let _ = shutdown_tx.send(());
@@ -227,7 +236,7 @@ async fn denied_ack_reconnects_and_resends() {
         "http://127.0.0.1/metrics",
         &endpoint,
     );
-    let mut seqs = SeqAllocator::with_incarnation(42);
+    let mut seqs = SeqAllocator::with_incarnation("incarnation-deny-42");
     let (prepared, _) = prepare_scrape(
         &config,
         "node-node-a",
@@ -260,8 +269,8 @@ async fn restart_incarnation_keeps_seq_zero_distinct() {
         "http://127.0.0.1/metrics",
         "127.0.0.1:9",
     );
-    let mut first_life = SeqAllocator::with_incarnation(1);
-    let mut second_life = SeqAllocator::with_incarnation(2);
+    let mut first_life = SeqAllocator::with_incarnation("life-1");
+    let mut second_life = SeqAllocator::with_incarnation("life-2");
     let (a, _) = prepare_scrape(
         &config,
         "node-node-a",

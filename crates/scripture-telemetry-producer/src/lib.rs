@@ -25,7 +25,7 @@ pub use config::{
 };
 pub use envelope::{
     EnvelopeContext, MetricEnvelope, MetricPoint, OtelBody, SCHEMA_REF, SeqAllocator,
-    format_rfc3339_utc,
+    format_rfc3339_utc, random_incarnation_hex, unix_nanos_now,
 };
 pub use ledger::{LedgerSendRow, SendLedger, SinkCommitRow};
 pub use normalize::{NormalizeCounters, NormalizedBatch, normalize_samples};

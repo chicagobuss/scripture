@@ -10,8 +10,8 @@ use crate::normalize::NormalizedSample;
 
 /// Schema reference stamped on every record.
 ///
-/// v1 includes `incarnation` in the dedup key before any durable Phase 2
-/// records exist. Bump on incompatible changes.
+/// v1 includes a 128-bit random `incarnation` string in the dedup key before any
+/// durable Phase-2 Canon records exist. Bump on incompatible changes.
 pub const SCHEMA_REF: &str = "otel-shaped-metrics.v1";
 
 /// One newline-delimited telemetry record.
@@ -27,8 +27,8 @@ pub struct MetricEnvelope {
     pub canon: String,
     /// Verse lane.
     pub verse: String,
-    /// Process/restart incarnation — disambiguates `seq` across restarts.
-    pub incarnation: u64,
+    /// Process/restart incarnation — 128-bit random hex; disambiguates `seq`.
+    pub incarnation: String,
     /// Per-Verse monotonic sequence within one incarnation.
     pub seq: u64,
     /// Collection time (RFC3339 UTC, e.g. `2026-07-19T04:12:30Z`).
@@ -101,12 +101,14 @@ pub struct EnvelopeContext<'a> {
     pub canon: &'a str,
     /// Verse lane.
     pub verse: &'a str,
-    /// Restart incarnation.
-    pub incarnation: u64,
+    /// Restart incarnation (128-bit hex).
+    pub incarnation: &'a str,
     /// Sequence within the incarnation.
     pub seq: u64,
     /// RFC3339 collection timestamp.
     pub collected_at: &'a str,
+    /// Collection instant as unix nanos (fallback for samples without timestamps).
+    pub collected_at_unix_nano: u64,
     /// Source kind.
     pub kind: SourceKind,
     /// Resource attributes.
@@ -122,17 +124,19 @@ impl MetricEnvelope {
             "gauge" => ("gauge".to_owned(), None),
             other => (other.to_owned(), None),
         };
+        // Prefer the sample timestamp; otherwise the scrape collection instant
+        // (never the unix epoch — node-exporter samples usually omit timestamps).
         let time_unix_nano = sample
             .timestamp_ms
             .map(|ms| (i128::from(ms) * 1_000_000).to_string())
-            .unwrap_or_else(|| "0".to_owned());
+            .unwrap_or_else(|| ctx.collected_at_unix_nano.to_string());
         Self {
             envelope_version: 1,
             schema_ref: SCHEMA_REF.to_owned(),
             producer_id: ctx.producer_id.to_owned(),
             canon: ctx.canon.to_owned(),
             verse: ctx.verse.to_owned(),
-            incarnation: ctx.incarnation,
+            incarnation: ctx.incarnation.to_owned(),
             seq: ctx.seq,
             collected_at: ctx.collected_at.to_owned(),
             source: SourceMeta {
@@ -160,11 +164,11 @@ impl MetricEnvelope {
 
     /// Dedup key `(producer_id, verse, incarnation, seq)`.
     #[must_use]
-    pub fn dedup_key(&self) -> (String, String, u64, u64) {
+    pub fn dedup_key(&self) -> (String, String, String, u64) {
         (
             self.producer_id.clone(),
             self.verse.clone(),
-            self.incarnation,
+            self.incarnation.clone(),
             self.seq,
         )
     }
@@ -187,26 +191,29 @@ impl MetricEnvelope {
 /// Assigns monotonic `seq` values within one `(producer_id, verse, incarnation)`.
 #[derive(Debug)]
 pub struct SeqAllocator {
-    /// Process/restart incarnation (unix millis at construction by default).
-    pub incarnation: u64,
+    /// Process/restart incarnation (128-bit random hex).
+    pub incarnation: String,
     next: u64,
 }
 
 impl SeqAllocator {
-    /// Creates an allocator with a fresh incarnation from wall-clock millis.
+    /// Creates an allocator with a fresh 128-bit random incarnation.
+    ///
+    /// Panics only if the OS entropy source fails — the process cannot safely
+    /// mint collision-resistant restart ids without it.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            incarnation: wall_millis(),
+            incarnation: random_incarnation_hex(),
             next: 0,
         }
     }
 
-    /// Creates an allocator with an explicit incarnation (tests / injected clocks).
+    /// Creates an allocator with an explicit incarnation (tests).
     #[must_use]
-    pub fn with_incarnation(incarnation: u64) -> Self {
+    pub fn with_incarnation(incarnation: impl Into<String>) -> Self {
         Self {
-            incarnation,
+            incarnation: incarnation.into(),
             next: 0,
         }
     }
@@ -220,15 +227,36 @@ impl SeqAllocator {
 }
 
 impl Default for SeqAllocator {
+    /// Same as [`SeqAllocator::new`] — fresh random incarnation.
+    ///
+    /// Prefer constructing allocators once at process start (see runner setup).
+    /// Do not call this lazily per scrape; a second mint would change incarnation.
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn wall_millis() -> u64 {
+/// 32-char lowercase hex of 16 random bytes.
+#[must_use]
+pub fn random_incarnation_hex() -> String {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).unwrap_or_else(|error| {
+        panic!("OS entropy required for producer incarnation: {error}");
+    });
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Current unix time in nanoseconds (for `collected_at` / `time_unix_nano`).
+#[must_use]
+pub fn unix_nanos_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
+        .map(|duration| duration.as_nanos().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -277,9 +305,10 @@ mod tests {
                 producer_id: "fleet-collector-0",
                 canon: "fleet-telemetry",
                 verse: "node-node-a",
-                incarnation: 42,
+                incarnation: "aabbccddeeff00112233445566778899",
                 seq: 7,
                 collected_at: "2026-07-19T04:12:30Z",
+                collected_at_unix_nano: 1_784_434_350_000_000_000,
                 kind: SourceKind::NodeExporter,
                 resource: BTreeMap::from([("host.name".into(), "node-a".into())]),
             },
@@ -291,8 +320,45 @@ mod tests {
         assert_eq!(parsed.schema_ref, SCHEMA_REF);
         assert_eq!(
             parsed.dedup_key(),
-            ("fleet-collector-0".into(), "node-node-a".into(), 42, 7)
+            (
+                "fleet-collector-0".into(),
+                "node-node-a".into(),
+                "aabbccddeeff00112233445566778899".into(),
+                7
+            )
         );
+        assert_eq!(parsed.otel.metric.data_point.time_unix_nano, "1000000000");
+    }
+
+    #[test]
+    fn missing_sample_timestamp_uses_collection_instant() {
+        let sample = NormalizedSample {
+            name: "node_memory_MemAvailable_bytes".into(),
+            labels: BTreeMap::new(),
+            value: 4096.0,
+            metric_type: "gauge".into(),
+            timestamp_ms: None,
+        };
+        let collected = 1_784_434_350_000_000_000_u64;
+        let envelope = MetricEnvelope::from_sample(
+            EnvelopeContext {
+                producer_id: "fleet-collector-0",
+                canon: "fleet-telemetry",
+                verse: "node-node-a",
+                incarnation: "00112233445566778899aabbccddeeff",
+                seq: 0,
+                collected_at: "2026-07-19T04:12:30Z",
+                collected_at_unix_nano: collected,
+                kind: SourceKind::NodeExporter,
+                resource: BTreeMap::new(),
+            },
+            &sample,
+        );
+        assert_eq!(
+            envelope.otel.metric.data_point.time_unix_nano,
+            collected.to_string()
+        );
+        assert_ne!(envelope.otel.metric.data_point.time_unix_nano, "0");
     }
 
     #[test]
@@ -303,10 +369,19 @@ mod tests {
 
     #[test]
     fn distinct_incarnations_do_not_collide() {
-        let mut a = SeqAllocator::with_incarnation(1);
-        let mut b = SeqAllocator::with_incarnation(2);
+        let mut a = SeqAllocator::with_incarnation("inc-a");
+        let mut b = SeqAllocator::with_incarnation("inc-b");
         assert_eq!(a.allocate(), 0);
         assert_eq!(b.allocate(), 0);
         assert_ne!(a.incarnation, b.incarnation);
+    }
+
+    #[test]
+    fn random_incarnation_is_32_hex_chars() {
+        let a = random_incarnation_hex();
+        let b = random_incarnation_hex();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }

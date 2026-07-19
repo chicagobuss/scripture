@@ -1,11 +1,12 @@
 //! In-process pipeline helpers for Phase 1 component tests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::buffer::{BufferedLine, DropOldestBuffer};
 use crate::config::{ProducerConfig, SourceKind};
-use crate::envelope::{EnvelopeContext, MetricEnvelope, SeqAllocator, format_rfc3339_utc};
+use crate::envelope::{
+    EnvelopeContext, MetricEnvelope, SeqAllocator, format_rfc3339_utc, unix_nanos_now,
+};
 use crate::normalize::normalize_samples;
 use crate::scrape::parse_openmetrics;
 
@@ -52,7 +53,8 @@ pub fn prepare_scrape(
         &config.normalize,
         config.scrape.max_series_per_scrape,
     );
-    let collected_at = rfc3339_now();
+    let collected_at_unix_nano = unix_nanos_now();
+    let collected_at = format_rfc3339_utc(collected_at_unix_nano / 1_000_000_000);
     let mut prepared = Vec::new();
     for sample in &batch.samples {
         let seq = seqs.allocate();
@@ -61,9 +63,10 @@ pub fn prepare_scrape(
                 producer_id: &config.producer_id,
                 canon: &config.canon,
                 verse,
-                incarnation: seqs.incarnation,
+                incarnation: &seqs.incarnation,
                 seq,
                 collected_at: &collected_at,
+                collected_at_unix_nano,
                 kind,
                 resource: BTreeMap::from([("host.name".into(), verse.to_owned())]),
             },
@@ -77,7 +80,7 @@ pub fn prepare_scrape(
             envelope,
             buffered: BufferedLine {
                 verse: verse.to_owned(),
-                incarnation: seqs.incarnation,
+                incarnation: seqs.incarnation.clone(),
                 seq,
                 line,
                 payload_digest: digest,
@@ -100,7 +103,7 @@ pub fn enqueue(buffer: &mut DropOldestBuffer, records: &[PreparedRecord]) -> usi
     for record in records {
         dropped += buffer
             .push(
-                record.envelope.incarnation,
+                record.envelope.incarnation.clone(),
                 record.buffered.seq,
                 record.buffered.line.clone(),
                 record.buffered.payload_digest.clone(),
@@ -122,7 +125,7 @@ pub struct DedupResult {
 /// Deduplicates committed payloads by `(producer_id, verse, incarnation, seq)`.
 #[must_use]
 pub fn dedup_committed_lines(lines: &[String]) -> DedupResult {
-    let mut seen: BTreeSet<(String, String, u64, u64)> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, String, String, u64)> = BTreeSet::new();
     let mut out = Vec::new();
     let mut unparseable_committed = 0_u64;
     for line in lines {
@@ -139,14 +142,6 @@ pub fn dedup_committed_lines(lines: &[String]) -> DedupResult {
         lines: out,
         unparseable_committed,
     }
-}
-
-fn rfc3339_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    format_rfc3339_utc(secs)
 }
 
 /// Prepare failures.
@@ -172,7 +167,7 @@ mod tests {
 
     #[test]
     fn collected_at_is_rfc3339() {
-        let stamp = rfc3339_now();
+        let stamp = format_rfc3339_utc(unix_nanos_now() / 1_000_000_000);
         assert!(
             stamp.len() == 20 && stamp.ends_with('Z') && stamp.contains('T'),
             "got {stamp}"

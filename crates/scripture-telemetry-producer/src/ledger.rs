@@ -15,8 +15,8 @@ pub struct LedgerSendRow {
     pub producer_id: String,
     /// Verse lane.
     pub verse: String,
-    /// Restart incarnation.
-    pub incarnation: u64,
+    /// Restart incarnation (128-bit hex).
+    pub incarnation: String,
     /// Sequence within the incarnation.
     pub seq: u64,
     /// Payload digest.
@@ -33,7 +33,7 @@ impl LedgerSendRow {
     pub fn from_ack(
         producer_id: &str,
         verse: &str,
-        incarnation: u64,
+        incarnation: &str,
         seq: u64,
         payload_digest: &str,
         ack: AckStatus,
@@ -49,7 +49,7 @@ impl LedgerSendRow {
         Self {
             producer_id: producer_id.to_owned(),
             verse: verse.to_owned(),
-            incarnation,
+            incarnation: incarnation.to_owned(),
             seq,
             payload_digest: payload_digest.to_owned(),
             ack_status,
