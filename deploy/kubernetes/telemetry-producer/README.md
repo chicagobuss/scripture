@@ -1,8 +1,15 @@
-# Phase 2 packaging for the first Kubernetes telemetry producer.
+# Phase 2–3 packaging for the first Kubernetes telemetry producer.
 #
 # Namespace: scripture-prototype (never scripture-lab / Tracker RustFS).
 # Live drill uses a lab raw-lines sink until product Scribe + dedicated RustFS
 # stand; that sink is not Canon/Oracle and must not be claimed as HA history.
+#
+# Phase 3: per-Verse `failover_connects` enables lab A→B cutover. On Denied
+# (or exhausted Unacked), the producer advances to the next endpoint and
+# appends an authority ledger row:
+#   Verse `node-node-a` promoted A→B
+# Drain is bounded by `drain_deadline` (default 10s) so a down endpoint at
+# exit leaves honest unacked/abandoned rows instead of hanging the Job.
 #
 # Apply order:
 #   kubectl apply -f namespace.yaml
