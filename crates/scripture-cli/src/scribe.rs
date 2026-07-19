@@ -335,7 +335,14 @@ pub async fn bootstrap_multi_assignment(
         shared.backend.label(),
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor, Arc::clone(&shared.store), listeners).await
+    run_multi_ingress(
+        config,
+        supervisor,
+        Arc::clone(&shared.store),
+        Arc::clone(&shared.metrics),
+        listeners,
+    )
+    .await
 }
 
 /// Targeted promote for one assignment inside a multi-assignment Scribe.
@@ -392,7 +399,14 @@ pub async fn promote_multi_assignment(
         assignment_id,
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor, Arc::clone(&shared.store), listeners).await
+    run_multi_ingress(
+        config,
+        supervisor,
+        Arc::clone(&shared.store),
+        Arc::clone(&shared.metrics),
+        listeners,
+    )
+    .await
 }
 
 /// Publishes this node's fleet-directory record on a heartbeat (decision 0014).
@@ -479,6 +493,7 @@ async fn run_multi_ingress(
     config: ScriptureConfig,
     supervisor: ScribeSupervisor,
     store: Arc<dyn ObjectStore>,
+    metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
     mut prebound: HashMap<String, TcpListener>,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
@@ -493,8 +508,9 @@ async fn run_multi_ingress(
         );
         let supervisor = Arc::clone(&supervisor);
         let alive = Arc::clone(&alive);
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
-            serve_probe_loop(listener, supervisor, alive).await;
+            serve_probe_loop(listener, supervisor, alive, metrics).await;
         });
     }
 
@@ -647,6 +663,7 @@ async fn serve_probe_loop(
     listener: TcpListener,
     supervisor: Arc<ScribeSupervisor>,
     alive: Arc<AtomicBool>,
+    metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -654,8 +671,9 @@ async fn serve_probe_loop(
         };
         let supervisor = Arc::clone(&supervisor);
         let alive = Arc::clone(&alive);
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
-            serve_probe_connection(stream, supervisor, alive).await;
+            serve_probe_connection(stream, supervisor, alive, metrics).await;
         });
     }
 }
@@ -664,6 +682,7 @@ async fn serve_probe_connection(
     mut stream: tokio::net::TcpStream,
     supervisor: Arc<ScribeSupervisor>,
     alive: Arc<AtomicBool>,
+    metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
 ) {
     let mut buf = [0_u8; 1024];
     let _ = stream.read(&mut buf).await;
@@ -694,6 +713,20 @@ async fn serve_probe_connection(
         }
         _ => {
             let mut body = supervisor.status_body();
+            // Cumulative object-store work for this process. Obligation 9 needs
+            // measured request counts, not modelled ones: PUTs/GETs per record
+            // is the cost line, and it is only honest if it comes from the
+            // adapter that actually issued them.
+            let store = metrics.snapshot();
+            body.push_str(&format!(
+                "store_puts={} store_gets={} store_lists={} store_objects_listed={} store_uploaded_bytes={} store_downloaded_bytes={}\n",
+                store.puts,
+                store.gets,
+                store.lists,
+                store.objects_listed,
+                store.uploaded_bytes,
+                store.downloaded_bytes,
+            ));
             body.push_str("live authority (re-observed from the root):\n");
             for (id, effective) in supervisor.effective_writers().await {
                 body.push_str(&format!(
