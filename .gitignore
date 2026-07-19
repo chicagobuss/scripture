@@ -1,6 +1,7 @@
 /target
 Cargo.lock.bak
 /config/local/
+/.cargo/config.toml
 /.tmp/
 /references/opendata/
 /deploy/fleet-exercise/bin/fleet-lab-node
