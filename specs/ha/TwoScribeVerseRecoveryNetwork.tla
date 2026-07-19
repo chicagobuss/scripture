@@ -14,9 +14,14 @@ That keeps exploration finite without treating retry exhaustion as a product
 policy.  A production durable outbox retries until it receives an explicit
 operator outcome or observes Canon commit.
 
-The TLC configuration also limits the explicit network to three concurrent
+The TLC configuration also limits the explicit network to two concurrent
 packets.  That keeps this first network model exhaustive while retaining the
 useful old-route + retry + late-ACK races.  It is not a network capacity claim.
+
+Authority here advances at most once (A -> B).  Endpoint identity is therefore
+an accidentally perfect proxy for epoch identity in this module, so the epoch
+fence below cannot be falsified here.  ThreeGenerationFencing.tla exists to
+falsify it, and must be kept in step with any change to LawfulSendGuard.
 *******************************************************************************)
 
 CONSTANTS Clients, Scribes, RetryLimit
@@ -41,8 +46,12 @@ AttemptNumbers == 1..RetryLimit
 RouteHint == [endpoint : Scribes, generation : Generations, term : Terms]
 \* Physical duplicate deliveries in the same generation deliberately collapse
 \* into one event-to-authority fact. A retry spanning A→B remains distinct.
+\* routeGeneration/routeTerm carry the epoch the *packet* was built from, so an
+\* append can be audited against the route that authorised it rather than only
+\* against the state the acceptance guard just read.
 AppendRecord == [client : Clients, writer : Scribes, generation : Generations,
-                 term : Terms]
+                 term : Terms, routeGeneration : Generations,
+                 routeTerm : Terms]
 
 LeasePacket == [kind : {"lease-expired"}, recipient : {B}]
 RoutePacket == [kind : {"route"}, client : Clients, endpoint : Scribes,
@@ -172,13 +181,25 @@ ClientSend(c) ==
                     sealed, recoveryCandidate, bLeaseView, leaseExpirySent,
                     route, outbox, ackObserved, appendSet >>
 
+\* The single acceptance rule for a send.  Endpoint liveness/identity is not
+\* sufficient: the packet must also have been built from the current epoch.
+\* Identity and epoch coincide while authority advances at most once, so this
+\* conjunct is only observable in ThreeGenerationFencing.tla.
+LawfulSendGuard(packet) ==
+    /\ writer # None
+    /\ alive[packet.endpoint]
+    /\ packet.endpoint = writer
+    /\ packet.generation = generation
+    /\ packet.term = term
+
 \* A send delivered to a stale, dead, or recovering Scribe is removed without
 \* an acknowledgement.  The client keeps its durable pending event and may
-\* retry through another route.
+\* retry through another route.  Defined as the exact complement of the
+\* acceptance rule so every send packet keeps a disposition.
 DeliverRejectedOrUnavailableSend(packet) ==
     /\ packet \in network
     /\ packet.kind = "send"
-    /\ (writer = None \/ ~alive[packet.endpoint] \/ packet.endpoint # writer)
+    /\ ~LawfulSendGuard(packet)
     /\ network' = network \ {packet}
     /\ UNCHANGED << alive, phase, writer, generation, term, authorityHistory,
                     sealed, recoveryCandidate, bLeaseView, leaseExpirySent,
@@ -190,15 +211,15 @@ DeliverRejectedOrUnavailableSend(packet) ==
 DeliverLawfulSend(packet) ==
     /\ packet \in network
     /\ packet.kind = "send"
-    /\ writer # None
-    /\ alive[packet.endpoint]
-    /\ packet.endpoint = writer
+    /\ LawfulSendGuard(packet)
     /\ network' = (network \ {packet}) \cup
          {[kind |-> "ack", client |-> packet.client, writer |-> writer,
            generation |-> generation, term |-> term]}
     /\ appendSet' = appendSet \cup
          {[client |-> packet.client, writer |-> writer,
-           generation |-> generation, term |-> term]}
+           generation |-> generation, term |-> term,
+           routeGeneration |-> packet.generation,
+           routeTerm |-> packet.term]}
     /\ UNCHANGED << alive, phase, writer, generation, term, authorityHistory,
                     sealed, recoveryCandidate, bLeaseView, leaseExpirySent,
                     route, outbox, ackObserved, attempts >>
@@ -265,6 +286,11 @@ PublishBSuccessor ==
     /\ alive[B]
     /\ phase = Recovering
     /\ recoveryCandidate = B
+    \* Explicit bound guard.  Authority currently advances only once because
+    \* BeginRecoveryByB requires writer = A; without this, adding any further
+    \* recovery round would silently drive generation out of Generations.
+    /\ generation + 1 \in Generations
+    /\ term + 1 \in Terms
     /\ phase' = Serving
     /\ writer' = B
     /\ generation' = generation + 1
@@ -329,6 +355,15 @@ OnlyAcknowledgedEventsAreReclaimed ==
     \A c \in Clients : outbox[c] = Reclaimed => ackObserved[c]
 
 RecoveryGapHasNoWriter == phase = Recovering => writer = None
+
+\* The load-bearing fence check.  Unlike EveryAppendMatchesPublishedAuthority,
+\* this compares independently recorded provenance (the epoch the packet was
+\* built from) against the epoch that accepted it, so it can actually fail if
+\* the acceptance rule ever admits a stale-route send.
+CommitCarriesCurrentEpochRoute ==
+    \A record \in appendSet :
+        /\ record.routeGeneration = record.generation
+        /\ record.routeTerm = record.term
 
 StaleAIsFencedAfterBPublication ==
     generation = 1 => authorityHistory[1] = B

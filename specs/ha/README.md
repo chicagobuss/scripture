@@ -37,6 +37,16 @@ The first complete network-model run checked 7,627,560 distinct states and
 74,470,427 transitions without an invariant failure. It uses TLC symmetry
 reduction for the three interchangeable clients and four checker workers.
 
+`ThreeGenerationFencing.tla` is a small harness, not a product model. It exists
+because the network model lets authority advance at most once (A -> B), which
+makes endpoint identity an accidentally perfect proxy for epoch identity: a
+route naming A is stale there exactly when A is not the writer. An
+endpoint-only acceptance rule is therefore indistinguishable from an epoch
+fence in that module, and no invariant it could carry would tell them apart.
+The harness lets authority alternate, so A can lawfully regain writership and a
+generation-0 route can name a Scribe that is once again the live writer while
+describing a dead epoch.
+
 The core algorithm in prose is:
 
 ```text
@@ -67,6 +77,22 @@ TLC checks these properties over every reachable bounded schedule:
 5. The sealed/recovering interval has no writer.
 6. After B's successor is published, A is not the authority for that latest
    generation.
+7. Every append was authorised by the epoch that accepted it, compared against
+   independently recorded packet provenance.
+
+Invariant 2 is weaker than it appears on its own: appends were previously
+stamped entirely from the state the acceptance guard had just read, so it
+could not fail by construction. `AppendRecord` now also carries the
+`routeGeneration`/`routeTerm` the packet was built from, which is what makes
+invariant 7 able to fail.
+
+Invariant 3 remains deliberately weak. It matches an acknowledgement to a
+commit by client identity only, because `AppendRecord` still has no per-event
+or per-attempt identity. It currently states "some commit exists for this
+client", not "this acknowledgement belongs to the event it acknowledges", and
+so expresses neither duplicate suppression nor exactly-once. Since
+`ReclaimAcknowledged` is the action with real data-loss consequences, adding
+that identity is the next correctness step.
 
 This is a safety model, not a liveness proof. It deliberately does **not** yet
 model a real Kubernetes Lease, Consul session, authority-store codec, route
@@ -93,3 +119,28 @@ Run the network refinement with:
 java -XX:+UseParallelGC -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
   -config TwoScribeVerseRecoveryNetwork.cfg TwoScribeVerseRecoveryNetwork.tla
 ```
+
+The fencing harness runs in both directions. `EnforceEpochFence` selects the
+acceptance rule under test, so the negative case is a configuration rather than
+a forked copy of the module:
+
+```sh
+# Expect: no error.
+java -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
+  -config ThreeGenerationFencing.cfg ThreeGenerationFencing.tla
+
+# Expect: CommitCarriesCurrentEpochRoute violated.
+java -cp "$TLA_TOOLS_JAR" tlc2.TLC -workers 4 \
+  -config ThreeGenerationFencingMutant.cfg ThreeGenerationFencing.tla
+```
+
+The mutant run is part of the evidence, not a curiosity: an invariant that has
+never been observed to fail has not been shown to test anything. Its
+counterexample commits a generation-0 route at generation 2 after A regains
+writership, and notably does **not** violate invariant 2 — the recorded writer
+still matches the published authority for that generation. If the mutant ever
+passes, the harness has stopped testing the guard and must be repaired.
+
+Measured runs (TLC 2.19, 4 workers): network model 7,627,560 distinct states at
+depth 46, no violation; fencing harness 20,977 distinct states at depth 25, no
+violation; mutant violated at 419 distinct states.
