@@ -18,6 +18,8 @@ pub struct DroppedRecord {
 pub struct BufferedLine {
     /// Verse lane.
     pub verse: String,
+    /// Restart incarnation.
+    pub incarnation: u64,
     /// Monotonic seq.
     pub seq: u64,
     /// JSON line (no trailing newline).
@@ -53,10 +55,17 @@ impl DropOldestBuffer {
     }
 
     /// Pushes a line, dropping oldest records until the caps hold.
-    pub fn push(&mut self, seq: u64, line: String, payload_digest: String) -> Vec<DroppedRecord> {
+    pub fn push(
+        &mut self,
+        incarnation: u64,
+        seq: u64,
+        line: String,
+        payload_digest: String,
+    ) -> Vec<DroppedRecord> {
         let mut dropped = Vec::new();
         let incoming = BufferedLine {
             verse: self.verse.clone(),
+            incarnation,
             seq,
             line,
             payload_digest,
@@ -131,9 +140,9 @@ mod tests {
     #[test]
     fn drop_oldest_on_record_cap() {
         let mut buffer = DropOldestBuffer::new("node-node-a", 2, 10_000);
-        assert!(buffer.push(0, "a".into(), "d0".into()).is_empty());
-        assert!(buffer.push(1, "b".into(), "d1".into()).is_empty());
-        let dropped = buffer.push(2, "c".into(), "d2".into());
+        assert!(buffer.push(0, 0, "a".into(), "d0".into()).is_empty());
+        assert!(buffer.push(0, 1, "b".into(), "d1".into()).is_empty());
+        let dropped = buffer.push(0, 2, "c".into(), "d2".into());
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].seq, 0);
         assert_eq!(buffer.dropped_records, 1);
@@ -144,8 +153,8 @@ mod tests {
     #[test]
     fn oversized_record_does_not_evict_buffer() {
         let mut buffer = DropOldestBuffer::new("node-node-a", 10, 4);
-        assert!(buffer.push(0, "abcd".into(), "d0".into()).is_empty());
-        let dropped = buffer.push(1, "too-big".into(), "d1".into());
+        assert!(buffer.push(0, 0, "abcd".into(), "d0".into()).is_empty());
+        let dropped = buffer.push(0, 1, "too-big".into(), "d1".into());
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].seq, 1);
         assert_eq!(buffer.len(), 1);

@@ -24,6 +24,8 @@ struct FakeState {
     committed: Vec<String>,
     /// When true, accept one line then drop the connection before OK.
     drop_before_ack: bool,
+    /// When true, reply `ERR not-owner` once then accept.
+    deny_once: bool,
 }
 
 async fn run_fake_scribe(
@@ -56,14 +58,22 @@ async fn run_fake_scribe(
                         if payload.is_empty() {
                             continue;
                         }
-                        let drop_before_ack = {
+                        let (drop_before_ack, deny_once) = {
                             let mut guard = state.lock().await;
                             let drop = guard.drop_before_ack;
                             if drop {
                                 guard.drop_before_ack = false;
                             }
-                            drop
+                            let deny = guard.deny_once;
+                            if deny {
+                                guard.deny_once = false;
+                            }
+                            (drop, deny)
                         };
+                        if deny_once {
+                            let _ = writer.write_all(b"ERR not-owner\n").await;
+                            continue;
+                        }
                         if drop_before_ack {
                             // Simulate commit landing server-side but ACK lost.
                             {
@@ -199,6 +209,48 @@ async fn induced_disconnect_duplicates_share_dedup_key() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
     assert_eq!(send_log.len(), 2);
+}
+
+#[tokio::test]
+async fn denied_ack_reconnects_and_resends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = listener.local_addr().expect("addr").to_string();
+    let state = Arc::new(Mutex::new(FakeState {
+        deny_once: true,
+        ..FakeState::default()
+    }));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(run_fake_scribe(listener, Arc::clone(&state), shutdown_rx));
+
+    let config = ProducerConfig::phase1_single_source(
+        "fleet-collector-0",
+        "http://127.0.0.1/metrics",
+        &endpoint,
+    );
+    let mut seqs = SeqAllocator::with_incarnation(42);
+    let (prepared, _) = prepare_scrape(
+        &config,
+        "node-node-a",
+        SourceKind::NodeExporter,
+        SAMPLE_BODY,
+        &mut seqs,
+    )
+    .expect("prepare");
+    let line = prepared[0].buffered.clone();
+
+    let mut client = RawLinesClient::new(&endpoint, Duration::from_secs(2), Duration::from_secs(2));
+    let first = client.send_await_ack(&line).await.expect("deny");
+    assert_eq!(first, AckStatus::Denied);
+    client.disconnect();
+    let second = client.send_await_ack(&line).await.expect("resend");
+    assert!(matches!(second, AckStatus::Committed { .. }));
+
+    let committed = state.lock().await.committed.clone();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0], line.line);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
 }
 
 #[tokio::test]

@@ -1,0 +1,43 @@
+# One-shot egress preflight before a live telemetry drill.
+# Verifies DNS + reachability across pod-CIDR and ZeroTier node IPs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: telemetry-egress-preflight
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: telemetry-egress-preflight
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: telemetry-egress-preflight
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: preflight
+          image: curlimages/curl:8.11.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "preflight: DNS kube-dns"
+              getent hosts kubernetes.default.svc.cluster.local || nslookup kubernetes.default.svc.cluster.local
+              echo "preflight: pod-CIDR self"
+              ip -4 addr show || true
+              echo "preflight: ZeroTier node IPs (ICMP may be filtered; TCP later)"
+              for ip in 10.244.231.86 10.244.19.23 10.244.151.131; do
+                echo "ping $ip"
+                ping -c 1 -W 2 "$ip" || echo "ping-fail $ip (non-fatal if ICMP filtered)"
+              done
+              echo "preflight: ok"
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

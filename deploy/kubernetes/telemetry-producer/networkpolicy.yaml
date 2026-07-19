@@ -1,0 +1,60 @@
+# SSRF control: egress allowlist for the producer only.
+# Allows DNS, scrape Services in this namespace, hostNetwork node-exporter
+# (ZeroTier node IPs :9100), and the lab raw-lines sink.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: scripture-telemetry-producer-egress
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: scripture-telemetry-producer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: scripture-telemetry-producer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    # CoreDNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # In-namespace scrape + lab sink (ClusterIP / pod IPs)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 9100
+        - protocol: TCP
+          port: 9101
+    # hostNetwork node-exporter on ZeroTier node IPs
+    - to:
+        - ipBlock:
+            cidr: 10.244.0.0/16
+      ports:
+        - protocol: TCP
+          port: 9100
+    # Pod-CIDR (in case scrape targets are non-hostNetwork)
+    - to:
+        - ipBlock:
+            cidr: 10.208.0.0/16
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 9100
+        - protocol: TCP
+          port: 9101

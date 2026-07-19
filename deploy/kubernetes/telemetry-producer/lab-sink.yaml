@@ -1,0 +1,61 @@
+# Lab-only raw-lines sink (not a product Scribe). Phase 2 evidence path when
+# multi-assignment Scribe + dedicated RustFS are not yet standing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: raw-lines-lab-sink
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: raw-lines-lab-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: raw-lines-lab-sink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: raw-lines-lab-sink
+        app.kubernetes.io/part-of: scripture
+    spec:
+      containers:
+        - name: sink
+          image: scripture-telemetry-producer:0.1.0
+          imagePullPolicy: Never
+          command: ["raw-lines-lab-sink"]
+          args:
+            - --listen
+            - 0.0.0.0:9101
+            - --ledger
+            - /var/lib/scripture-telemetry/sink-ledger.jsonl
+          ports:
+            - name: raw-lines
+              containerPort: 9101
+          volumeMounts:
+            - name: ledger
+              mountPath: /var/lib/scripture-telemetry
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+      volumes:
+        - name: ledger
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: raw-lines-lab-sink
+  namespace: scripture-prototype
+  labels:
+    app.kubernetes.io/name: raw-lines-lab-sink
+spec:
+  selector:
+    app.kubernetes.io/name: raw-lines-lab-sink
+  ports:
+    - name: raw-lines
+      port: 9101
+      targetPort: raw-lines

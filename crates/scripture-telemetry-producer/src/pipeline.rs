@@ -77,6 +77,7 @@ pub fn prepare_scrape(
             envelope,
             buffered: BufferedLine {
                 verse: verse.to_owned(),
+                incarnation: seqs.incarnation,
                 seq,
                 line,
                 payload_digest: digest,
@@ -99,6 +100,7 @@ pub fn enqueue(buffer: &mut DropOldestBuffer, records: &[PreparedRecord]) -> usi
     for record in records {
         dropped += buffer
             .push(
+                record.envelope.incarnation,
                 record.buffered.seq,
                 record.buffered.line.clone(),
                 record.buffered.payload_digest.clone(),
