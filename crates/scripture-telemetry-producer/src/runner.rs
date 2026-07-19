@@ -1,13 +1,15 @@
-//! Continuous scrape → normalize → send loop (Phase 2+).
+//! Continuous scrape → normalize → send loop (Phase 2–3).
 //!
 //! Scrape and send are decoupled: one send task per Verse drains its buffer
 //! independently so a slow or Denied lane cannot stall other Verses' sends or
-//! couple retry latency to the scrape interval.
+//! couple retry latency to the scrape interval. Phase 3 adds exponential
+//! backoff, ordered failover connects (A→B), a bounded shutdown drain, and
+//! per-Verse authority ledger rows.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, watch};
 
@@ -15,7 +17,7 @@ use crate::buffer::DropOldestBuffer;
 use crate::client::{AckStatus, ClientError, RawLinesClient};
 use crate::config::{ProducerConfig, ScrapeSource};
 use crate::envelope::SeqAllocator;
-use crate::ledger::{LedgerSendRow, SendLedger};
+use crate::ledger::{LedgerAuthorityRow, LedgerSendRow, SendLedger};
 use crate::pipeline::{enqueue, prepare_scrape};
 use crate::scrape::scrape_url;
 
@@ -36,14 +38,35 @@ pub struct RunnerCounters {
     pub committed: u64,
     /// Unacked / denied attempts (may later commit on resend).
     pub unacked_attempts: u64,
+    /// Per-Verse A→B (or further) promotions recorded.
+    pub promotions: u64,
+    /// Pending records abandoned after drain deadline.
+    pub abandoned_on_drain_deadline: u64,
+}
+
+/// Optional run bounds (CLI / drills).
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// Stop after this many scrape iterations (`None` = forever).
+    pub max_iterations: Option<u64>,
+    /// Per-send ACK wait.
+    pub ack_timeout: Duration,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: None,
+            ack_timeout: Duration::from_secs(5),
+        }
+    }
 }
 
 /// Runs until `max_iterations` scrapes complete (or forever if `None`).
 pub async fn run_producer(
     config: ProducerConfig,
     ledger_path: &Path,
-    max_iterations: Option<u64>,
-    ack_timeout: Duration,
+    options: RunOptions,
 ) -> Result<RunnerCounters, RunError> {
     config.validate().map_err(RunError::Config)?;
     let ledger = Arc::new(Mutex::new(SendLedger::open(ledger_path).await?));
@@ -78,15 +101,18 @@ pub async fn run_producer(
         let Some(notify) = wake.get(&verse).cloned() else {
             continue;
         };
+        let connect_chain = endpoint.connect_chain();
+        let Some(primary) = connect_chain.first().cloned() else {
+            continue;
+        };
         let ledger = Arc::clone(&ledger);
         let counters = Arc::clone(&counters);
         let producer_id = config.producer_id.clone();
         let resend = config.resend_unacked_on_reconnect;
-        let mut client = RawLinesClient::new(
-            endpoint.connect.clone(),
-            config.connect_timeout,
-            ack_timeout,
-        );
+        let drain_deadline = config.drain_deadline;
+        let retry_initial = config.retry_initial_backoff;
+        let retry_max = config.retry_max_backoff;
+        let mut client = RawLinesClient::new(primary, config.connect_timeout, options.ack_timeout);
         let mut shutdown_rx = shutdown_rx.clone();
         send_tasks.push(tokio::spawn(async move {
             verse_send_loop(
@@ -94,6 +120,10 @@ pub async fn run_producer(
                     verse,
                     producer_id,
                     resend_unacked_on_reconnect: resend,
+                    connect_chain,
+                    drain_deadline,
+                    retry_initial_backoff: retry_initial,
+                    retry_max_backoff: retry_max,
                     buffer,
                     notify,
                     ledger,
@@ -113,7 +143,7 @@ pub async fn run_producer(
         }
 
         iterations += 1;
-        if max_iterations.is_some_and(|max| iterations >= max) {
+        if options.max_iterations.is_some_and(|max| iterations >= max) {
             break;
         }
         tokio::time::sleep(config.scrape.interval).await;
@@ -214,6 +244,10 @@ struct VerseSendParams {
     verse: String,
     producer_id: String,
     resend_unacked_on_reconnect: bool,
+    connect_chain: Vec<String>,
+    drain_deadline: Duration,
+    retry_initial_backoff: Duration,
+    retry_max_backoff: Duration,
     buffer: Arc<Mutex<DropOldestBuffer>>,
     notify: Arc<Notify>,
     ledger: Arc<Mutex<SendLedger>>,
@@ -229,20 +263,45 @@ async fn verse_send_loop(
         verse,
         producer_id,
         resend_unacked_on_reconnect,
+        connect_chain,
+        drain_deadline,
+        retry_initial_backoff,
+        retry_max_backoff,
         buffer,
         notify,
         ledger,
         counters,
     } = params;
+
+    let mut endpoint_index = 0_usize;
+    let mut backoff = retry_initial_backoff;
+    let mut consecutive_unacked = 0_u32;
     let mut empty_idle = Duration::from_millis(25);
+    let mut drain_deadline_at: Option<Instant> = None;
+
     loop {
+        if *shutdown_rx.borrow() {
+            if drain_deadline_at.is_none() {
+                drain_deadline_at = Some(Instant::now() + drain_deadline);
+            }
+            if drain_deadline_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                let pending = buffer.lock().await.len() as u64;
+                if pending > 0 {
+                    eprintln!(
+                        "scripture-telemetry-producer: drain_deadline verse={verse} abandoned={pending}"
+                    );
+                    counters.lock().await.abandoned_on_drain_deadline += pending;
+                }
+                break;
+            }
+        }
+
         let front = {
             let guard = buffer.lock().await;
             guard.front().cloned()
         };
         let Some(line) = front else {
             if *shutdown_rx.borrow() {
-                // Final drain check under lock.
                 let empty = buffer.lock().await.is_empty();
                 if empty {
                     break;
@@ -283,6 +342,7 @@ async fn verse_send_loop(
                 line.seq,
                 &line.payload_digest,
                 status,
+                client.endpoint(),
             );
             ledger.lock().await.append(&row).await?;
         }
@@ -291,15 +351,51 @@ async fn verse_send_loop(
             AckStatus::Committed { .. } => {
                 let _ = buffer.lock().await.pop_front();
                 counters.lock().await.committed += 1;
+                backoff = retry_initial_backoff;
+                consecutive_unacked = 0;
             }
             AckStatus::Denied | AckStatus::Unacked => {
                 counters.lock().await.unacked_attempts += 1;
                 client.disconnect();
                 if !resend_unacked_on_reconnect {
                     let _ = buffer.lock().await.pop_front();
+                    backoff = retry_initial_backoff;
+                    consecutive_unacked = 0;
+                    continue;
                 }
-                // Retry this Verse immediately (do not wait for scrape interval).
-                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                let promote = match status {
+                    AckStatus::Denied => true,
+                    AckStatus::Unacked => {
+                        consecutive_unacked = consecutive_unacked.saturating_add(1);
+                        consecutive_unacked >= 3
+                    }
+                    AckStatus::Committed { .. } => false,
+                };
+
+                if promote && endpoint_index + 1 < connect_chain.len() {
+                    let from = connect_chain[endpoint_index].clone();
+                    endpoint_index += 1;
+                    let to = connect_chain[endpoint_index].clone();
+                    let authority = LedgerAuthorityRow::verse_promoted(
+                        &verse,
+                        &from,
+                        &to,
+                        match status {
+                            AckStatus::Denied => "denied",
+                            _ => "unacked_exhausted",
+                        },
+                    );
+                    eprintln!("scripture-telemetry-producer: {}", authority.message);
+                    ledger.lock().await.append_authority(&authority).await?;
+                    counters.lock().await.promotions += 1;
+                    client.retarget(to);
+                    consecutive_unacked = 0;
+                    backoff = retry_initial_backoff;
+                } else {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff.saturating_mul(2)).min(retry_max_backoff);
+                }
             }
         }
     }

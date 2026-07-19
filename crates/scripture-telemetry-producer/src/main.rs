@@ -1,14 +1,14 @@
-//! `scripture-telemetry-producer` — scrape → normalize → raw-lines (Phase 2).
+//! `scripture-telemetry-producer` — scrape → normalize → raw-lines (Phase 2–3).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use scripture_telemetry_producer::{ProducerConfig, run_producer};
+use scripture_telemetry_producer::{ProducerConfig, RunOptions, run_producer};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: scripture-telemetry-producer --config <path.yaml> [--ledger <path.jsonl>] [--ack-timeout <Ns|Nms>] [--max-iterations <n>]"
+        "usage: scripture-telemetry-producer --config <path.yaml> [--ledger <path.jsonl>] [--ack-timeout <Ns|Nms>] [--max-iterations <n>] [--drain-deadline <Ns|Nms>]"
     );
     std::process::exit(2);
 }
@@ -18,6 +18,7 @@ fn main() -> ExitCode {
     let mut ledger_path = PathBuf::from("/var/lib/scripture-telemetry/send-ledger.jsonl");
     let mut ack_timeout = Duration::from_secs(5);
     let mut max_iterations: Option<u64> = None;
+    let mut drain_deadline_override: Option<Duration> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -38,6 +39,13 @@ fn main() -> ExitCode {
             "--max-iterations" => {
                 let raw = args.next().unwrap_or_else(|| usage());
                 max_iterations = Some(raw.parse().unwrap_or_else(|_| usage()));
+            }
+            "--drain-deadline" => {
+                let raw = args.next().unwrap_or_else(|| usage());
+                drain_deadline_override = Some(parse_duration(&raw).unwrap_or_else(|error| {
+                    eprintln!("scripture-telemetry-producer: {error}");
+                    usage();
+                }));
             }
             "--help" | "-h" => usage(),
             other => {
@@ -64,19 +72,28 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
-        let config = match ProducerConfig::load_yaml_path(&config_path) {
+        let mut config = match ProducerConfig::load_yaml_path(&config_path) {
             Ok(config) => config,
             Err(error) => {
                 eprintln!("scripture-telemetry-producer: config: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        match run_producer(config, &ledger_path, max_iterations, ack_timeout).await {
+        if let Some(deadline) = drain_deadline_override {
+            config.drain_deadline = deadline;
+        }
+        let options = RunOptions {
+            max_iterations,
+            ack_timeout,
+        };
+        match run_producer(config, &ledger_path, options).await {
             Ok(counters) => {
                 eprintln!(
-                    "scripture-telemetry-producer: done committed={} unacked_attempts={} scrapes_ok={:?} scrape_errors={:?} dropped_records={:?} dropped_series={:?}",
+                    "scripture-telemetry-producer: done committed={} unacked_attempts={} promotions={} abandoned={} scrapes_ok={:?} scrape_errors={:?} dropped_records={:?} dropped_series={:?}",
                     counters.committed,
                     counters.unacked_attempts,
+                    counters.promotions,
+                    counters.abandoned_on_drain_deadline,
                     counters.scrapes_ok,
                     counters.scrape_errors,
                     counters.dropped_records,

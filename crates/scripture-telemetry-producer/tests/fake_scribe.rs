@@ -26,6 +26,8 @@ struct FakeState {
     drop_before_ack: bool,
     /// When true, reply `ERR not-owner` once then accept.
     deny_once: bool,
+    /// After this many successful commits, deny forever.
+    deny_after_commits: Option<u64>,
 }
 
 async fn run_fake_scribe(
@@ -58,7 +60,7 @@ async fn run_fake_scribe(
                         if payload.is_empty() {
                             continue;
                         }
-                        let (drop_before_ack, deny_once) = {
+                        let (drop_before_ack, deny_once, deny_forever) = {
                             let mut guard = state.lock().await;
                             let drop = guard.drop_before_ack;
                             if drop {
@@ -68,9 +70,12 @@ async fn run_fake_scribe(
                             if deny {
                                 guard.deny_once = false;
                             }
-                            (drop, deny)
+                            let forever = guard
+                                .deny_after_commits
+                                .is_some_and(|n| guard.committed.len() as u64 >= n);
+                            (drop, deny, forever)
                         };
-                        if deny_once {
+                        if deny_once || deny_forever {
                             let _ = writer.write_all(b"ERR not-owner\n").await;
                             continue;
                         }
