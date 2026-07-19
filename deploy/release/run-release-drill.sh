@@ -655,8 +655,13 @@ set -- \$payloads
 IFS="\$oldifs"
 n=\$#
 printf 'target=%s port=%s payload_count=%s\\n' "\$target" "\$port" "\$n"
-if ! nc -z -w 5 "\$target" "\$port"; then
+set +e
+nc -w 5 "\$target" "\$port" </dev/null >/dev/null 2>/tmp/probe.err
+probe_rc=\$?
+set -e
+if [ "\$probe_rc" -ne 0 ]; then
   echo "tcp_probe=failed" >&2
+  cat /tmp/probe.err >&2 || true
   exit 1
 fi
 echo "tcp_probe=connected"
