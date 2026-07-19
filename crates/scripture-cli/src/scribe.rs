@@ -593,7 +593,6 @@ async fn serve_probe_connection(
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/status");
 
-    let any_serving = supervisor.any_serving();
     let (code, body) = match path {
         "/livez" | "/healthz" => {
             if alive.load(Ordering::Relaxed) {
@@ -602,14 +601,26 @@ async fn serve_probe_connection(
                 (503, "not-alive\n".to_owned())
             }
         }
+        // Readiness re-observes the root rather than trusting the disposition
+        // this process started with. A deposed-but-alive Scribe answering 200
+        // keeps a load balancer sending it producer traffic it can only refuse.
         "/readyz" => {
-            if any_serving {
+            if supervisor.any_effective_writer().await {
                 (200, "ready\n".to_owned())
             } else {
-                (503, "not-ready disposition=multi-assignment\n".to_owned())
+                (503, "not-ready reason=no-effective-writer\n".to_owned())
             }
         }
-        _ => (200, supervisor.status_body()),
+        _ => {
+            let mut body = supervisor.status_body();
+            body.push_str("live authority (re-observed from the root):\n");
+            for (id, effective) in supervisor.effective_writers().await {
+                body.push_str(&format!(
+                    "assignment_id={id} effective_writer={effective}\n"
+                ));
+            }
+            (200, body)
+        }
     };
     let response = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

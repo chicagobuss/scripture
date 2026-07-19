@@ -523,6 +523,41 @@ impl ScribeSupervisor {
             .any(|assignment| matches!(assignment.disposition, AssignmentDisposition::Serving))
     }
 
+    /// Live effective-writer state per assignment, re-observed from the root.
+    ///
+    /// [`Self::any_serving`] and [`AssignmentRuntime::admits_committed_acks`]
+    /// both report the disposition an assignment *started* with. They stay true
+    /// on a deposed-but-alive node, so anything that routes traffic must use
+    /// this instead — a fenced Scribe that still answers a readiness probe with
+    /// 200 keeps receiving producer connections it can only refuse.
+    ///
+    /// Costs one root observation per assignment per call. That is small beside
+    /// the admission path, which already re-observes on every submission and
+    /// every acknowledgement.
+    pub async fn effective_writers(&self) -> Vec<(String, bool)> {
+        let mut out = Vec::with_capacity(self.assignments.len());
+        for assignment in &self.assignments {
+            let effective = match assignment.session.as_ref() {
+                Some(session) => session.is_effective_writer().await,
+                None => false,
+            };
+            out.push((assignment.id.clone(), effective));
+        }
+        out
+    }
+
+    /// Whether any assignment currently holds effective writer authority.
+    pub async fn any_effective_writer(&self) -> bool {
+        for assignment in &self.assignments {
+            if let Some(session) = assignment.session.as_ref()
+                && session.is_effective_writer().await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Compact multi-assignment status body (no secrets).
     #[must_use]
     pub fn status_body(&self) -> String {
