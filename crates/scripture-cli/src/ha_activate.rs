@@ -65,6 +65,9 @@ pub async fn bootstrap_and_serve_cli(
     config: ScriptureConfig,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    // Hold ingress before Empty→Serving CAS. Publishing authority and then
+    // failing to bind leaves the Verse with no reachable writer.
+    let listener = TcpListener::bind(config.listener_bind()?).await?;
     #[cfg(feature = "campaign-faults")]
     let (assembled, campaign) = {
         let mut assembled = assemble::assemble_supervisor(&config)?;
@@ -113,7 +116,7 @@ pub async fn bootstrap_and_serve_cli(
         assembled.backend.label(),
         assembled.store_root,
     );
-    run_ha_ingress(config, session).await
+    run_ha_ingress(config, session, listener).await
 }
 
 /// Operator-directed promote that remains the serving process.
@@ -121,6 +124,9 @@ pub async fn promote_and_serve_cli(
     config: ScriptureConfig,
     candidate_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    // Bind before the root CAS. A candidate that cannot open ingress must not
+    // depose a Scribe that can.
+    let listener = TcpListener::bind(config.listener_bind()?).await?;
     #[cfg(feature = "campaign-faults")]
     let (assembled, campaign) = {
         let mut assembled = assemble::assemble_supervisor(&config)?;
@@ -198,30 +204,30 @@ pub async fn promote_and_serve_cli(
         assembled.backend.label(),
         assembled.store_root,
     );
-    run_ha_ingress(config, session).await
+    run_ha_ingress(config, session, listener).await
 }
 
 async fn run_ha_ingress(
     config: ScriptureConfig,
     session: HaServingSession,
+    listener: TcpListener,
 ) -> Result<(), Box<dyn Error>> {
     let session = Arc::new(session);
     let alive = Arc::new(AtomicBool::new(true));
 
     if let Some(status_bind) = &config.metrics.status_bind {
-        let listener = TcpListener::bind(status_bind).await?;
+        let status_listener = TcpListener::bind(status_bind).await?;
         eprintln!(
             "scripture: status/liveness/readiness on {} (/livez /readyz /status)",
-            listener.local_addr()?
+            status_listener.local_addr()?
         );
         let session = Arc::clone(&session);
         let alive = Arc::clone(&alive);
         tokio::spawn(async move {
-            serve_probe_loop(listener, session, alive).await;
+            serve_probe_loop(status_listener, session, alive).await;
         });
     }
 
-    let listener = TcpListener::bind(config.listener_bind()?).await?;
     eprintln!(
         "scripture: listening on {} (temporary ingress; authority-gated; not a public producer protocol)",
         listener.local_addr()?

@@ -7,6 +7,7 @@
 //! Standby is a dormant candidate: no Serving authority, no warm recovery, no
 //! committed ACKs until a targeted `promote --assignment`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +104,33 @@ async fn observe_expected_generation(
     })?;
     JournalGenerationRef::from_virtual_log_state(&versioned.state)
         .map_err(|error| format!("cannot derive JournalGenerationRef: {error}").into())
+}
+
+/// Bind ingress for every assignment that will attempt Serving publication.
+///
+/// Must run before any root CAS for those assignments. A candidate that cannot
+/// open ingress must not depose a Scribe that can — bind failure exits without
+/// touching the root, so the predecessor keeps authority.
+async fn bind_ingress_before_authority(
+    assignments: &[AssignmentConfig],
+    will_attempt_serve: impl Fn(&AssignmentConfig) -> bool,
+) -> Result<HashMap<String, TcpListener>, Box<dyn Error>> {
+    let mut listeners = HashMap::new();
+    for assignment in assignments {
+        if !will_attempt_serve(assignment) {
+            continue;
+        }
+        let listener = TcpListener::bind(&assignment.ingress.bind)
+            .await
+            .map_err(|error| {
+                format!(
+                    "assignment id={} cannot bind ingress {}: {error}",
+                    assignment.id, assignment.ingress.bind
+                )
+            })?;
+        listeners.insert(assignment.id.clone(), listener);
+    }
+    Ok(listeners)
 }
 
 async fn activate_one(
@@ -287,6 +315,12 @@ pub async fn bootstrap_multi_assignment(
         .ok_or("multi-assignment bootstrap requires scribe.assignments")?
         .assignments
         .clone();
+    // Hold ingress before any Empty→Serving CAS. Publishing authority and then
+    // failing to bind leaves the Verse with no reachable writer.
+    let listeners = bind_ingress_before_authority(&assignments, |assignment| {
+        matches!(assignment.posture, AssignmentPosture::BootstrapIfEmpty)
+    })
+    .await?;
     let count = assignments.len();
     let mut runtimes = Vec::with_capacity(count);
     for assignment in &assignments {
@@ -301,7 +335,7 @@ pub async fn bootstrap_multi_assignment(
         shared.backend.label(),
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor, Arc::clone(&shared.store)).await
+    run_multi_ingress(config, supervisor, Arc::clone(&shared.store), listeners).await
 }
 
 /// Targeted promote for one assignment inside a multi-assignment Scribe.
@@ -331,6 +365,13 @@ pub async fn promote_multi_assignment(
         )
         .into());
     }
+    // Bind before any root CAS. Target always attempts promote; BootstrapIfEmpty
+    // siblings may publish too. Standby siblings stay dormant and need no port.
+    let listeners = bind_ingress_before_authority(&assignments, |assignment| {
+        assignment.id == assignment_id
+            || matches!(assignment.posture, AssignmentPosture::BootstrapIfEmpty)
+    })
+    .await?;
     let count = assignments.len();
     let mut runtimes = Vec::with_capacity(count);
     for assignment in &assignments {
@@ -351,7 +392,7 @@ pub async fn promote_multi_assignment(
         assignment_id,
         supervisor.assignments().len(),
     );
-    run_multi_ingress(config, supervisor, Arc::clone(&shared.store)).await
+    run_multi_ingress(config, supervisor, Arc::clone(&shared.store), listeners).await
 }
 
 /// Publishes this node's fleet-directory record on a heartbeat (decision 0014).
@@ -438,6 +479,7 @@ async fn run_multi_ingress(
     config: ScriptureConfig,
     supervisor: ScribeSupervisor,
     store: Arc<dyn ObjectStore>,
+    mut prebound: HashMap<String, TcpListener>,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
     let alive = Arc::new(AtomicBool::new(true));
@@ -467,6 +509,8 @@ async fn run_multi_ingress(
             .assignment(&assignment.id)
             .ok_or_else(|| format!("missing activated assignment {}", assignment.id))?;
         if !runtime.admits_committed_acks() {
+            // FailClosed / Standby: drop any listener held before a failed CAS.
+            let _ = prebound.remove(&assignment.id);
             eprintln!(
                 "scripture: assignment id={} skips producer ingress disposition={} standby_kind={}",
                 assignment.id,
@@ -489,7 +533,13 @@ async fn run_multi_ingress(
             .ok_or_else(|| format!("serving assignment {} missing session", assignment.id))?;
         let ingress_budgets = runtime.ingress_budgets(Arc::clone(&node_budget));
         let raw_config = raw_lines_config_from_budget(&runtime.budget);
-        let listener = TcpListener::bind(&assignment.ingress.bind).await?;
+        // Serve on the listener bound before the root CAS — never bind here.
+        let listener = prebound.remove(&assignment.id).ok_or_else(|| {
+            format!(
+                "serving assignment {} missing pre-bound ingress (bind must precede authority CAS)",
+                assignment.id
+            )
+        })?;
         eprintln!(
             "scripture: assignment id={} listening on {} (authority scope canon={} verse={}; advertise={}; not a public producer protocol)",
             assignment.id,
@@ -632,4 +682,238 @@ async fn serve_probe_connection(
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use holylog::provision::{ExclusiveClaimStore, InMemoryExclusiveClaimStore};
+    use holylog::virtual_log::{
+        ConditionalRegister, InMemoryConditionalRegister, LogletResolver, VirtualLog,
+    };
+    use scripture::serving_authority::{
+        AuthorityKey, AuthorityState, RouteHint, ServingAuthorityRecord, WriterTerm,
+    };
+    use scripture::{
+        ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, SystemClock,
+        SystemTimer, VerseId, WriterId,
+    };
+    use scripture_runtime::{
+        HolylogJournalFoundation, NodeIdentity, ProcessLogletResolver, SharedMemoryPartsFactory,
+        bootstrap_and_serve, promote_and_serve,
+    };
+    use scripture_service::{
+        AuthorityCoordinator, DeterministicTransitionIdGenerator, JournalFoundationTransition,
+        VerseRuntimeConfig,
+    };
+    use tokio::net::TcpListener;
+
+    use super::bind_ingress_before_authority;
+    use crate::config::{AssignmentConfig, AssignmentPosture, ListenerConfig};
+
+    fn owner_a() -> OwnerId {
+        OwnerId::from_bytes(*b"bind-ord-owner-a")
+    }
+
+    fn owner_b() -> OwnerId {
+        OwnerId::from_bytes(*b"bind-ord-owner-b")
+    }
+
+    fn key() -> AuthorityKey {
+        AuthorityKey {
+            journal_id: JournalId::from_bytes(*b"bind-ord-jrnl!!!"),
+            verse_id: VerseId::from_bytes(*b"bind-ord-verse!!"),
+        }
+    }
+
+    fn runtime_config(owner_id: OwnerId, writer: [u8; 16]) -> VerseRuntimeConfig {
+        VerseRuntimeConfig {
+            journal_id: JournalId::from_bytes(*b"bind-ord-jrnl!!!"),
+            verse_id: VerseId::from_bytes(*b"bind-ord-verse!!"),
+            owner_id,
+            cohort_id: CohortId::from_bytes(*b"bind-ord-cohort!"),
+            writer_id: WriterId::from_bytes(writer),
+            policy: ChunkPolicy {
+                max_chunk_bytes: 64 * 1024,
+                max_record_bytes: 16 * 1024,
+                max_chunk_records: 8,
+                max_chunk_age: Duration::from_secs(60),
+                max_buffered_bytes: 64 * 1024,
+                max_inflight_chunks: 1,
+                max_uncommitted_age: Duration::from_secs(60),
+                recovery_scan: RecoveryBound::new(8).expect("bound"),
+            },
+            recovery_bound: RecoveryBound::new(8).expect("bound"),
+            queue_capacity: 16,
+        }
+    }
+
+    fn serving_owner(record: &ServingAuthorityRecord) -> OwnerId {
+        match &record.state {
+            AuthorityState::Serving { authority, .. } => authority.owner_id,
+            other => panic!("expected Serving authority, got {other:?}"),
+        }
+    }
+
+    async fn observe_root(
+        register: Arc<dyn ConditionalRegister>,
+        resolver: Arc<dyn LogletResolver>,
+    ) -> (u64, OwnerId) {
+        let virtual_log = VirtualLog::new(register, resolver);
+        let observed = virtual_log
+            .observe_membership()
+            .await
+            .expect("observe root");
+        let record =
+            ServingAuthorityRecord::decode_application_fence(&observed.state.application_fence)
+                .expect("decode Serving Authority fence");
+        (observed.state.revision, serving_owner(&record))
+    }
+
+    /// Occupied ingress must abort the promote path before the root CAS, so the
+    /// predecessor remains the effective writer (availability: no silent outage).
+    #[tokio::test]
+    async fn promote_bind_failure_leaves_predecessor_root_unchanged() {
+        let register = Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>;
+        let parts = Arc::new(SharedMemoryPartsFactory::default());
+        let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+        let auth = key();
+
+        let a_resolver = Arc::new(ProcessLogletResolver::default());
+        let a_foundation = Arc::new(HolylogJournalFoundation::with_default_loglet_ids(
+            auth,
+            NodeIdentity {
+                owner_id: owner_a(),
+                endpoint: OwnerEndpoint::new("tcp://owner-a:9000").expect("ep"),
+            },
+            Arc::clone(&register),
+            Arc::clone(&a_resolver),
+            Arc::clone(&parts) as Arc<dyn scripture_runtime::PartsFactory>,
+            Arc::clone(&claims),
+            2,
+        ));
+        let a_coordinator = AuthorityCoordinator::new(
+            Arc::clone(&register),
+            Arc::clone(&a_resolver) as Arc<dyn LogletResolver>,
+            Arc::clone(&a_foundation) as Arc<dyn JournalFoundationTransition>,
+            Arc::new(DeterministicTransitionIdGenerator::new()),
+            owner_a(),
+            RouteHint::new("tcp://owner-a:9000").expect("route"),
+        );
+        let a_session = bootstrap_and_serve(
+            &a_coordinator,
+            a_foundation.as_ref(),
+            auth,
+            WriterTerm::new(1).expect("t1"),
+            runtime_config(owner_a(), *b"bind-ord-wrtr-a!"),
+            Arc::clone(&register),
+            Arc::clone(&a_resolver),
+            SystemClock::new(),
+            SystemTimer::new(),
+        )
+        .await
+        .expect("predecessor Serving");
+        let expected = a_session.generation().clone();
+        let (revision_before, owner_before) = observe_root(
+            Arc::clone(&register),
+            Arc::clone(&a_resolver) as Arc<dyn LogletResolver>,
+        )
+        .await;
+        assert_eq!(owner_before, owner_a());
+        assert!(a_session.is_effective_writer().await);
+
+        // Stale holder on the candidate's ingress — the live failure mode.
+        let occupied = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("occupy ingress");
+        let bind = occupied.local_addr().expect("addr").to_string();
+        let assignment = AssignmentConfig {
+            id: "telemetry-host-a".into(),
+            canon: "bind-ord-jrnl!!!".into(),
+            verse: "bind-ord-verse!!".into(),
+            cohort_id: "bind-ord-cohort!".into(),
+            writer_id: "bind-ord-wrtr-b!".into(),
+            posture: AssignmentPosture::Standby,
+            ingress: ListenerConfig { bind: bind.clone() },
+            advertise: "tcp://owner-b:9000".into(),
+        };
+
+        let b_resolver = Arc::new(ProcessLogletResolver::default());
+        let b_foundation = Arc::new(HolylogJournalFoundation::with_default_loglet_ids(
+            auth,
+            NodeIdentity {
+                owner_id: owner_b(),
+                endpoint: OwnerEndpoint::new("tcp://owner-b:9000").expect("ep"),
+            },
+            Arc::clone(&register),
+            Arc::clone(&b_resolver),
+            Arc::clone(&parts) as Arc<dyn scripture_runtime::PartsFactory>,
+            Arc::clone(&claims),
+            2,
+        ));
+        let b_coordinator = AuthorityCoordinator::new(
+            Arc::clone(&register),
+            Arc::clone(&b_resolver) as Arc<dyn LogletResolver>,
+            Arc::clone(&b_foundation) as Arc<dyn JournalFoundationTransition>,
+            Arc::new(DeterministicTransitionIdGenerator::new()),
+            owner_b(),
+            RouteHint::new("tcp://owner-b:9000").expect("route"),
+        );
+
+        // Same ordering as promote_multi_assignment: bind all authority attempts,
+        // then seal/root-CAS. Bind failure must never reach promote_and_serve.
+        let promote_path = async {
+            let _listeners =
+                bind_ingress_before_authority(std::slice::from_ref(&assignment), |candidate| {
+                    candidate.id == assignment.id
+                })
+                .await?;
+            promote_and_serve(
+                &b_coordinator,
+                b_foundation.as_ref(),
+                auth,
+                WriterTerm::new(2).expect("t2"),
+                expected.clone(),
+                runtime_config(owner_b(), *b"bind-ord-wrtr-b!"),
+                Arc::clone(&register),
+                Arc::clone(&b_resolver),
+                SystemClock::new(),
+                SystemTimer::new(),
+            )
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        };
+
+        let error = promote_path
+            .await
+            .expect_err("occupied ingress must fail promote before root CAS");
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot bind ingress") || message.contains("Address already in use"),
+            "unexpected error: {message}"
+        );
+
+        let (revision_after, owner_after) = observe_root(
+            Arc::clone(&register),
+            Arc::clone(&a_resolver) as Arc<dyn LogletResolver>,
+        )
+        .await;
+        assert_eq!(
+            revision_after, revision_before,
+            "root revision must be unchanged when bind fails before CAS"
+        );
+        assert_eq!(
+            owner_after, owner_before,
+            "predecessor must remain the root owner when bind fails before CAS"
+        );
+        assert!(
+            a_session.is_effective_writer().await,
+            "predecessor must remain the effective writer"
+        );
+        // Keep `occupied` in scope so the port stays held through the promote attempt.
+        let _ = occupied.local_addr();
+    }
 }
