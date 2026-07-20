@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::chunk::ProducerId;
+use crate::chunk::{ChunkId, CohortId, ProducerId};
 use crate::driver::Submission;
 use crate::model::{AttributeValue, JournalId, Record};
 
@@ -14,6 +14,7 @@ const MAGIC: &[u8; 4] = b"SSWF";
 const VERSION: u8 = 1;
 const KIND_SUBMISSION: u8 = 1;
 const KIND_PROGRESS: u8 = 2;
+const KIND_PRECOMMIT: u8 = 3;
 const STRING_TAG: u8 = 1;
 const I64_TAG: u8 = 2;
 const BOOL_TAG: u8 = 3;
@@ -28,6 +29,22 @@ pub enum SpoolFrame {
         /// Unchanged driver submission.
         submission: Submission,
     },
+    /// Pre-seal envelope destined for a `(Canon, Verse)`, never a generation.
+    ///
+    /// Carries stable chunk identity so a successor can reseal under the active
+    /// generation after handoff.
+    PreCommit {
+        /// Verse / assignment key.
+        verse_key: String,
+        /// Stable chunk identity across resealing.
+        chunk_id: ChunkId,
+        /// Journal carried by this one-frame chunk.
+        journal_id: JournalId,
+        /// Cohort policy for this chunk.
+        cohort_id: CohortId,
+        /// Producer submission (stable event identity + records).
+        submission: Submission,
+    },
     /// Local evidence that a wrapped committed receipt completed.
     Progress(ProgressIdentity),
 }
@@ -37,6 +54,8 @@ pub enum SpoolFrame {
 pub enum FrameKind {
     /// Submission WAL frame.
     Submission,
+    /// Pre-commit envelope frame.
+    PreCommit,
     /// Progress evidence frame.
     Progress,
 }
@@ -47,6 +66,7 @@ impl SpoolFrame {
     pub fn kind(&self) -> FrameKind {
         match self {
             Self::Submission { .. } => FrameKind::Submission,
+            Self::PreCommit { .. } => FrameKind::PreCommit,
             Self::Progress(_) => FrameKind::Progress,
         }
     }
@@ -58,6 +78,11 @@ impl SpoolFrame {
             Self::Submission {
                 journal_id,
                 submission,
+            }
+            | Self::PreCommit {
+                journal_id,
+                submission,
+                ..
             } => Some(ProgressIdentity {
                 journal_id: *journal_id,
                 producer_id: submission.producer_id,
@@ -140,6 +165,23 @@ pub fn encode_frame(frame: &SpoolFrame) -> Result<Bytes, SpoolFrameError> {
             body.put_u32(identity.producer_epoch);
             body.put_u64(identity.sequence);
         }
+        SpoolFrame::PreCommit {
+            verse_key,
+            chunk_id,
+            journal_id,
+            cohort_id,
+            submission,
+        } => {
+            body.put_u8(KIND_PRECOMMIT);
+            put_len_bytes(&mut body, verse_key.as_bytes())?;
+            body.put_slice(&chunk_id.as_bytes());
+            body.put_slice(&cohort_id.as_bytes());
+            body.put_slice(&journal_id.as_bytes());
+            body.put_slice(&submission.producer_id.as_bytes());
+            body.put_u32(submission.producer_epoch);
+            body.put_u64(submission.sequence);
+            encode_records(&mut body, &submission.records)?;
+        }
     }
     let crc = crc32c::crc32c(&body);
     body.put_u32(crc);
@@ -187,6 +229,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(SpoolFrame, usize), SpoolFrameError
     let frame = match kind {
         KIND_SUBMISSION => decode_submission(payload)?,
         KIND_PROGRESS => SpoolFrame::Progress(decode_progress(payload)?),
+        KIND_PRECOMMIT => decode_precommit(payload)?,
         other => return Err(SpoolFrameError::UnsupportedKind { kind: other }),
     };
     Ok((frame, total))
@@ -243,6 +286,44 @@ fn decode_progress(payload: &[u8]) -> Result<ProgressIdentity, SpoolFrameError> 
             payload[42],
             payload[43],
         ]),
+    })
+}
+
+fn decode_precommit(mut payload: &[u8]) -> Result<SpoolFrame, SpoolFrameError> {
+    let verse_bytes = take_len_bytes(&mut payload)?;
+    let verse_key = std::str::from_utf8(verse_bytes)
+        .map_err(|_| SpoolFrameError::InvalidUtf8)?
+        .to_owned();
+    if payload.len() < 16 + 16 + 16 + 16 + 4 + 8 {
+        return Err(SpoolFrameError::Truncated);
+    }
+    let chunk_id = ChunkId::from_bytes(id16(&payload[0..16])?);
+    let cohort_id = CohortId::from_bytes(id16(&payload[16..32])?);
+    let journal_id = JournalId::from_bytes(id16(&payload[32..48])?);
+    let producer_id = ProducerId::from_bytes(id16(&payload[48..64])?);
+    let producer_epoch = u32::from_be_bytes([payload[64], payload[65], payload[66], payload[67]]);
+    let sequence = u64::from_be_bytes([
+        payload[68],
+        payload[69],
+        payload[70],
+        payload[71],
+        payload[72],
+        payload[73],
+        payload[74],
+        payload[75],
+    ]);
+    let records = decode_records(&payload[76..])?;
+    Ok(SpoolFrame::PreCommit {
+        verse_key,
+        chunk_id,
+        journal_id,
+        cohort_id,
+        submission: Submission {
+            producer_id,
+            producer_epoch,
+            sequence,
+            records,
+        },
     })
 }
 

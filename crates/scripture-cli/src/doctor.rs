@@ -66,6 +66,11 @@ struct CanonHistoryReport {
 #[derive(Debug, Clone, Serialize)]
 struct ProducerContinuityReport {
     durable_local_outbox: String,
+    /// Receipt profiles this node can offer (`committed` always; `spooled` only
+    /// with a constructed capability that publishes a loss budget).
+    receipt_profiles: String,
+    /// Loss budget text when `spooled` is available; empty when not offered.
+    spooled_loss_budget: String,
     evidence: String,
     result: String,
 }
@@ -145,8 +150,13 @@ async fn build_report(
         producer_continuity: ProducerContinuityReport {
             // Honest: no edge outbox exists yet. Do not invent a substrate.
             durable_local_outbox: "NOT CONFIGURED".to_owned(),
-            evidence: "no durable producer outbox exists in this codebase yet".to_owned(),
-            result: "an ordinary Scribe restart stalls producers. Unacknowledged source records depend on the application's own retry/persistence.".to_owned(),
+            // Pre-commit spool WAL exists in-library; serve-path wiring is not
+            // on by default. A `spooled` profile without a published loss budget
+            // cannot construct (`ScribeSpoolCapability::validate`).
+            receipt_profiles: "committed (default); spooled available only when a ScribeSpoolCapability with a published loss_budget is constructed".to_owned(),
+            spooled_loss_budget: String::new(),
+            evidence: "receipt vocabulary in scripture::receipt; PreCommitSpool in scripture-runtime; serve path still committed-only unless spool capability is mounted".to_owned(),
+            result: "an ordinary Scribe restart stalls producers for committed-only paths. If spooled were enabled, up to loss_budget of acknowledged data could be lost if this Scribe is destroyed before upload — durability is not availability.".to_owned(),
         },
         scribe_availability,
         failure_domain_durability: FailureDomainReport {
@@ -380,6 +390,16 @@ fn format_human(report: &CapabilityReport) -> String {
         report.producer_continuity.durable_local_outbox
     ));
     out.push_str(&format!(
+        "  receipt profiles: {}\n",
+        report.producer_continuity.receipt_profiles
+    ));
+    if !report.producer_continuity.spooled_loss_budget.is_empty() {
+        out.push_str(&format!(
+            "  spooled loss budget: {}\n",
+            report.producer_continuity.spooled_loss_budget
+        ));
+    }
+    out.push_str(&format!(
         "  Evidence: {}\n",
         report.producer_continuity.evidence
     ));
@@ -525,6 +545,8 @@ mod tests {
             canon_history: dummy_canon(),
             producer_continuity: ProducerContinuityReport {
                 durable_local_outbox: "NOT CONFIGURED".to_owned(),
+                receipt_profiles: "committed".to_owned(),
+                spooled_loss_budget: String::new(),
                 evidence: "no durable producer outbox exists in this codebase yet".to_owned(),
                 result: "stalls".to_owned(),
             },
@@ -548,6 +570,8 @@ mod tests {
     fn dummy_producer() -> ProducerContinuityReport {
         ProducerContinuityReport {
             durable_local_outbox: "NOT CONFIGURED".to_owned(),
+            receipt_profiles: "committed".to_owned(),
+            spooled_loss_budget: String::new(),
             evidence: "none".to_owned(),
             result: "stalls".to_owned(),
         }

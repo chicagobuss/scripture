@@ -1,7 +1,9 @@
 //! Submission spool (S1a): local WAL of submissions, progress evidence, fail-closed recovery.
 //!
-//! Governed by decision 0013. Public receipts remain committed-only; a single local
-//! disk is not a `Journaled` quorum and never auto-resubmits after restart.
+//! Governed by decision 0013 for the committed-only cell path. Public early
+//! `spooled` receipts use the pre-commit envelope frame and
+//! `scripture_runtime::pre_commit_spool`, which replays through the active
+//! generation rather than fail-closing on non-empty history.
 
 mod cell;
 mod file;
@@ -19,5 +21,5 @@ pub use recovery::{
 };
 pub use storage::{
     InMemorySpoolStorage, ScanTail, SpoolConfig, SpoolError, SpoolPoisonCause, SpoolStorage,
-    SpoolStorageFaults, ValidFrame,
+    SpoolStorageFaults, ValidFrame, encoded_frame_bytes,
 };

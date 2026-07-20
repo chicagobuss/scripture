@@ -286,6 +286,7 @@ pub(super) fn scan_bytes(bytes: &[u8]) -> (Vec<ValidFrame>, ScanTail) {
 }
 
 /// Encode helper for capacity checks without mutating storage.
-pub(super) fn encoded_frame_bytes(frame: &SpoolFrame) -> Result<Bytes, SpoolError> {
+/// Encoded size helper shared by the S1a cell and the pre-commit WAL.
+pub fn encoded_frame_bytes(frame: &SpoolFrame) -> Result<Bytes, SpoolError> {
     Ok(encode_frame(frame)?)
 }

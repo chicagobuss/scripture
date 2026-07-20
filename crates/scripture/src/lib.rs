@@ -14,6 +14,7 @@ pub mod dataref;
 pub mod driver;
 pub mod journal;
 pub mod model;
+pub mod receipt;
 pub mod sequencer_key;
 pub mod serving_authority;
 pub mod spool;
@@ -55,6 +56,11 @@ pub use journal::{
 pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
+pub use receipt::{
+    AchievedProfile, AdmitPlan, CommittedReceipt, ProducerReceipt, ReceiptPolicyError,
+    ReceiptRequirement, ScribeSpoolCapability, SpoolFsyncPolicy, SpoolOnFull, SpooledReceipt,
+    VerseReceiptPolicy, plan_admission, profile_satisfies, raise_to_floor,
+};
 pub use sequencer_key::{sequencer_request_key_for_chunk, sequencer_request_key_for_submission};
 pub use serving_authority::{
     AuthorityKey, AuthorityState, JournalGenerationRef, RouteHint, ServingAuthorityError,
@@ -65,7 +71,8 @@ pub use spool::{
     FileSpoolStorage, FrameClassification, FrameKind, InMemorySpoolStorage, ProgressIdentity,
     RecoveryClassification, RecoveryReport, ScanTail, SpoolCell, SpoolCellHandle, SpoolCellState,
     SpoolConfig, SpoolError, SpoolFrame, SpoolFrameError, SpoolPoisonCause, SpoolReceiptFuture,
-    SpoolStorage, SpoolStorageFaults, ValidFrame, classify_frames, scan_and_classify,
+    SpoolStorage, SpoolStorageFaults, ValidFrame, classify_frames, encoded_frame_bytes,
+    scan_and_classify,
 };
 pub use spool::{decode_frame as decode_spool_frame, encode_frame as encode_spool_frame};
 pub use trace::{CostScope, Effect, Event, Ledger, RejectReason, TerminalOutcome};

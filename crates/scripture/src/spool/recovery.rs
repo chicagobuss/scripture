@@ -71,6 +71,11 @@ pub fn classify_frames(frames: &[ValidFrame], tail: &ScanTail) -> RecoveryReport
             SpoolFrame::Submission {
                 journal_id,
                 submission,
+            }
+            | SpoolFrame::PreCommit {
+                journal_id,
+                submission,
+                ..
             } => {
                 let identity = ProgressIdentity {
                     journal_id: *journal_id,

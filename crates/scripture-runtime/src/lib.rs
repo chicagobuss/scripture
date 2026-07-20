@@ -18,6 +18,7 @@ mod holylog_foundation;
 mod ingress;
 mod node;
 mod object_store;
+pub mod pre_commit_spool;
 mod producer_routing;
 mod raw_lines;
 mod scribe;
@@ -63,6 +64,10 @@ pub use node::{
 };
 pub use object_store::{
     BackendProfile, ObjectStoreError, ObjectStorePartsFactory, connect_s3_compat,
+};
+pub use pre_commit_spool::{
+    AdmitOrderLog, PreCommitSpool, PreCommitSpoolConfig, PreCommitSpoolError,
+    committed_receipt_for, plan_without_spool, reset_drain_markers,
 };
 pub use producer_routing::{
     CommittedAck, DirectoryRouteSource, OutboundRecord, ProducerRoute, ProducerRoutingError,
