@@ -41,6 +41,8 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// - `rustfs`: `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY`, or AWS-compatible
 ///   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (no built-in defaults).
 /// - `r2`: `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` (required).
+/// - `s3`: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (required; the SDK
+///   profile file is deliberately not consulted).
 pub fn resolve_credentials(profile: BackendProfile) -> Result<StoreCredentials, CredentialError> {
     match profile {
         BackendProfile::RustFs => Ok(StoreCredentials {
@@ -52,6 +54,16 @@ pub fn resolve_credentials(profile: BackendProfile) -> Result<StoreCredentials, 
                 .ok_or_else(|| {
                     CredentialError::missing("RUSTFS_SECRET_KEY|AWS_SECRET_ACCESS_KEY")
                 })?,
+        }),
+        // object_store does not read ~/.aws/credentials. Without AWS_* in the
+        // environment it falls through to the EC2 metadata endpoint and fails
+        // after a long timeout with a retry error, which looks nothing like a
+        // credential problem. Require them explicitly.
+        BackendProfile::AmazonS3 => Ok(StoreCredentials {
+            access_key: env_nonempty("AWS_ACCESS_KEY_ID")
+                .ok_or_else(|| CredentialError::missing("AWS_ACCESS_KEY_ID"))?,
+            secret_key: env_nonempty("AWS_SECRET_ACCESS_KEY")
+                .ok_or_else(|| CredentialError::missing("AWS_SECRET_ACCESS_KEY"))?,
         }),
         BackendProfile::CloudflareR2 => Ok(StoreCredentials {
             access_key: env_nonempty("R2_ACCESS_KEY_ID")

@@ -263,7 +263,18 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         self.ledger.event(Event::AppendIssued {
             chunk_id: pending.sealed.chunk_id,
         });
-        match self.writer.append(&pending.sealed).await {
+        let append_result = if let Some(config) = self.dataref_blobs.as_ref() {
+            crate::blob_store::commit_sealed_as_data_ref(
+                &mut self.writer,
+                config.store.as_ref(),
+                &config.blob_prefix,
+                &pending.sealed,
+            )
+            .await
+        } else {
+            self.writer.append(&pending.sealed).await
+        };
+        match append_result {
             Ok(ack) => {
                 self.ledger.event(Event::AppendAcknowledged {
                     chunk_id: pending.sealed.chunk_id,

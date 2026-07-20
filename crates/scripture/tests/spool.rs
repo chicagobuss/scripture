@@ -98,6 +98,7 @@ fn spawn_driver() -> (
         clock,
         timer,
         8,
+        None,
     )
     .expect("actor");
     let pool = LocalPool::new();

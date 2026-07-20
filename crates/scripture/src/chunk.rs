@@ -861,6 +861,42 @@ pub fn decode_frame(entry: &FrameRef, frame_bytes: &[u8]) -> Result<Vec<Record>,
     Ok(records)
 }
 
+/// Returns the byte length of the sealed chunk that begins at `bytes[0..]`.
+///
+/// Staging blobs concatenate sealed chunks. Membership scanning walks the
+/// object by reading each chunk's header/index to learn where it ends — the
+/// same bytes that must be fetched before a collectability delete anyway.
+pub fn next_sealed_chunk_len(bytes: &[u8]) -> Result<usize, ChunkError> {
+    let index = decode_index(bytes)?;
+    let frames_end = index
+        .frames
+        .last()
+        .map(|frame| frame.frame_offset as usize + frame.frame_len as usize)
+        .ok_or(ChunkError::EmptyChunk)?;
+    let len = frames_end
+        .checked_add(TRAILER_LEN)
+        .ok_or(ChunkError::Oversized)?;
+    if bytes.len() < len {
+        return Err(ChunkError::Truncated);
+    }
+    Ok(len)
+}
+
+/// Walks concatenated sealed-chunk bytes and returns every [`ChunkId`] in order.
+pub fn scan_sealed_chunk_ids(bytes: &[u8]) -> Result<Vec<ChunkId>, ChunkError> {
+    let mut ids = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let len = next_sealed_chunk_len(&bytes[offset..])?;
+        let end = offset.checked_add(len).ok_or(ChunkError::Oversized)?;
+        let chunk_bytes = Bytes::copy_from_slice(&bytes[offset..end]);
+        let chunk = decode_chunk(&chunk_bytes)?;
+        ids.push(chunk.header.chunk_id);
+        offset = end;
+    }
+    Ok(ids)
+}
+
 /// Decodes and fully validates a complete chunk.
 pub fn decode_chunk(bytes: &Bytes) -> Result<Chunk, ChunkError> {
     if bytes.len() < HEADER_LEN + TRAILER_LEN {

@@ -710,3 +710,141 @@ async fn shared_staging_blob_is_not_collectable_from_one_verses_payloads() {
         "must not report collectable while a sibling Verse still references the blob"
     );
 }
+
+#[tokio::test]
+async fn derived_membership_equals_writer_recorded_for_multi_verse_blob() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let commit = commit_staging(
+        &store,
+        &[
+            ("alpha", 1, journal(b'a'), &[10]),
+            ("beta", 2, journal(b'b'), &[20]),
+            ("alpha", 3, journal(b'a'), &[11]),
+        ],
+    )
+    .await;
+    assert_eq!(commit.staging_refs.len(), 3);
+    let blob_key = commit.staging_refs[0].blob_key.clone();
+    assert!(
+        commit.staging_refs.iter().all(|r| r.blob_key == blob_key),
+        "all three placements must share one staging blob"
+    );
+    let writer_ids: BTreeSet<ChunkId> = commit.staging_refs.iter().map(|r| r.chunk_id).collect();
+    assert_eq!(writer_ids.len(), 3);
+
+    let bytes = store
+        .get(&object_store::path::Path::from(blob_key.as_str()))
+        .await
+        .expect("get blob")
+        .bytes()
+        .await
+        .expect("bytes");
+    let derived = scripture_runtime::staging_blob_contents_from_bytes(&blob_key, &bytes)
+        .expect("derive membership");
+    assert_eq!(derived.blob_key, blob_key);
+    assert_eq!(
+        derived.chunk_ids, writer_ids,
+        "scanned membership must equal every ChunkId the writer placed"
+    );
+}
+
+#[tokio::test]
+async fn collectability_using_derived_membership_matches_writer_including_shared_blob_rewrite() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let config = RewriteConfig::default();
+    let commit = commit_staging(
+        &store,
+        &[
+            ("alpha", 1, journal(b'a'), &[1]),
+            ("beta", 2, journal(b'b'), &[2]),
+        ],
+    )
+    .await;
+    let staging_key = commit.staging_refs[0].blob_key.clone();
+    let bytes = store
+        .get(&object_store::path::Path::from(staging_key.as_str()))
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("bytes");
+    let derived =
+        scripture_runtime::staging_blob_contents_from_bytes(&staging_key, &bytes).expect("derive");
+    let writer_contents = StagingBlobContents {
+        blob_key: staging_key.clone(),
+        chunk_ids: commit.staging_refs.iter().map(|r| r.chunk_id).collect(),
+    };
+    assert_eq!(derived, writer_contents);
+
+    let alpha_pointers: Vec<StagingPointer> = commit
+        .staging_refs
+        .iter()
+        .filter(|r| r.chunk_id == ChunkId::from_bytes([1; 16]))
+        .enumerate()
+        .map(|(index, data_ref)| StagingPointer {
+            first_offset: RecordOffset::new(index as u64),
+            verse_key: "alpha".into(),
+            data_ref: data_ref.clone(),
+        })
+        .collect();
+    let payloads = Arc::clone(&commit.log_payloads);
+    let mut progress = VerseRewriteProgress::default();
+    let mut target = SupersedingTarget {
+        writer: Arc::clone(commit.writers.get("alpha").expect("writer")),
+        payloads: Arc::clone(&payloads),
+        fail_after: None,
+        appended: Arc::new(Mutex::new(0)),
+    };
+    rewrite_verse_staging(&store, &config, &alpha_pointers, &mut progress, &mut target)
+        .await
+        .expect("rewrite one Verse of shared blob");
+
+    let all = payloads.lock().expect("payloads").clone();
+    let superseded = superseded_chunk_ids(&all, &config).expect("superseded");
+    assert_eq!(
+        staging_blob_collectable(&derived, &superseded),
+        staging_blob_collectable(&writer_contents, &superseded),
+    );
+    assert!(
+        !staging_blob_collectable(&derived, &superseded),
+        "shared blob must stay uncollectable until beta is also rewritten"
+    );
+
+    let beta_pointers: Vec<StagingPointer> = commit
+        .staging_refs
+        .iter()
+        .filter(|r| r.chunk_id == ChunkId::from_bytes([2; 16]))
+        .map(|data_ref| StagingPointer {
+            first_offset: RecordOffset::new(0),
+            verse_key: "beta".into(),
+            data_ref: data_ref.clone(),
+        })
+        .collect();
+    let mut beta_progress = VerseRewriteProgress::default();
+    let mut beta_target = SupersedingTarget {
+        writer: Arc::clone(commit.writers.get("beta").expect("writer")),
+        payloads: Arc::clone(&payloads),
+        fail_after: None,
+        appended: Arc::new(Mutex::new(0)),
+    };
+    rewrite_verse_staging(
+        &store,
+        &config,
+        &beta_pointers,
+        &mut beta_progress,
+        &mut beta_target,
+    )
+    .await
+    .expect("rewrite sibling");
+
+    let all = payloads.lock().expect("payloads").clone();
+    let superseded = superseded_chunk_ids(&all, &config).expect("superseded");
+    assert_eq!(
+        staging_blob_collectable(&derived, &superseded),
+        staging_blob_collectable(&writer_contents, &superseded),
+    );
+    assert!(
+        staging_blob_collectable(&derived, &superseded),
+        "after both Verses rewrite, derived membership must agree the blob is collectable"
+    );
+}

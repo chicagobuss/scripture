@@ -26,20 +26,24 @@ pub enum BackendProfile {
     RustFs,
     /// Cloudflare R2 (S3-compatible); register attested via [`RegisterCapabilities::cloudflare_r2`].
     CloudflareR2,
+    /// Amazon S3; register attested via [`RegisterCapabilities::amazon_s3`].
+    ///
+    /// S3 gained conditional writes only in 2024, so a bucket configured
+    /// without them is not a register whatever the endpoint claims. The
+    /// attestation is a named claim about a tested configuration, never an
+    /// inference from the API shape.
+    AmazonS3,
 }
 
 impl BackendProfile {
-    /// Parses `rustfs` or `r2`. An `s3` token is reserved and rejected.
+    /// Parses `rustfs`, `r2`, or `s3`.
     pub fn parse(raw: &str) -> Result<Self, ObjectStoreError> {
         match raw {
             "rustfs" => Ok(Self::RustFs),
             "r2" => Ok(Self::CloudflareR2),
-            "s3" => Err(ObjectStoreError::BackendProfile(
-                "backend profile 's3' is reserved for a follow-up AWS exercise; use rustfs or r2"
-                    .into(),
-            )),
+            "s3" => Ok(Self::AmazonS3),
             other => Err(ObjectStoreError::BackendProfile(format!(
-                "unknown backend profile '{other}' (expected rustfs|r2)"
+                "unknown backend profile '{other}' (expected rustfs|r2|s3)"
             ))),
         }
     }
@@ -50,6 +54,7 @@ impl BackendProfile {
         match self {
             Self::RustFs => "rustfs",
             Self::CloudflareR2 => "r2",
+            Self::AmazonS3 => "s3",
         }
     }
 
@@ -57,7 +62,7 @@ impl BackendProfile {
     #[must_use]
     pub fn register_capabilities(self) -> RegisterCapabilities {
         match self {
-            Self::RustFs => RegisterCapabilities::amazon_s3(),
+            Self::RustFs | Self::AmazonS3 => RegisterCapabilities::amazon_s3(),
             Self::CloudflareR2 => RegisterCapabilities::cloudflare_r2(),
         }
     }
@@ -65,7 +70,9 @@ impl BackendProfile {
     /// LogDrive capability declaration for this profile.
     #[must_use]
     pub fn drive_capabilities(self) -> BackendCapabilities {
-        // RustFS and R2 are both attested for atomic conditional create + lex listing.
+        // RustFS, R2 and S3 are all attested for atomic conditional create and
+        // lexicographic listing; the 2026-07-12 run exercised data, seal and
+        // trim namespaces on S3 directly.
         BackendCapabilities::new(
             PointSemantics::LinearizableSingleValue,
             ListingOrder::Lexicographic,
@@ -222,7 +229,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     #[test]
-    fn parses_backend_profiles_and_rejects_s3_reservation() {
+    fn parses_attested_profiles_and_rejects_unattested_ones() {
         assert_eq!(
             BackendProfile::parse("rustfs").expect("rustfs"),
             BackendProfile::RustFs
@@ -231,8 +238,24 @@ mod tests {
             BackendProfile::parse("r2").expect("r2"),
             BackendProfile::CloudflareR2
         );
-        assert!(BackendProfile::parse("s3").is_err());
+        assert_eq!(
+            BackendProfile::parse("s3").expect("s3"),
+            BackendProfile::AmazonS3
+        );
+        // Garage speaks the same API and the same headers, and silently ignores
+        // the preconditions a register depends on. It is the recorded
+        // falsification, and the reason a profile is a tested claim rather than
+        // an inference from the endpoint.
         assert!(BackendProfile::parse("garage").is_err());
+    }
+
+    #[test]
+    fn s3_declares_the_attested_amazon_register_capabilities() {
+        assert_eq!(
+            BackendProfile::AmazonS3.register_capabilities(),
+            RegisterCapabilities::amazon_s3()
+        );
+        assert_eq!(BackendProfile::AmazonS3.label(), "s3");
     }
 
     #[test]

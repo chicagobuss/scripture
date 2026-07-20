@@ -8,8 +8,8 @@
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use scripture::{
     CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, ChunkPolicy, Clock, CohortId,
-    DriverError, JournalId, OwnerId, ReceiptFuture, RecoveryBound, Submission, Timer, VerseId,
-    WriterId,
+    DataRefBlobConfig, DriverError, JournalId, OwnerId, ReceiptFuture, RecoveryBound, Submission,
+    Timer, VerseId, WriterId,
 };
 
 use crate::canon_owner::{CanonOwnerError, CanonOwnerRequest, recover_canon_owner};
@@ -38,6 +38,8 @@ pub struct CanonNodeConfig {
     pub recovery_bound: RecoveryBound,
     /// Bounded command-queue capacity for the actor.
     pub queue_capacity: usize,
+    /// When set, recovery resolves DataRefs and the driver emits them.
+    pub dataref_blobs: Option<DataRefBlobConfig>,
 }
 
 impl CanonNodeConfig {
@@ -53,6 +55,7 @@ impl CanonNodeConfig {
             policy: self.policy,
             recovery_bound: self.recovery_bound,
             queue_capacity: self.queue_capacity,
+            dataref_blobs: self.dataref_blobs.clone(),
         }
     }
 }
@@ -320,6 +323,7 @@ mod tests {
             },
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 16,
+            dataref_blobs: None,
         }
     }
 

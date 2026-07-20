@@ -13,8 +13,8 @@
 use holylog::virtual_log::VirtualLog;
 use scripture::{
     CanonAuthoritySnapshot, ChunkDriverActor, ChunkDriverHandle, ChunkLogError, ChunkLogWriter,
-    ChunkPolicy, Clock, CohortId, DriverError, JournalId, OwnerId, RecoveredChunk, RecoveryBound,
-    Timer, VerseId, WriterId,
+    ChunkPolicy, Clock, CohortId, DataRefBlobConfig, DriverError, JournalId, OwnerId,
+    RecoveredChunk, RecoveryBound, Timer, VerseId, WriterId,
 };
 
 /// Inputs for one Canon-authorized owner construction attempt.
@@ -36,6 +36,8 @@ pub struct CanonOwnerRequest {
     pub recovery_bound: RecoveryBound,
     /// Bounded command-queue capacity for the actor.
     pub queue_capacity: usize,
+    /// When set, recovery resolves DataRefs and the driver emits them.
+    pub dataref_blobs: Option<DataRefBlobConfig>,
 }
 
 /// A recovered, unstarted Canon owner for one startup attempt.
@@ -128,6 +130,10 @@ where
     C: Clock,
     T: Timer,
 {
+    let blob_store = request
+        .dataref_blobs
+        .as_ref()
+        .map(|config| config.store.as_ref());
     let recovery = ChunkLogWriter::recover_virtual(
         request.journal_id,
         request.cohort_id,
@@ -135,6 +141,7 @@ where
         request.owner_id,
         virtual_log,
         request.recovery_bound,
+        blob_store,
     )
     .await?;
     let generation = recovery.authority.revision();
@@ -149,6 +156,7 @@ where
         clock,
         timer,
         request.queue_capacity,
+        request.dataref_blobs.clone(),
     )?;
     Ok(RecoveredCanonOwner {
         authority: recovery.authority,
@@ -223,6 +231,7 @@ mod tests {
             policy: policy(),
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 16,
+            dataref_blobs: None,
         }
     }
 

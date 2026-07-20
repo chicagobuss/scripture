@@ -465,6 +465,7 @@ impl ScriptureConfig {
             policy: default_chunk_policy(),
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 256,
+            dataref_blobs: None,
         })
     }
 
@@ -482,6 +483,7 @@ impl ScriptureConfig {
             policy: default_chunk_policy(),
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 256,
+            dataref_blobs: None,
         })
     }
 

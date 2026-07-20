@@ -10,6 +10,7 @@ mod authority_gate;
 pub mod blob_reader;
 pub mod blob_rewrite;
 pub mod blob_writer;
+pub mod chunk_blob_store;
 pub mod counting_store;
 mod credentials;
 pub mod directory;
@@ -35,13 +36,15 @@ pub use blob_rewrite::{
     DEFAULT_REWRITTEN_PREFIX, DEFAULT_STAGING_PREFIX, RewriteConfig, RewriteError,
     StagingBlobContents, StagingPointer, SupersedingAppendTarget, VerseRewriteOutcome,
     VerseRewriteProgress, is_rewritten_blob_key, is_staging_blob_key, prefer_data_ref,
-    rewrite_verse_staging, scan_log_deduped, staging_blob_collectable, superseded_chunk_ids,
+    rewrite_verse_staging, scan_log_deduped, staging_blob_collectable,
+    staging_blob_contents_from_bytes, superseded_chunk_ids,
 };
 pub use blob_writer::{
     BlobCutReason, BlobEnvelope, BlobEnvelopeSource, BlobWriter, BlobWriterConfig, BlobWriterError,
     CutPlan, DEFAULT_MAX_LINGER, DEFAULT_TARGET_BLOB_BYTES, DataRefAppendTarget,
     PlacementCommitOutcome, VerseSealer, commit_cut_plan,
 };
+pub use chunk_blob_store::ObjectStoreChunkBlobStore;
 pub use credentials::{CredentialError, StoreCredentials, resolve_credentials};
 pub use ha_session::{
     HaActivationError, HaAdmissionError, HaServingSession, bootstrap_and_serve, promote_and_serve,

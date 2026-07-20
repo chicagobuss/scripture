@@ -6,6 +6,7 @@
 //! consumer groups, and cross-process writer fencing are not v0 features.
 
 pub mod batch;
+pub mod blob_store;
 pub mod canon;
 pub mod chunk;
 pub mod chunklog;
@@ -21,6 +22,9 @@ pub mod spool;
 pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
+pub use blob_store::{
+    ChunkBlobStore, DEFAULT_STAGING_BLOB_PREFIX, DataRefBlobConfig, commit_sealed_as_data_ref,
+};
 pub use canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, CanonFence, CanonFenceError, CanonOwner,
     OwnedSequencerBinding, OwnerEndpoint, OwnerId, VerseId, WitnessedCanonAuthority,
@@ -29,7 +33,8 @@ pub use canon::{
 pub use chunk::{
     Chunk, ChunkDigest, ChunkError, ChunkHeader, ChunkId, ChunkIndex, CohortId, Frame, FrameRef,
     ProducerId, SealedChunk, SubmissionRef, WriterId, decode_chunk, decode_frame, decode_index,
-    encoded_chunk_len, seal_chunk, seal_single_frame_chunk,
+    encoded_chunk_len, next_sealed_chunk_len, scan_sealed_chunk_ids, seal_chunk,
+    seal_single_frame_chunk,
 };
 pub use chunklog::{
     ChunkAppendAck, ChunkLogError, ChunkLogRecovery, ChunkLogWriter, RecoveredChunk, RecoveryBound,

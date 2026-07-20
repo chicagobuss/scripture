@@ -115,6 +115,7 @@ impl RealActorHarness {
             clock,
             timer.clone(),
             64,
+            None,
         )
         .expect("actor");
         let pool = LocalPool::new();
@@ -662,6 +663,7 @@ fn dropped_receipt_future_still_leaves_durable_identity() {
             1,
             harness.log.clone(),
             RecoveryBound::new(64).expect("bound"),
+            None,
         ))
         .expect("recover");
     let (_, recovery_identities) = check_recovery(&recovery).expect("recovery");
@@ -697,6 +699,7 @@ proptest! {
             1,
             harness.log.clone(),
             RecoveryBound::new(64).expect("bound"),
+            None,
         )).expect("recover");
         let (record_ceiling, recovery_identities) =
             check_recovery(&recovery).map_err(TestCaseError::fail)?;

@@ -19,9 +19,12 @@ use crate::sequencer_key::sequencer_request_key_for_chunk;
 
 /// A bounded number of tail chunks to inspect during owner recovery.
 ///
-/// The bound limits producer-dedup reconstruction in the future driver.  It
-/// also makes the recovery cost explicit: at most this many Holylog reads,
-/// after one checked-tail operation.
+/// The bound limits producer-dedup reconstruction in the driver. It also makes
+/// the recovery cost explicit: at most this many Holylog reads after one
+/// checked-tail operation. When those entries are DataRefs, each Holylog read
+/// additionally implies one blob fetch (the producer submissions needed for
+/// dedup live inside the sealed chunk bytes). A slow bounded recovery is
+/// acceptable; an unmeasured one is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryBound(usize);
 
@@ -172,6 +175,18 @@ pub enum ChunkLogError {
     /// A DataRef must carry the digest of the exact sealed bytes.
     #[error("dataref chunk digest does not match sealed chunk")]
     DataRefChunkDigestMismatch,
+    /// Recovery or commit needed blob bytes and the object store refused them.
+    #[error("chunk blob store: {0}")]
+    BlobStore(String),
+    /// A DataRef names a blob that is absent; recovery must not silently skip it.
+    #[error("dataref blob missing: {key}")]
+    DataRefBlobMissing {
+        /// Object-store key that could not be fetched.
+        key: String,
+    },
+    /// Recovery saw a DataRef but no blob store was supplied to resolve it.
+    #[error("dataref recovery requires a blob store")]
+    DataRefRecoveryRequiresBlobStore,
     /// A chunk belongs to another cohort.
     #[error("chunk cohort does not match this writer")]
     CohortMismatch,
@@ -303,6 +318,12 @@ impl ChunkLog {
 }
 
 impl ChunkLogWriter {
+    /// Journal this writer allocates dense offsets for.
+    #[must_use]
+    pub const fn journal_id(&self) -> JournalId {
+        self.journal_id
+    }
+
     /// Constructs a writer after ownership and its initial offset are known.
     #[must_use]
     pub fn new(
@@ -558,12 +579,18 @@ impl ChunkLogWriter {
     }
 
     /// Rebuilds the writer and returns a bounded durable suffix for dedup.
+    ///
+    /// `blob_store` is required when the scanned suffix contains DataRefs: dedup
+    /// needs producer submissions inside the sealed chunk, so each DataRef entry
+    /// costs one Holylog read **and** one blob fetch. Pass `None` only for
+    /// inline-chunk laboratory logs.
     pub async fn recover(
         journal_id: JournalId,
         cohort_id: CohortId,
         generation: u64,
         log: AtomicLog,
         bound: RecoveryBound,
+        blob_store: Option<&dyn crate::blob_store::ChunkBlobStore>,
     ) -> Result<ChunkLogRecovery, ChunkLogError> {
         let (writer, chunks) = Self::recover_from_log(
             journal_id,
@@ -572,6 +599,7 @@ impl ChunkLogWriter {
             ChunkLog::Atomic(log),
             bound,
             GenerationPolicy::Exact(generation),
+            blob_store,
         )
         .await?;
         Ok(ChunkLogRecovery { writer, chunks })
@@ -588,6 +616,8 @@ impl ChunkLogWriter {
     /// If the register advances or the active generation is observed sealed
     /// while recovery reads, the attempt returns
     /// [`ChunkLogError::StaleCanonRecovery`] and never a writer.
+    ///
+    /// `blob_store` resolves DataRef payloads; see [`Self::recover`].
     pub async fn recover_virtual(
         journal_id: JournalId,
         cohort_id: CohortId,
@@ -595,6 +625,7 @@ impl ChunkLogWriter {
         expected_owner_id: OwnerId,
         log: VirtualLog,
         bound: RecoveryBound,
+        blob_store: Option<&dyn crate::blob_store::ChunkBlobStore>,
     ) -> Result<VirtualChunkLogRecovery, ChunkLogError> {
         let authority =
             observe_canon_authority(&log, journal_id, expected_verse_id, expected_owner_id).await?;
@@ -607,6 +638,7 @@ impl ChunkLogWriter {
             ChunkLog::Virtual(log.clone()),
             bound,
             GenerationPolicy::AtMost(active_revision),
+            blob_store,
         )
         .await?;
 
@@ -641,6 +673,7 @@ impl ChunkLogWriter {
         log: ChunkLog,
         bound: RecoveryBound,
         generation_policy: GenerationPolicy,
+        blob_store: Option<&dyn crate::blob_store::ChunkBlobStore>,
     ) -> Result<(Self, Vec<RecoveredChunk>), ChunkLogError> {
         let tail = match &log {
             ChunkLog::Atomic(_) => log.checked_tail().await?,
@@ -683,7 +716,45 @@ impl ChunkLogWriter {
                 }
                 Err(error) => return Err(error),
             };
-            let index = decode_index(&payload)?;
+            let chunk_bytes = match crate::dataref::decode_log_payload(&payload)? {
+                crate::dataref::LogPayload::InlineChunk(bytes) => bytes,
+                crate::dataref::LogPayload::DataRef(data_ref) => {
+                    let store =
+                        blob_store.ok_or(ChunkLogError::DataRefRecoveryRequiresBlobStore)?;
+                    let blob = match store.get(&data_ref.blob_key).await {
+                        Ok(bytes) => bytes,
+                        Err(ChunkLogError::DataRefBlobMissing { key }) => {
+                            return Err(ChunkLogError::DataRefBlobMissing { key });
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if ChunkDigest::of(&blob) != data_ref.blob_digest {
+                        return Err(ChunkLogError::DataRef(
+                            crate::dataref::DataRefError::BlobDigestMismatch,
+                        ));
+                    }
+                    let start = usize::try_from(data_ref.offset).map_err(|_| {
+                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow)
+                    })?;
+                    let end = usize::try_from(data_ref.offset.checked_add(data_ref.length).ok_or(
+                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow),
+                    )?)
+                    .map_err(|_| {
+                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow)
+                    })?;
+                    let range = blob.get(start..end).ok_or_else(|| {
+                        ChunkLogError::BlobStore(format!(
+                            "dataref range {}..{} outside blob {}",
+                            data_ref.offset,
+                            data_ref.offset + data_ref.length,
+                            data_ref.blob_key
+                        ))
+                    })?;
+                    data_ref.verify_chunk_bytes(range)?;
+                    bytes::Bytes::copy_from_slice(range)
+                }
+            };
+            let index = decode_index(&chunk_bytes)?;
             if index.header.cohort_id != cohort_id {
                 return Err(ChunkLogError::CohortMismatch);
             }
@@ -727,7 +798,7 @@ impl ChunkLogWriter {
             chunks.push(RecoveredChunk {
                 slot,
                 chunk_id: index.header.chunk_id,
-                digest: ChunkDigest::of(&payload),
+                digest: ChunkDigest::of(&chunk_bytes),
                 generation: index.header.generation,
                 first_offset: frame.base_offset,
                 record_count: frame.record_count,

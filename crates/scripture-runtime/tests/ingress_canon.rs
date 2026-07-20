@@ -53,6 +53,7 @@ fn config(owner: OwnerId) -> VerseRuntimeConfig {
         },
         recovery_bound: RecoveryBound::new(8).expect("bound"),
         queue_capacity: 16,
+        dataref_blobs: None,
     }
 }
 

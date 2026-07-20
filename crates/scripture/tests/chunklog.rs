@@ -209,6 +209,7 @@ fn real_atomic_log_append_and_bounded_recovery_preserve_offsets() {
             4,
             log,
             RecoveryBound::new(2).expect("non-zero bound"),
+            None,
         )
         .await
         .expect("recover");
@@ -448,6 +449,7 @@ fn virtual_recovery_rebuilds_suffix_across_canon_cutover() {
             owner_id(),
             harness.virtual_log(),
             RecoveryBound::new(8).expect("bound"),
+            None,
         )
         .await
         .expect("recover");
@@ -502,6 +504,7 @@ fn virtual_recovery_preserves_mixed_generation_suffix_order() {
             owner_id(),
             harness.virtual_log(),
             RecoveryBound::new(8).expect("bound"),
+            None,
         )
         .await
         .expect("recover");
@@ -555,6 +558,7 @@ fn virtual_recovery_rejects_future_chunk_generation() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::FutureChunkGeneration {
@@ -611,6 +615,7 @@ fn virtual_recovery_rejects_generation_regression_in_logical_order() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::RecoveredGenerationRegression {
@@ -635,6 +640,7 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::Authority(
@@ -649,6 +655,7 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::Authority(
@@ -663,6 +670,7 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
                 OwnerId::from_bytes(*b"other-owner-id!!"),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::Authority(
@@ -685,6 +693,7 @@ fn virtual_recovery_validates_canon_identity_before_returning_a_writer() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(1).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::Authority(
@@ -730,6 +739,7 @@ fn virtual_recovery_fails_closed_when_canon_advances_mid_recovery() {
                 owner_id(),
                 harness.virtual_log(),
                 RecoveryBound::new(8).expect("bound"),
+                None,
             )
             .await,
             Err(ChunkLogError::StaleCanonRecovery {

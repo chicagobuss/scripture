@@ -20,6 +20,7 @@ use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 
+use crate::blob_store::DataRefBlobConfig;
 use crate::chunk::{ChunkError, ChunkId, CohortId, ProducerId, WriterId};
 use crate::chunklog::{ChunkLogError, ChunkLogWriter, RecoveredChunk};
 use crate::clock::{Clock, Timer};
@@ -240,6 +241,8 @@ pub struct ChunkDriverActor<C, T> {
     age_sleep: Option<BoxFuture<'static, ()>>,
     /// Deadline for which [`Self::age_sleep`] was created, if any.
     age_sleep_deadline: Option<Duration>,
+    /// When set, sealed chunks are put as staging blobs and the log receives a DataRef.
+    dataref_blobs: Option<DataRefBlobConfig>,
 }
 
 impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
@@ -262,6 +265,7 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
         clock: C,
         timer: T,
         queue_capacity: usize,
+        dataref_blobs: Option<DataRefBlobConfig>,
     ) -> Result<(ChunkDriverHandle, Self), DriverError> {
         policy.validate()?;
         let (sender, receiver) = mpsc::channel(queue_capacity.max(1));
@@ -292,6 +296,7 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
             metrics: Arc::clone(&metrics),
             age_sleep: None,
             age_sleep_deadline: None,
+            dataref_blobs,
         };
         actor.rebuild_dedup(recovered);
         Ok((

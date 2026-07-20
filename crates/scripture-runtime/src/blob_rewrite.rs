@@ -21,6 +21,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use scripture::{
     Chunk, ChunkAppendAck, ChunkDigest, ChunkError, ChunkId, ChunkLogError, DataRef, DataRefError,
     LogPayload, RecordOffset, WriterId, decode_chunk, decode_log_payload, encode_data_ref,
+    scan_sealed_chunk_ids,
 };
 
 use crate::blob_reader::{BlobReadError, ResolvedChunk, fetch_data_ref, resolve_log_payload};
@@ -411,14 +412,35 @@ async fn load_rewritten_placements(
 /// blob collectable while a sibling Verse still referenced it, and deleting on
 /// that answer loses the sibling's records.
 ///
-/// Produced by the writer that cut the blob, and it must be made durable to
-/// evaluate collectability after a restart.
+/// Prefer [`staging_blob_contents_from_bytes`]: a staging blob is a concatenation
+/// of sealed chunks whose headers carry [`ChunkId`], so membership is derived
+/// from the object you must fetch before deleting — no sidecar to drift from
+/// the bytes it describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagingBlobContents {
     /// Object-store key of the staging blob.
     pub blob_key: String,
     /// Every chunk in the blob, regardless of which Verse owns it.
     pub chunk_ids: BTreeSet<ChunkId>,
+}
+
+/// Derives staging-blob membership by scanning concatenated sealed-chunk bytes.
+///
+/// Chosen over a sidecar because one GET of the object already required for
+/// deletion recovers the full set, with no second write and no manifest that
+/// can disagree with the bytes it names.
+pub fn staging_blob_contents_from_bytes(
+    blob_key: impl Into<String>,
+    bytes: &[u8],
+) -> Result<StagingBlobContents, ChunkError> {
+    let ids = scan_sealed_chunk_ids(bytes)?;
+    if ids.is_empty() {
+        return Err(ChunkError::EmptyChunk);
+    }
+    Ok(StagingBlobContents {
+        blob_key: blob_key.into(),
+        chunk_ids: ids.into_iter().collect(),
+    })
 }
 
 /// Collects the chunk ids that already have a superseding rewritten pointer.

@@ -9,10 +9,11 @@ use holylog_object_store::{ObjectStoreExclusiveClaim, ObjectStoreMetrics, WriteP
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::ObjectStore;
 use object_store::path::Path;
+use scripture::DataRefBlobConfig;
 use scripture_runtime::counting_store::{CountingStore, RequestCounters};
 use scripture_runtime::{
-    BackendProfile, NodeIdentity, ObjectStorePartsFactory, PartsFactory, ProcessLogletResolver,
-    VerseNodeSupervisor, connect_s3_compat, resolve_credentials,
+    BackendProfile, NodeIdentity, ObjectStoreChunkBlobStore, ObjectStorePartsFactory, PartsFactory,
+    ProcessLogletResolver, VerseNodeSupervisor, connect_s3_compat, resolve_credentials,
 };
 use scripture_service::VerseRuntimeConfig;
 
@@ -48,10 +49,12 @@ pub fn connect_shared_store(config: &ScriptureConfig) -> Result<SharedStore, Box
     let advertise = config.advertise()?;
     let backend = config.backend()?;
     let credentials = resolve_credentials(backend)?;
-    if matches!(backend, BackendProfile::CloudflareR2)
-        && config.store.endpoint.starts_with("http://")
+    if matches!(
+        backend,
+        BackendProfile::CloudflareR2 | BackendProfile::AmazonS3
+    ) && config.store.endpoint.starts_with("http://")
     {
-        return Err("r2 requires an HTTPS endpoint".into());
+        return Err(format!("{} requires an HTTPS endpoint", backend.label()).into());
     }
 
     let store = connect_s3_compat(
@@ -76,10 +79,18 @@ pub fn connect_shared_store(config: &ScriptureConfig) -> Result<SharedStore, Box
 pub fn assemble_assignment_seams(
     shared: &SharedStore,
     store_root: &str,
-    verse_config: VerseRuntimeConfig,
+    mut verse_config: VerseRuntimeConfig,
     advertise: scripture::OwnerEndpoint,
 ) -> Result<AssembledNode, Box<dyn Error>> {
     let store_root = store_root.trim_end_matches('/').to_owned();
+    // Mount DataRefs on the live serve path: sealed chunks become staging blobs
+    // and the Verse log receives pointers. Without this the blob writer stays a
+    // lab seam and requests-per-record cannot move.
+    if verse_config.dataref_blobs.is_none() {
+        verse_config.dataref_blobs = Some(DataRefBlobConfig::new(Arc::new(
+            ObjectStoreChunkBlobStore::new(Arc::clone(&shared.store)),
+        )));
+    }
     // The register and claim store carry the Serving-Authority traffic, which
     // Holylog cannot count: neither type takes metrics. Wrap the store for
     // those two paths only, so authority requests are attributable separately
