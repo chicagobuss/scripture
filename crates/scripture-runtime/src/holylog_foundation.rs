@@ -50,7 +50,11 @@ pub trait FreshLogletIdPolicy: Send + Sync {
     ) -> Result<LogletId, FoundationTransitionError>;
 }
 
-/// Default policy: `g{revision}-t{term}-{owner-hex-prefix}`.
+/// Default policy: `g{revision}-t{term}-{owner-hex}-a{attempt}`.
+///
+/// Uses the full owner identity (not a short prefix) so concurrent Verses that
+/// share a [`PartsFactory`] do not collide on Loglet namespaces when owners
+/// share a common ASCII prefix (e.g. `fleet-own-*`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultFreshLogletIdPolicy;
 
@@ -65,7 +69,6 @@ impl FreshLogletIdPolicy for DefaultFreshLogletIdPolicy {
         let hex: String = candidate
             .as_bytes()
             .iter()
-            .take(4)
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let raw = format!("g{next_revision}-t{}-{hex}-a{attempt}", next_term.get());
@@ -349,27 +352,53 @@ impl HolylogJournalFoundation {
         }
     }
 
-    async fn ensure_predecessor_sealed(
+    /// Installs read/seal views for every generation in membership.
+    ///
+    /// A promote on a fresh process resolver (after crash simulation removes
+    /// only the active writable) must still resolve historical generations:
+    /// VirtualLog `read_next` / catch-up routes by chain position and will
+    /// surface [`VirtualLogError::MissingLoglet`] for any gen absent from the
+    /// resolver. Mirrors supervisor restart materialization in `inspect`.
+    ///
+    /// The active predecessor is sealed if still open so
+    /// [`VirtualLog::reconfigure_with_receipt`] can observe an authoritative
+    /// sealed tail.
+    async fn materialize_membership_for_cutover(
         &self,
-        predecessor: &LogletId,
+        state: &VirtualLogState,
     ) -> Result<(), FoundationTransitionError> {
-        let parts = self
-            .parts
-            .open(predecessor)
-            .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
-        let historical = resolve_read_seal(parts.components(self.k))
-            .await
-            .map_err(Self::map_unavailable)?;
-        if !historical
-            .observe_durable()
-            .await
-            .map_err(Self::map_unavailable)?
-            .sealed()
-        {
-            historical.seal().await.map_err(Self::map_unavailable)?;
+        let active_id = state
+            .active()
+            .ok_or_else(|| FoundationTransitionError::Conflict {
+                message: "no active generation to seal".into(),
+            })?
+            .loglet_id
+            .clone();
+
+        for generation in &state.generations {
+            let is_active = generation.loglet_id == active_id;
+            if !is_active && self.resolver.contains(&generation.loglet_id) {
+                continue;
+            }
+            let parts = self
+                .parts
+                .open(&generation.loglet_id)
+                .map_err(|error| FoundationTransitionError::Unavailable(Box::new(error)))?;
+            let historical = resolve_read_seal(parts.components(self.k))
+                .await
+                .map_err(Self::map_unavailable)?;
+            if is_active
+                && !historical
+                    .observe_durable()
+                    .await
+                    .map_err(Self::map_unavailable)?
+                    .sealed()
+            {
+                historical.seal().await.map_err(Self::map_unavailable)?;
+            }
+            self.resolver
+                .insert_read_seal(generation.loglet_id.clone(), Arc::new(historical));
         }
-        self.resolver
-            .insert_read_seal(predecessor.clone(), Arc::new(historical));
         Ok(())
     }
 
@@ -545,18 +574,33 @@ impl HolylogJournalFoundation {
             .loglet_id
             .clone();
 
-        self.ensure_predecessor_sealed(&predecessor).await?;
+        self.materialize_membership_for_cutover(&observed.state)
+            .await?;
         self.observer
             .checkpoint(FoundationTransitionCheckpoint::PredecessorSealed)?;
 
-        // Successor start = sealed predecessor contiguous tail (Holylog sets this
-        // on reconfigure; we bind the Serving fence to the post-publish observe).
+        // Successor start must match Holylog's reconfigure boundary:
+        // `predecessor.start + sealed_local_tail`. Embedding only the local
+        // tail breaks the second+ cutover when predecessor.start > 0
+        // (ContenderConflict in require_local_serving).
+        let predecessor_start = observed
+            .state
+            .active()
+            .ok_or_else(|| FoundationTransitionError::Conflict {
+                message: "no active generation to seal".into(),
+            })?
+            .start;
         let next_revision = observed.state.revision.checked_add(1).ok_or_else(|| {
             FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
                 "VirtualLog revision overflow",
             )))
         })?;
-        let start = self.sealed_predecessor_start(&predecessor).await?;
+        let local_tail = self.sealed_predecessor_start(&predecessor).await?;
+        let start = predecessor_start.checked_add(local_tail).ok_or_else(|| {
+            FoundationTransitionError::Unavailable(Box::new(std::io::Error::other(
+                "VirtualLog address space exhausted computing successor start",
+            )))
+        })?;
         self.observer
             .checkpoint(FoundationTransitionCheckpoint::SealedTailObserved)?;
         let (successor, _parts, receipt, writable, bind) = self

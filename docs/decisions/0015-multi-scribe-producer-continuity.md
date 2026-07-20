@@ -38,9 +38,11 @@ This is implemented as campaign Composition scenario
 ## Deterministic validation
 
 `cargo test -p scripture-campaign multi_scribe` runs three concurrent Verses,
-continuous produce (≥600 admissions) through a **fsynced file outbox**, one
-rolling restart pass per Verse, and asserts `local_durable == committed` with
-`pending == 0`.
+continuous produce (≥600 admissions) through a **fsynced file outbox**, two
+rolling restart cycles per Verse (A→B then B→A), and asserts
+`local_durable == committed` with `pending == 0`. Multi-cycle cutovers require
+successor `start = predecessor.start + local_tail` and full membership
+materialization into the process resolver.
 
 `cargo test -p scripture-producer file_outbox_survives` proves reopen after
 process drop recovers pending submissions and committed progress.

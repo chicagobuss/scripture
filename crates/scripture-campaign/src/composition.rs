@@ -41,6 +41,8 @@ const FOUNDATION_K: u64 = 2;
 const SCRIBE_COUNT: usize = 3;
 /// Bursts of concurrent produce across all lanes (each burst = SCRIBE_COUNT records).
 const PRODUCE_BURST: u64 = 200;
+/// Full rolling-restart cycles (A→B, then B→A, …) while produce continues.
+const RESTART_CYCLES: usize = 2;
 const RESTART_PAUSE: Duration = Duration::from_millis(15);
 
 #[derive(Clone, Copy)]
@@ -220,6 +222,10 @@ impl ScribeBundle {
         self.promote_owner(self.lane.owner_b, "b", expected).await
     }
 
+    async fn promote_a(&self, expected: JournalGenerationRef) -> Result<(), CampaignError> {
+        self.promote_owner(self.lane.owner_a, "a", expected).await
+    }
+
     async fn promote_owner(
         &self,
         owner: OwnerId,
@@ -240,7 +246,7 @@ impl ScribeBundle {
             key_for(self.lane),
             WriterTerm::new(next)
                 .map_err(|error| CampaignError::Scenario(format!("term {tag}: {error}")))?,
-            expected,
+            expected.clone(),
             config_for(self.lane, owner),
             Arc::clone(&self.register),
             Arc::clone(&resolver),
@@ -250,7 +256,7 @@ impl ScribeBundle {
         .await
         .map_err(|error| {
             CampaignError::Scenario(format!(
-                "promote {tag} lane {}: {error}",
+                "promote {tag} lane {} term={next} expected={expected:?}: {error}",
                 self.lane.index
             ))
         })?;
@@ -318,6 +324,8 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
     run_id: &str,
 ) -> Result<(serde_json::Value, serde_json::Value), CampaignError> {
     // One shared parts factory across all lane promotions so sealed gens reopen.
+    // Per-lane factories would also work; sharing is fine once successor start
+    // matches Holylog (predecessor.start + local_tail).
     let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
 
     let mut lanes = BTreeMap::new();
@@ -370,18 +378,25 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
         Ok::<u64, CampaignError>(admitted)
     });
 
-    // One rolling pass: crash each serving scribe and promote its standby while
-    // the producer keeps admitting into the continuity outbox.
-    for index in 0..SCRIBE_COUNT {
-        sleep(RESTART_PAUSE).await;
-        let bundle = lanes
-            .get(&index)
-            .ok_or_else(|| CampaignError::Scenario("missing lane".into()))?;
-        let expected = bundle.crash_for_restart().await?;
-        sleep(RESTART_PAUSE).await;
-        bundle.promote_b(expected).await?;
-        let map = lane_of.lock().await.clone();
-        drain_pending(&lanes, &outbox, &map).await;
+    // Rolling restart cycles while the producer keeps admitting into the outbox.
+    // Cycle 0: A→B on each lane; cycle 1: B→A — exercises successor start after
+    // predecessor.start > 0 (the prior ContenderConflict failure mode).
+    for cycle in 0..RESTART_CYCLES {
+        for index in 0..SCRIBE_COUNT {
+            sleep(RESTART_PAUSE).await;
+            let bundle = lanes
+                .get(&index)
+                .ok_or_else(|| CampaignError::Scenario("missing lane".into()))?;
+            let expected = bundle.crash_for_restart().await?;
+            sleep(RESTART_PAUSE).await;
+            if cycle % 2 == 0 {
+                bundle.promote_b(expected).await?;
+            } else {
+                bundle.promote_a(expected).await?;
+            }
+            let map = lane_of.lock().await.clone();
+            drain_pending(&lanes, &outbox, &map).await;
+        }
     }
 
     let produced = producer_task
@@ -420,6 +435,7 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
         "outbox": "fsynced-file-wal",
         "outbox_dir": outbox_dir.display().to_string(),
         "scribes": SCRIBE_COUNT,
+        "restart_cycles": RESTART_CYCLES,
         "produced": produced,
         "committed": snap.committed.len(),
         "pending": snap.pending,
