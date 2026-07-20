@@ -75,6 +75,8 @@ fn runtime_config_for(
         recovery_bound: RecoveryBound::new(8).expect("bound"),
         queue_capacity: 16,
         dataref_blobs: None,
+        blob_sink: None,
+        blob_verse_key: None,
     }
 }
 

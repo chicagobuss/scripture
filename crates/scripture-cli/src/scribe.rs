@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use holylog::virtual_log::LogletResolver;
 use object_store::ObjectStore;
+use scripture::BlobCommitSink;
 use scripture::serving_authority::{AuthorityKey, JournalGenerationRef, RouteHint, WriterTerm};
+use scripture_runtime::counting_store::CountingStore;
 use scripture_runtime::{
-    AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime, HaServingSession,
-    HolylogJournalFoundation, IngressBudgets, NodeIdentity, NodeResourceBudget, RawLinesConfig,
-    ScribeResourceLimits, ScribeSupervisor, bootstrap_and_serve, promote_and_serve,
-    serve_ha_raw_lines_connection_with_budgets, system_clocks,
+    AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime, BlobWriterConfig,
+    HaServingSession, HolylogJournalFoundation, IngressBudgets, NodeIdentity, NodeResourceBudget,
+    RawLinesConfig, ScribeResourceLimits, ScribeSupervisor, SharedBlobSink, SharedBlobSinkConfig,
+    bootstrap_and_serve, promote_and_serve, serve_ha_raw_lines_connection_with_budgets,
+    system_clocks,
 };
 use scripture_service::{
     AuthorityCoordinator, JournalFoundationTransition, SecureTransitionIdGenerator,
@@ -139,11 +142,17 @@ async fn activate_one(
     assignment: &AssignmentConfig,
     initial_term: u64,
     budget: Arc<AssignmentResourceBudget>,
+    shared_blob_sink: Option<Arc<dyn BlobCommitSink>>,
 ) -> Result<AssignmentRuntime, Box<dyn Error>> {
     let key = authority_key(config, assignment)?;
     let store_root = config.assignment_store_root(assignment)?;
     let advertise = assignment.advertise.clone();
     let assembled = assemble::assemble_assignment(config, shared, assignment)?;
+    let mut verse_config = assembled.verse_config.clone();
+    if let Some(sink) = shared_blob_sink {
+        verse_config.blob_sink = Some(sink);
+        verse_config.blob_verse_key = Some(assignment.id.clone());
+    }
 
     match assignment.posture {
         AssignmentPosture::Standby => {
@@ -181,7 +190,7 @@ async fn activate_one(
                 foundation.as_ref(),
                 key,
                 term,
-                assembled.verse_config.clone(),
+                verse_config,
                 Arc::clone(&assembled.register),
                 Arc::clone(&assembled.resolver),
                 clock,
@@ -234,11 +243,17 @@ async fn promote_one(
     assignment: &AssignmentConfig,
     candidate_term: u64,
     budget: Arc<AssignmentResourceBudget>,
+    shared_blob_sink: Option<Arc<dyn BlobCommitSink>>,
 ) -> Result<AssignmentRuntime, Box<dyn Error>> {
     let key = authority_key(config, assignment)?;
     let store_root = config.assignment_store_root(assignment)?;
     let advertise = assignment.advertise.clone();
     let assembled = assemble::assemble_assignment(config, shared, assignment)?;
+    let mut verse_config = assembled.verse_config.clone();
+    if let Some(sink) = shared_blob_sink {
+        verse_config.blob_sink = Some(sink);
+        verse_config.blob_verse_key = Some(assignment.id.clone());
+    }
     let expected = observe_expected_generation(&assembled).await?;
     let foundation = Arc::new(build_foundation(&assembled, key));
     let coordinator = AuthorityCoordinator::new(
@@ -257,7 +272,7 @@ async fn promote_one(
         key,
         term,
         expected,
-        assembled.verse_config.clone(),
+        verse_config,
         Arc::clone(&assembled.register),
         Arc::clone(&assembled.resolver),
         clock,
@@ -302,6 +317,26 @@ async fn promote_one(
     }
 }
 
+fn spawn_shared_blob_sink(
+    shared: &SharedStore,
+    limits: &ScribeResourceLimits,
+    assignment_count: usize,
+) -> Result<Arc<SharedBlobSink>, Box<dyn Error>> {
+    let blob_store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new(
+        Arc::clone(&shared.store),
+        Arc::clone(&shared.blob_counters),
+    ));
+    let sink = SharedBlobSink::spawn(
+        blob_store,
+        SharedBlobSinkConfig::fair_for_assignments(
+            BlobWriterConfig::default(),
+            limits.max_pending_bytes,
+            assignment_count,
+        ),
+    )?;
+    Ok(Arc::new(sink))
+}
+
 /// Long-lived multi-assignment bootstrap-and-serve for `scribe.assignments`.
 pub async fn bootstrap_multi_assignment(
     config: ScriptureConfig,
@@ -322,10 +357,26 @@ pub async fn bootstrap_multi_assignment(
     })
     .await?;
     let count = assignments.len();
+    let shared_blob_sink = if count > 1 {
+        let sink = spawn_shared_blob_sink(&shared, &limits, count)?;
+        Some(sink as Arc<dyn BlobCommitSink>)
+    } else {
+        None
+    };
     let mut runtimes = Vec::with_capacity(count);
     for assignment in &assignments {
         let budget = assignment_budget_for_node(&limits, count);
-        runtimes.push(activate_one(&config, &shared, assignment, initial_term, budget).await?);
+        runtimes.push(
+            activate_one(
+                &config,
+                &shared,
+                assignment,
+                initial_term,
+                budget,
+                shared_blob_sink.clone(),
+            )
+            .await?,
+        );
     }
     let supervisor = ScribeSupervisor::from_assignments(limits, runtimes)?;
     eprintln!(
@@ -382,14 +433,40 @@ pub async fn promote_multi_assignment(
     })
     .await?;
     let count = assignments.len();
+    let shared_blob_sink = if count > 1 {
+        let sink = spawn_shared_blob_sink(&shared, &limits, count)?;
+        Some(sink as Arc<dyn BlobCommitSink>)
+    } else {
+        None
+    };
     let mut runtimes = Vec::with_capacity(count);
     for assignment in &assignments {
         let budget = assignment_budget_for_node(&limits, count);
         if assignment.id == assignment_id {
-            runtimes.push(promote_one(&config, &shared, assignment, candidate_term, budget).await?);
+            runtimes.push(
+                promote_one(
+                    &config,
+                    &shared,
+                    assignment,
+                    candidate_term,
+                    budget,
+                    shared_blob_sink.clone(),
+                )
+                .await?,
+            );
         } else {
             // Sibling activation uses posture only — never promote.
-            runtimes.push(activate_one(&config, &shared, assignment, 1, budget).await?);
+            runtimes.push(
+                activate_one(
+                    &config,
+                    &shared,
+                    assignment,
+                    1,
+                    budget,
+                    shared_blob_sink.clone(),
+                )
+                .await?,
+            );
         }
     }
     let supervisor = ScribeSupervisor::from_assignments(limits, runtimes)?;
@@ -834,6 +911,8 @@ mod tests {
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 16,
             dataref_blobs: None,
+            blob_sink: None,
+            blob_verse_key: None,
         }
     }
 

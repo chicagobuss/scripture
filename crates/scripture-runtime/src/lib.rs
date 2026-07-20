@@ -23,6 +23,7 @@ pub mod pre_commit_spool;
 mod producer_routing;
 mod raw_lines;
 mod scribe;
+pub mod shared_blob_sink;
 mod status;
 
 pub use assignment_root::assignment_durable_root;
@@ -84,4 +85,5 @@ pub use scribe::{
     IngressBudgets, NodeResourceBudget, NodeResourceSnapshot, ScribeError, ScribeResourceLimits,
     ScribeSupervisor,
 };
+pub use shared_blob_sink::{SharedBlobSink, SharedBlobSinkConfig, SharedBlobSinkMetrics};
 pub use status::{disposition_label, is_ready_to_serve, status_body};

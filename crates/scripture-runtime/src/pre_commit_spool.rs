@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use scripture::{
     AchievedProfile, AdmitPlan, ChunkId, CohortId, JournalId, ProducerReceipt, ProgressIdentity,
-    ReceiptPolicyError, ReceiptRequirement, ScribeSpoolCapability, SpoolConfig, SpoolError,
-    SpoolFrame, SpoolOnFull, SpoolStorage, SpooledReceipt, Submission, SubmissionRef,
+    ReceiptPolicyError, ReceiptRequirement, RecordOffset, ScribeSpoolCapability, SpoolConfig,
+    SpoolError, SpoolFrame, SpoolOnFull, SpoolStorage, SpooledReceipt, Submission, SubmissionRef,
     VerseReceiptPolicy, encoded_frame_bytes, plan_admission, scan_and_classify,
 };
 
@@ -422,6 +422,7 @@ fn envelope_from_parts(
     BlobEnvelope {
         verse_key,
         chunk_id,
+        base_offset: RecordOffset::new(0),
         journal_id,
         cohort_id,
         records: submission.records,

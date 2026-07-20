@@ -7,9 +7,9 @@
 
 use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use scripture::{
-    CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, ChunkPolicy, Clock, CohortId,
-    DataRefBlobConfig, DriverError, JournalId, OwnerId, ReceiptFuture, RecoveryBound, Submission,
-    Timer, VerseId, WriterId,
+    BlobCommitSink, CanonAuthorityError, CanonFence, CanonFenceError, CanonOwner, ChunkPolicy,
+    Clock, CohortId, DataRefBlobConfig, DriverError, JournalId, OwnerId, ReceiptFuture,
+    RecoveryBound, Submission, Timer, VerseId, WriterId,
 };
 
 use crate::canon_owner::{CanonOwnerError, CanonOwnerRequest, recover_canon_owner};
@@ -20,7 +20,7 @@ use crate::chunk_service::{ChunkJournalService, ChunkServiceError};
 ///
 /// `OwnerId` must be supplied by the deployment across restarts. This type does
 /// not generate owner identities or treat endpoints as fencing grants.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CanonNodeConfig {
     /// Logical Scripture journal.
     pub journal_id: JournalId,
@@ -40,6 +40,21 @@ pub struct CanonNodeConfig {
     pub queue_capacity: usize,
     /// When set, recovery resolves DataRefs and the driver emits them.
     pub dataref_blobs: Option<DataRefBlobConfig>,
+    /// When set, sealed chunks buffer in a shared Scribe sink instead of depth-one PUTs.
+    pub blob_sink: Option<std::sync::Arc<dyn BlobCommitSink>>,
+    /// Assignment key for shared-sink routing.
+    pub blob_verse_key: Option<String>,
+}
+
+impl std::fmt::Debug for CanonNodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonNodeConfig")
+            .field("journal_id", &self.journal_id)
+            .field("verse_id", &self.verse_id)
+            .field("blob_sink", &self.blob_sink.is_some())
+            .field("blob_verse_key", &self.blob_verse_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CanonNodeConfig {
@@ -56,6 +71,8 @@ impl CanonNodeConfig {
             recovery_bound: self.recovery_bound,
             queue_capacity: self.queue_capacity,
             dataref_blobs: self.dataref_blobs.clone(),
+            blob_sink: self.blob_sink.clone(),
+            blob_verse_key: self.blob_verse_key.clone(),
         }
     }
 }
@@ -324,6 +341,8 @@ mod tests {
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 16,
             dataref_blobs: None,
+            blob_sink: None,
+            blob_verse_key: None,
         }
     }
 

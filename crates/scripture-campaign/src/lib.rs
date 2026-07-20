@@ -753,6 +753,8 @@ fn config(owner: OwnerId) -> VerseRuntimeConfig {
         recovery_bound: RecoveryBound::new(8).expect("recovery bound"),
         queue_capacity: 16,
         dataref_blobs: None,
+        blob_sink: None,
+        blob_verse_key: None,
     }
 }
 

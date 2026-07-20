@@ -466,10 +466,12 @@ impl ScriptureConfig {
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 256,
             dataref_blobs: None,
+            blob_sink: None,
+            blob_verse_key: None,
         })
     }
 
-    /// Per-assignment verse runtime config (`canon`/`verse` → JournalId/VerseId).
+    /// Per-assignment verse runtime config (`canon`/`verse` → JournalId/VerseId`).
     pub fn assignment_runtime_config(
         &self,
         assignment: &AssignmentConfig,
@@ -484,6 +486,8 @@ impl ScriptureConfig {
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 256,
             dataref_blobs: None,
+            blob_sink: None,
+            blob_verse_key: None,
         })
     }
 

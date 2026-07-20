@@ -64,6 +64,8 @@ fn receipt_is_released_only_after_kernel_acknowledges() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -124,6 +126,8 @@ fn cancelled_submitter_still_commits() {
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -190,6 +194,8 @@ fn failed_or_ambiguous_append_poisons_and_never_retries() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -237,6 +243,8 @@ fn record_and_flush_bounds_emit_single_frame_chunks() {
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -302,6 +310,8 @@ fn dropped_response_retry_returns_original_receipt() {
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -492,6 +502,8 @@ fn reservation_pressure_parks_admission_until_commit() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -622,6 +634,8 @@ fn parked_duplicate_retries_join_instead_of_double_encode() {
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -769,6 +783,8 @@ fn auto_seal_durable_then_error_poisons_without_flush() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -828,6 +844,8 @@ fn age_bound_seals_and_commits_via_manual_timer() {
         Arc::clone(&clock),
         timer.clone(),
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -904,6 +922,8 @@ fn multi_record_submission_admits_when_each_record_under_limit() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -945,6 +965,8 @@ fn a_multi_record_submission_yields_exactly_one_receipt_spanning_all_records() {
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -1013,6 +1035,8 @@ fn an_oversized_submission_is_rejected_and_not_split_across_chunks() {
         timer,
         8,
         None,
+        None,
+        None,
     )
     .expect("actor");
 
@@ -1064,6 +1088,8 @@ fn a_retry_of_the_same_multi_record_submission_identity_is_deduplicated_as_one_u
         clock,
         timer,
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -1128,6 +1154,8 @@ fn command_winning_select_does_not_leak_timer_sleepers() {
         clock,
         timer.clone(),
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -1198,6 +1226,8 @@ fn max_uncommitted_age_parks_new_admission() {
         Arc::clone(&clock),
         timer.clone(),
         8,
+        None,
+        None,
         None,
     )
     .expect("actor");
@@ -1280,6 +1310,7 @@ proptest! {
         let timer = ManualTimer::new(Arc::clone(&clock));
         let (handle, actor) = ChunkDriverActor::new(
             journal(), cohort(), writer_id(), 1, writer, &[], policy(), clock, timer, 32, None,
+            None, None,
         ).expect("actor");
         let mut pool = LocalPool::new();
         pool.spawner().spawn(async move { let _ = actor.run().await; }).expect("spawn actor");

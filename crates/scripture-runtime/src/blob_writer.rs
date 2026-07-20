@@ -66,6 +66,8 @@ pub struct BlobEnvelope {
     pub verse_key: String,
     /// Stable chunk identity used for acknowledgements across resealing.
     pub chunk_id: ChunkId,
+    /// Dense offset allocated when the chunk was formed.
+    pub base_offset: RecordOffset,
     /// Journal carried by this one-frame chunk.
     pub journal_id: JournalId,
     /// Cohort policy for this chunk.
@@ -504,7 +506,7 @@ impl<C: BlobClock> BlobWriter<C> {
 fn estimate_envelope_len(envelope: &BlobEnvelope) -> Result<usize, BlobWriterError> {
     encoded_chunk_len(&[Frame {
         journal_id: envelope.journal_id,
-        base_offset: RecordOffset::new(0),
+        base_offset: envelope.base_offset,
         records: envelope.records.clone(),
         submissions: envelope.submissions.clone(),
     }])

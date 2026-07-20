@@ -305,6 +305,8 @@ mod tests {
             timer,
             16,
             None,
+            None,
+            None,
         )
         .expect("actor")
     }

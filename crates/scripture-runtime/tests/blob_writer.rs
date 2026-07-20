@@ -42,6 +42,7 @@ fn envelope(verse: &str, chunk: u8, journal_id: JournalId, values: &[i64]) -> Bl
     BlobEnvelope {
         verse_key: verse.into(),
         chunk_id: ChunkId::from_bytes([chunk; 16]),
+        base_offset: RecordOffset::new(0),
         journal_id,
         cohort_id: cohort(),
         records: values.iter().copied().map(record).collect(),

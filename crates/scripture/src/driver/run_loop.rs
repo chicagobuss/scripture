@@ -6,10 +6,11 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::future::{self, Either};
 
+use crate::blob_sink::BlobSinkSubmit;
 use crate::chunk::{ChunkHeader, ChunkId, Frame, SubmissionRef, seal_single_frame_chunk};
 use crate::trace::{Effect, Event, TerminalOutcome};
 
-use super::state::{Command, SealedWork};
+use super::state::{Command, PendingAppend, SealedWork};
 use super::{AckLevel, ChunkDriverActor, DriverError, Receipt};
 
 impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
@@ -25,9 +26,21 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             }
 
             // Depth one: if a sealed chunk is waiting, append it before taking
-            // more seal decisions. Commands may still queue in the channel.
-            if self.pending_append.is_some() {
-                self.append_pending().await?;
+            // more seal decisions. Shared-sink pending stays non-blocking so cut
+            // seal/append commands can be handled while envelopes buffer.
+            if matches!(self.pending_append, Some(PendingAppend::DepthOne(_))) {
+                self.append_depth_one().await?;
+                continue;
+            }
+
+            if matches!(
+                self.pending_append,
+                Some(PendingAppend::BlobSink {
+                    enqueued: false,
+                    ..
+                })
+            ) {
+                self.try_enqueue_blob_sink().await?;
                 continue;
             }
 
@@ -64,8 +77,8 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                 if self.open.is_some() {
                     self.seal_open();
                 }
-                if self.pending_append.is_some() {
-                    self.append_pending().await?;
+                if matches!(self.pending_append, Some(PendingAppend::DepthOne(_))) {
+                    self.append_depth_one().await?;
                 }
                 while let Some(blocked) = self.blocked.pop_front() {
                     let _ = blocked.admission.send(Err(DriverError::Unavailable));
@@ -103,11 +116,11 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
     fn refresh_age_sleep(&mut self) {
         let deadline = self.age_deadline();
         if self.age_sleep_deadline == deadline {
-            if deadline.is_some() && self.age_sleep.is_none() {
-                // Previously completed or cleared; recreate for the same deadline.
-                if let Some(deadline) = deadline {
-                    self.age_sleep = Some(self.timer.sleep_until(deadline));
-                }
+            if deadline.is_some()
+                && self.age_sleep.is_none()
+                && let Some(deadline) = deadline
+            {
+                self.age_sleep = Some(self.timer.sleep_until(deadline));
             }
             return;
         }
@@ -136,14 +149,36 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                     self.clear_age_sleep();
                     self.seal_open();
                 }
-                if self.pending_append.is_some() {
-                    self.append_pending().await?;
+                if matches!(self.pending_append, Some(PendingAppend::DepthOne(_))) {
+                    self.append_depth_one().await?;
                 }
                 if self.poisoned {
                     let _ = responder.send(Err(DriverError::Poisoned));
                 } else {
                     let _ = responder.send(Ok(()));
                 }
+                Ok(())
+            }
+            Command::BlobSinkSeal {
+                envelope,
+                responder,
+            } => {
+                let result = self.seal_envelope(&envelope);
+                let _ = responder.send(result);
+                Ok(())
+            }
+            Command::BlobSinkAppendRefs { items, responder } => {
+                let result = self.append_blob_sink_refs(items).await;
+                let _ = responder.send(result);
+                Ok(())
+            }
+            Command::BlobSinkCommitted {
+                chunk_id,
+                ack,
+                responder,
+            } => {
+                let result = self.finish_blob_sink_committed(chunk_id, ack);
+                let _ = responder.send(result);
                 Ok(())
             }
         }
@@ -157,6 +192,15 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             Command::Flush { responder } => {
                 let _ = responder.send(Err(error));
             }
+            Command::BlobSinkSeal { responder, .. } => {
+                let _ = responder.send(Err(error));
+            }
+            Command::BlobSinkAppendRefs { responder, .. } => {
+                let _ = responder.send(Err(error));
+            }
+            Command::BlobSinkCommitted { responder, .. } => {
+                let _ = responder.send(Err(error));
+            }
         }
     }
 
@@ -165,6 +209,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             let _ = blocked.admission.send(Err(DriverError::Poisoned));
         }
     }
+
     pub(super) fn seal_open(&mut self) {
         let Some(open) = self.open.take() else {
             return;
@@ -195,8 +240,59 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             self.next_chunk = self.next_chunk.wrapping_add(1);
             bytes
         });
+
+        if self.blob_sink.is_some() {
+            let verse_key = self
+                .blob_verse_key
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let envelope = crate::blob_sink::PendingBlobEnvelope {
+                verse_key,
+                chunk_id,
+                base_offset,
+                journal_id: self.journal_id,
+                cohort_id: self.cohort_id,
+                records,
+                submissions,
+            };
+            let bytes = match crate::chunk::encoded_chunk_len(&[Frame {
+                journal_id: envelope.journal_id,
+                base_offset: envelope.base_offset,
+                records: envelope.records.clone(),
+                submissions: envelope.submissions.clone(),
+            }]) {
+                Ok(len) => len,
+                Err(error) => {
+                    for placed in open.placed {
+                        for waiter in placed.waiters {
+                            let _ = waiter.send(Err(DriverError::Codec(error.clone())));
+                        }
+                    }
+                    self.publish_reserved();
+                    self.drain_blocked();
+                    return;
+                }
+            };
+            self.ledger.event(Event::ChunkSealed {
+                chunk_id,
+                records: first_record,
+                bytes,
+            });
+            self.pending_append = Some(PendingAppend::BlobSink {
+                envelope,
+                placed: open.placed,
+                encoded_bytes: open.encoded_bytes,
+                enqueued: false,
+            });
+            self.publish_reserved();
+            if let Ok(mut metrics) = self.metrics.lock() {
+                metrics.inflight_chunks = 1;
+                metrics.bytes_at_risk = self.policy.bytes_at_risk();
+            }
+            return;
+        }
+
         let created_at_micros = u64::try_from(self.clock.now().as_micros()).unwrap_or(u64::MAX);
-        let sealed_at = self.clock.now();
         let sealed = match seal_single_frame_chunk(
             ChunkHeader {
                 chunk_id,
@@ -230,12 +326,12 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             records: first_record,
             bytes,
         });
-        self.pending_append = Some(SealedWork {
+        self.pending_append = Some(PendingAppend::DepthOne(SealedWork {
             sealed,
             placed: open.placed,
             encoded_bytes: open.encoded_bytes,
-            sealed_at,
-        });
+            sealed_at: self.clock.now(),
+        }));
         self.publish_reserved();
         if let Ok(mut metrics) = self.metrics.lock() {
             metrics.inflight_chunks = 1;
@@ -248,7 +344,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         let pending_bytes = self
             .pending_append
             .as_ref()
-            .map_or(0, |pending| pending.encoded_bytes);
+            .map_or(0, PendingAppend::encoded_bytes);
         self.reserved_bytes = open_bytes + pending_bytes;
         if let Ok(mut metrics) = self.metrics.lock() {
             metrics.reserved_bytes = self.reserved_bytes;
@@ -256,8 +352,8 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         }
     }
 
-    async fn append_pending(&mut self) -> Result<(), DriverError> {
-        let Some(pending) = self.pending_append.take() else {
+    async fn append_depth_one(&mut self) -> Result<(), DriverError> {
+        let Some(PendingAppend::DepthOne(pending)) = self.pending_append.take() else {
             return Ok(());
         };
         self.ledger.event(Event::AppendIssued {
@@ -274,6 +370,148 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         } else {
             self.writer.append(&pending.sealed).await
         };
+        self.finish_depth_one_append(pending, append_result).await
+    }
+
+    async fn try_enqueue_blob_sink(&mut self) -> Result<(), DriverError> {
+        let Some(PendingAppend::BlobSink {
+            envelope,
+            encoded_bytes,
+            enqueued: false,
+            ..
+        }) = self.pending_append.as_ref()
+        else {
+            return Ok(());
+        };
+        let chunk_id = envelope.chunk_id;
+        self.ledger.event(Event::AppendIssued { chunk_id });
+        let Some(sink) = self.blob_sink.clone() else {
+            return Err(DriverError::Invariant(
+                "blob sink pending without a configured sink".into(),
+            ));
+        };
+        let (completion_tx, _completion_rx) = futures::channel::oneshot::channel();
+        let submit = BlobSinkSubmit {
+            envelope: envelope.clone(),
+            encoded_bytes: *encoded_bytes,
+            completion: completion_tx,
+        };
+        match sink.submit(submit).await {
+            Ok(()) => {
+                if let Some(PendingAppend::BlobSink { enqueued, .. }) = &mut self.pending_append {
+                    *enqueued = true;
+                }
+                Ok(())
+            }
+            Err(DriverError::BlobSinkBufferFull) => {
+                std::thread::yield_now();
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let pending = self.pending_append.take();
+                if let Some(PendingAppend::BlobSink { placed, .. }) = pending {
+                    for placed in placed {
+                        for waiter in placed.waiters {
+                            let _ = waiter.send(Err(DriverError::Invariant(message.clone())));
+                        }
+                    }
+                }
+                self.publish_reserved();
+                if let Ok(mut metrics) = self.metrics.lock() {
+                    metrics.inflight_chunks = 0;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn seal_envelope(
+        &mut self,
+        envelope: &crate::blob_sink::PendingBlobEnvelope,
+    ) -> Result<crate::chunk::SealedChunk, DriverError> {
+        let created_at_micros = u64::try_from(self.clock.now().as_micros()).unwrap_or(u64::MAX);
+        seal_single_frame_chunk(
+            ChunkHeader {
+                chunk_id: envelope.chunk_id,
+                cohort_id: envelope.cohort_id,
+                generation: self.generation,
+                writer_id: self.writer_id,
+                created_at_micros,
+            },
+            vec![Frame {
+                journal_id: envelope.journal_id,
+                base_offset: envelope.base_offset,
+                records: envelope.records.clone(),
+                submissions: envelope.submissions.clone(),
+            }],
+        )
+        .map_err(DriverError::from)
+    }
+
+    async fn append_blob_sink_refs(
+        &mut self,
+        items: Vec<crate::blob_sink::BlobSinkAppendItem>,
+    ) -> Result<crate::chunklog::ChunkAppendAck, DriverError> {
+        if items.is_empty() {
+            return Err(DriverError::Invariant(
+                "append_blob_sink_refs requires at least one item".into(),
+            ));
+        }
+        let refs: Vec<(&crate::chunk::SealedChunk, &crate::dataref::DataRef)> = items
+            .iter()
+            .map(|item| (&item.sealed, &item.data_ref))
+            .collect();
+        match refs.len() {
+            1 => self
+                .writer
+                .append_data_ref(refs[0].0, refs[0].1)
+                .await
+                .map_err(DriverError::from),
+            _ => self
+                .writer
+                .append_reference_batch(&refs)
+                .await
+                .map_err(DriverError::from),
+        }
+    }
+
+    fn finish_blob_sink_committed(
+        &mut self,
+        chunk_id: ChunkId,
+        ack: crate::chunklog::ChunkAppendAck,
+    ) -> Result<(), DriverError> {
+        let Some(PendingAppend::BlobSink { placed, .. }) = self.pending_append.take() else {
+            return Err(DriverError::Invariant(
+                "blob sink committed without pending work".into(),
+            ));
+        };
+        if ack.chunk_id != chunk_id {
+            return Err(DriverError::Invariant(
+                "blob sink committed chunk_id mismatch".into(),
+            ));
+        }
+        self.ledger.event(Event::AppendAcknowledged {
+            chunk_id,
+            slot: ack.slot,
+        });
+        self.ledger
+            .effect(crate::trace::CostScope::Logical, Effect::ChunkCommitted);
+        self.release_receipts_for_placed(placed, chunk_id, ack);
+        self.publish_reserved();
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.inflight_chunks = 0;
+            metrics.committed_chunks = metrics.committed_chunks.saturating_add(1);
+        }
+        self.drain_blocked();
+        Ok(())
+    }
+
+    async fn finish_depth_one_append(
+        &mut self,
+        pending: SealedWork,
+        append_result: Result<crate::chunklog::ChunkAppendAck, crate::chunklog::ChunkLogError>,
+    ) -> Result<(), DriverError> {
         match append_result {
             Ok(ack) => {
                 self.ledger.event(Event::AppendAcknowledged {
@@ -282,52 +520,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                 });
                 self.ledger
                     .effect(crate::trace::CostScope::Logical, Effect::ChunkCommitted);
-                for placed in pending.placed {
-                    let records = placed.submission.records.len() as u32;
-                    let next_offset = placed
-                        .first_offset
-                        .checked_add(placed.submission.records.len())
-                        .unwrap_or(placed.first_offset);
-                    let key = (
-                        placed.submission.producer_id,
-                        placed.submission.producer_epoch,
-                    );
-                    let entry = self
-                        .dedup
-                        .entry(key)
-                        .or_insert((placed.submission.sequence, BTreeMap::new()));
-                    entry.0 = entry.0.max(placed.submission.sequence);
-                    entry.1.insert(
-                        placed.submission.sequence,
-                        (
-                            placed.first_offset,
-                            records,
-                            pending.sealed.chunk_id,
-                            ack.slot,
-                            self.generation,
-                        ),
-                    );
-                    self.ledger.event(Event::ReceiptReleased {
-                        producer_id: placed.submission.producer_id,
-                        producer_epoch: placed.submission.producer_epoch,
-                        sequence: placed.submission.sequence,
-                        first_offset: placed.first_offset,
-                        records,
-                    });
-                    let receipt = Receipt {
-                        level: AckLevel::Committed,
-                        journal_id: self.journal_id,
-                        first_offset: placed.first_offset,
-                        next_offset,
-                        chunk_id: pending.sealed.chunk_id,
-                        slot: ack.slot,
-                        canon_revision: self.generation,
-                        deduplicated: false,
-                    };
-                    for waiter in placed.waiters {
-                        let _ = waiter.send(Ok(receipt.clone()));
-                    }
-                }
+                self.release_receipts_for_placed(pending.placed, pending.sealed.chunk_id, ack);
                 self.publish_reserved();
                 if let Ok(mut metrics) = self.metrics.lock() {
                     metrics.inflight_chunks = 0;
@@ -377,9 +570,61 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                     metrics.reserved_bytes = 0;
                     metrics.bytes_at_risk = self.policy.bytes_at_risk();
                 }
-                // Do not return Err: run must continue into the poisoned drain loop
-                // so later Submit callers observe Poisoned, not Unavailable.
                 Ok(())
+            }
+        }
+    }
+
+    fn release_receipts_for_placed(
+        &mut self,
+        placed: Vec<super::state::PlacedSubmission>,
+        chunk_id: ChunkId,
+        ack: crate::chunklog::ChunkAppendAck,
+    ) {
+        for placed in placed {
+            let records = placed.submission.records.len() as u32;
+            let next_offset = placed
+                .first_offset
+                .checked_add(placed.submission.records.len())
+                .unwrap_or(placed.first_offset);
+            let key = (
+                placed.submission.producer_id,
+                placed.submission.producer_epoch,
+            );
+            let entry = self
+                .dedup
+                .entry(key)
+                .or_insert((placed.submission.sequence, BTreeMap::new()));
+            entry.0 = entry.0.max(placed.submission.sequence);
+            entry.1.insert(
+                placed.submission.sequence,
+                (
+                    placed.first_offset,
+                    records,
+                    chunk_id,
+                    ack.slot,
+                    self.generation,
+                ),
+            );
+            self.ledger.event(Event::ReceiptReleased {
+                producer_id: placed.submission.producer_id,
+                producer_epoch: placed.submission.producer_epoch,
+                sequence: placed.submission.sequence,
+                first_offset: placed.first_offset,
+                records,
+            });
+            let receipt = Receipt {
+                level: AckLevel::Committed,
+                journal_id: self.journal_id,
+                first_offset: placed.first_offset,
+                next_offset,
+                chunk_id,
+                slot: ack.slot,
+                canon_revision: self.generation,
+                deduplicated: false,
+            };
+            for waiter in placed.waiters {
+                let _ = waiter.send(Ok(receipt.clone()));
             }
         }
     }

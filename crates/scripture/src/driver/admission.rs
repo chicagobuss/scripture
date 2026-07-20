@@ -9,7 +9,7 @@ use crate::chunk::{ChunkError, Frame, ProducerId, SubmissionRef, encoded_chunk_l
 use crate::model::{Record, RecordOffset};
 use crate::trace::{Event, RejectReason};
 
-use super::state::{BlockedSubmission, OpenChunk, PlacedSubmission};
+use super::state::{BlockedSubmission, OpenChunk, PendingAppend, PlacedSubmission};
 use super::{AckLevel, AdmissionSender, ChunkDriverActor, DriverError, Receipt, Submission};
 
 impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
@@ -24,7 +24,10 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         let pending_sealed = self
             .pending_append
             .as_ref()
-            .map(|pending| pending.sealed_at);
+            .and_then(|pending| match pending {
+                PendingAppend::DepthOne(work) => Some(work.sealed_at),
+                PendingAppend::BlobSink { .. } => None,
+            });
         match (open_started, pending_sealed) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -48,7 +51,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         let pending_bytes = self
             .pending_append
             .as_ref()
-            .map_or(0, |pending| pending.encoded_bytes);
+            .map_or(0, PendingAppend::encoded_bytes);
         let at_risk = open_bytes
             .saturating_add(pending_bytes)
             .saturating_add(encoded_bytes);
@@ -104,7 +107,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             }
         }
         if let Some(pending) = self.pending_append.as_ref() {
-            for placed in &pending.placed {
+            for placed in pending.placed() {
                 if placed.submission.producer_id == submission.producer_id
                     && placed.submission.producer_epoch == submission.producer_epoch
                     && placed.submission.sequence == submission.sequence
@@ -254,7 +257,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             }
         }
         if let Some(pending) = self.pending_append.as_mut() {
-            for placed in &mut pending.placed {
+            for placed in pending.placed_mut() {
                 if placed.submission.producer_id == submission.producer_id
                     && placed.submission.producer_epoch == submission.producer_epoch
                     && placed.submission.sequence == submission.sequence
@@ -324,7 +327,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         let pending_bytes = self
             .pending_append
             .as_ref()
-            .map_or(0, |pending| pending.encoded_bytes);
+            .map_or(0, PendingAppend::encoded_bytes);
 
         let first_offset = self.writer.next_offset();
         let first_offset = self.open.as_ref().map_or(first_offset, |open| {

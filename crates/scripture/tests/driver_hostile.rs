@@ -116,6 +116,8 @@ impl RealActorHarness {
             timer.clone(),
             64,
             None,
+            None,
+            None,
         )
         .expect("actor");
         let pool = LocalPool::new();

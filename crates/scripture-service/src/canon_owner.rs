@@ -12,13 +12,13 @@
 
 use holylog::virtual_log::VirtualLog;
 use scripture::{
-    CanonAuthoritySnapshot, ChunkDriverActor, ChunkDriverHandle, ChunkLogError, ChunkLogWriter,
-    ChunkPolicy, Clock, CohortId, DataRefBlobConfig, DriverError, JournalId, OwnerId,
-    RecoveredChunk, RecoveryBound, Timer, VerseId, WriterId,
+    BlobCommitSink, CanonAuthoritySnapshot, ChunkDriverActor, ChunkDriverHandle, ChunkLogError,
+    ChunkLogWriter, ChunkPolicy, Clock, CohortId, DataRefBlobConfig, DriverError, JournalId,
+    OwnerId, RecoveredChunk, RecoveryBound, Timer, VerseId, WriterId,
 };
 
 /// Inputs for one Canon-authorized owner construction attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CanonOwnerRequest {
     /// Logical Scripture journal.
     pub journal_id: JournalId,
@@ -38,6 +38,22 @@ pub struct CanonOwnerRequest {
     pub queue_capacity: usize,
     /// When set, recovery resolves DataRefs and the driver emits them.
     pub dataref_blobs: Option<DataRefBlobConfig>,
+    /// When set, sealed chunks buffer in a shared Scribe sink instead of depth-one PUTs.
+    pub blob_sink: Option<std::sync::Arc<dyn BlobCommitSink>>,
+    /// Assignment key for shared-sink routing.
+    pub blob_verse_key: Option<String>,
+}
+
+impl std::fmt::Debug for CanonOwnerRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonOwnerRequest")
+            .field("journal_id", &self.journal_id)
+            .field("verse_id", &self.verse_id)
+            .field("owner_id", &self.owner_id)
+            .field("blob_sink", &self.blob_sink.is_some())
+            .field("blob_verse_key", &self.blob_verse_key)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A recovered, unstarted Canon owner for one startup attempt.
@@ -157,7 +173,12 @@ where
         timer,
         request.queue_capacity,
         request.dataref_blobs.clone(),
+        request.blob_sink.clone(),
+        request.blob_verse_key.clone(),
     )?;
+    if let (Some(sink), Some(verse_key)) = (&request.blob_sink, &request.blob_verse_key) {
+        sink.register_driver(verse_key, handle.clone());
+    }
     Ok(RecoveredCanonOwner {
         authority: recovery.authority,
         handle,
@@ -232,6 +253,8 @@ mod tests {
             recovery_bound: RecoveryBound::new(8).expect("bound"),
             queue_capacity: 16,
             dataref_blobs: None,
+            blob_sink: None,
+            blob_verse_key: None,
         }
     }
 

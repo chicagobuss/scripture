@@ -6,6 +6,7 @@
 //! consumer groups, and cross-process writer fencing are not v0 features.
 
 pub mod batch;
+pub mod blob_sink;
 pub mod blob_store;
 pub mod canon;
 pub mod chunk;
@@ -22,6 +23,7 @@ pub mod spool;
 pub mod trace;
 
 pub use batch::{Batch, CodecError, decode_batch, encode_batch, encoded_batch_len};
+pub use blob_sink::{BlobCommitSink, BlobSinkAppendItem, BlobSinkSubmit, PendingBlobEnvelope};
 pub use blob_store::{
     ChunkBlobStore, DEFAULT_STAGING_BLOB_PREFIX, DataRefBlobConfig, commit_sealed_as_data_ref,
 };

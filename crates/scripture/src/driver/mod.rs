@@ -20,8 +20,9 @@ use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
 
+use crate::blob_sink::{BlobCommitSink, BlobSinkAppendItem, PendingBlobEnvelope};
 use crate::blob_store::DataRefBlobConfig;
-use crate::chunk::{ChunkError, ChunkId, CohortId, ProducerId, WriterId};
+use crate::chunk::{ChunkError, ChunkId, CohortId, ProducerId, SealedChunk, WriterId};
 use crate::chunklog::{ChunkLogError, ChunkLogWriter, RecoveredChunk};
 use crate::clock::{Clock, Timer};
 use crate::model::{JournalId, Record, RecordOffset};
@@ -32,7 +33,7 @@ pub use policy::{ChunkPolicy, PolicyError};
 pub use receipt::ReceiptFuture;
 
 use receipt::SharedLedger;
-use state::{BlockedSubmission, Command, DedupWindow, OpenChunk, SealedWork};
+use state::{BlockedSubmission, Command, DedupWindow, OpenChunk, PendingAppend};
 
 /// Acknowledgement level reported on a receipt.
 ///
@@ -174,6 +175,12 @@ pub enum DriverError {
     /// Chunk-log boundary failure.
     #[error(transparent)]
     Log(#[from] ChunkLogError),
+    /// Shared blob sink rejected the envelope under the Scribe buffer ceiling.
+    #[error("shared blob sink buffer full")]
+    BlobSinkBufferFull,
+    /// Internal invariant broken (should not happen on a correct driver).
+    #[error("driver invariant: {0}")]
+    Invariant(String),
 }
 
 pub(super) type AdmissionReply =
@@ -219,6 +226,56 @@ impl ChunkDriverHandle {
         receiver.await.unwrap_or(Err(DriverError::Unavailable))
     }
 
+    /// Seals a buffered envelope under the active generation during a shared cut.
+    pub async fn blob_sink_seal(
+        &self,
+        envelope: PendingBlobEnvelope,
+    ) -> Result<SealedChunk, DriverError> {
+        let (responder, receiver) = oneshot::channel();
+        self.commands
+            .clone()
+            .send(Command::BlobSinkSeal {
+                envelope,
+                responder,
+            })
+            .await
+            .map_err(|_| DriverError::Unavailable)?;
+        receiver.await.unwrap_or(Err(DriverError::Unavailable))
+    }
+
+    /// Appends DataRefs for one Verse during a shared cut.
+    pub async fn blob_sink_append_refs(
+        &self,
+        items: Vec<BlobSinkAppendItem>,
+    ) -> Result<crate::chunklog::ChunkAppendAck, DriverError> {
+        let (responder, receiver) = oneshot::channel();
+        self.commands
+            .clone()
+            .send(Command::BlobSinkAppendRefs { items, responder })
+            .await
+            .map_err(|_| DriverError::Unavailable)?;
+        receiver.await.unwrap_or(Err(DriverError::Unavailable))
+    }
+
+    /// Completes one buffered chunk after the shared sink cut commits.
+    pub async fn blob_sink_committed(
+        &self,
+        chunk_id: ChunkId,
+        ack: crate::chunklog::ChunkAppendAck,
+    ) -> Result<(), DriverError> {
+        let (responder, receiver) = oneshot::channel();
+        self.commands
+            .clone()
+            .send(Command::BlobSinkCommitted {
+                chunk_id,
+                ack,
+                responder,
+            })
+            .await
+            .map_err(|_| DriverError::Unavailable)?;
+        receiver.await.unwrap_or(Err(DriverError::Unavailable))
+    }
+
     /// Snapshot of owner counters.
     #[must_use]
     pub fn metrics(&self) -> DriverMetrics {
@@ -245,7 +302,7 @@ pub struct ChunkDriverActor<C, T> {
     commands: mpsc::Receiver<Command>,
     open: Option<OpenChunk>,
     /// Depth-one: at most one sealed chunk waiting to append or appending.
-    pending_append: Option<SealedWork>,
+    pending_append: Option<PendingAppend>,
     blocked: VecDeque<BlockedSubmission>,
     dedup: DedupWindow,
     admitted_seq: BTreeMap<(ProducerId, u32), u64>,
@@ -261,6 +318,10 @@ pub struct ChunkDriverActor<C, T> {
     age_sleep_deadline: Option<Duration>,
     /// When set, sealed chunks are put as staging blobs and the log receives a DataRef.
     dataref_blobs: Option<DataRefBlobConfig>,
+    /// When set, sealed chunks buffer in the shared Scribe sink instead of depth-one PUTs.
+    blob_sink: Option<Arc<dyn BlobCommitSink>>,
+    /// Assignment key routing shared-sink seal/append commands.
+    blob_verse_key: Option<String>,
 }
 
 impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
@@ -284,6 +345,8 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
         timer: T,
         queue_capacity: usize,
         dataref_blobs: Option<DataRefBlobConfig>,
+        blob_sink: Option<Arc<dyn BlobCommitSink>>,
+        blob_verse_key: Option<String>,
     ) -> Result<(ChunkDriverHandle, Self), DriverError> {
         policy.validate()?;
         let (sender, receiver) = mpsc::channel(queue_capacity.max(1));
@@ -315,6 +378,8 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
             age_sleep: None,
             age_sleep_deadline: None,
             dataref_blobs,
+            blob_sink,
+            blob_verse_key,
         };
         actor.rebuild_dedup(recovered);
         Ok((

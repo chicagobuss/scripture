@@ -65,6 +65,7 @@ fn envelope(verse: &str, chunk: u8, sequence: u64, value: i64) -> BlobEnvelope {
     BlobEnvelope {
         verse_key: verse.into(),
         chunk_id: ChunkId::from_bytes([chunk; 16]),
+        base_offset: RecordOffset::new(0),
         journal_id: journal(b'a'),
         cohort_id: cohort(),
         records: vec![record(value)],
