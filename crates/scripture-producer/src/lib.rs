@@ -5,6 +5,7 @@
 //! [`scripture::driver::AckLevel::Committed`] receipts; `local_durable` lives here.
 
 mod cell;
+mod continuity;
 mod file;
 mod frame;
 mod progress;
@@ -12,6 +13,9 @@ mod recovery;
 mod storage;
 
 pub use cell::{SpoolCell, SpoolCellHandle, SpoolCellState, SpoolReceiptFuture};
+pub use continuity::{
+    ContinuityError, ContinuityId, ContinuityOutbox, ContinuitySnapshot, PendingEntry,
+};
 pub use file::FileSpoolStorage;
 pub use frame::{FrameKind, SpoolFrame, SpoolFrameError, decode_frame, encode_frame};
 pub use progress::ProgressIdentity;

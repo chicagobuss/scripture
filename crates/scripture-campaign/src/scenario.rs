@@ -37,9 +37,13 @@ impl Suite {
         ];
         match self {
             Self::Core => core,
-            Self::Composition => Vec::new(),
+            Self::Composition => vec![Scenario::MultiScribeRollingRestart],
             Self::Resilience => Vec::new(),
-            Self::All => core,
+            Self::All => {
+                let mut all = core;
+                all.push(Scenario::MultiScribeRollingRestart);
+                all
+            }
         }
     }
 
@@ -48,9 +52,9 @@ impl Suite {
     pub fn schedule_label(self) -> &'static str {
         match self {
             Self::Core => "core-slice1",
-            Self::Composition => "composition-not-implemented",
+            Self::Composition => "composition-multi-scribe-continuity",
             Self::Resilience => "resilience-not-implemented",
-            Self::All => "all-implemented-slice1",
+            Self::All => "all-implemented",
         }
     }
 
@@ -72,12 +76,17 @@ pub enum SuiteError {
 #[cfg(test)]
 mod tests {
     use super::Suite;
+    use crate::Scenario;
 
     #[test]
     fn unavailable_suites_are_not_reported_as_implemented() {
-        assert!(!Suite::Composition.is_implemented());
+        assert!(Suite::Composition.is_implemented());
         assert!(!Suite::Resilience.is_implemented());
         assert!(Suite::Core.is_implemented());
         assert!(Suite::All.is_implemented());
+        assert_eq!(
+            Suite::Composition.scenarios(),
+            vec![Scenario::MultiScribeRollingRestart]
+        );
     }
 }

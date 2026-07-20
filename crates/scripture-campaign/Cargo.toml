@@ -22,6 +22,7 @@ holylog-object-store = { workspace = true, features = ["s3"] }
 holylog-object-store-register = { workspace = true, features = ["aws"] }
 object_store = { workspace = true, default-features = false }
 scripture = { path = "../scripture" }
+scripture-producer = { path = "../scripture-producer" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
 serde_json.workspace = true

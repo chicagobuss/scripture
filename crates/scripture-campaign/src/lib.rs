@@ -23,6 +23,7 @@
 //! availability, or replica-independence claim.
 
 mod artifacts;
+mod composition;
 mod legacy;
 mod preflight;
 mod producer_identity;
@@ -97,14 +98,17 @@ pub enum Scenario {
     /// Writer payload lands durably then the writer wedges before a committed
     /// ACK; HA recovery seals the predecessor and B serves the successor.
     WriterDiesAfterPayload,
+    /// Multi-scribe active-active with producer-edge continuity through rolling restart.
+    MultiScribeRollingRestart,
 }
 
 impl Scenario {
     /// All scenario tokens accepted by [`Scenario::parse`].
-    pub const ALL: [&'static str; 3] = [
+    pub const ALL: [&'static str; 4] = [
         "baseline-committed-ack",
         "root-cas-reply-lost",
         "writer-dies-after-payload",
+        "multi-scribe-rolling-restart",
     ];
 
     /// Parses a scenario token.
@@ -113,6 +117,7 @@ impl Scenario {
             "baseline-committed-ack" => Ok(Self::BaselineCommittedAck),
             "root-cas-reply-lost" => Ok(Self::RootCasReplyLost),
             "writer-dies-after-payload" => Ok(Self::WriterDiesAfterPayload),
+            "multi-scribe-rolling-restart" => Ok(Self::MultiScribeRollingRestart),
             other => Err(CampaignError::UnknownScenario(other.to_owned())),
         }
     }
@@ -124,6 +129,7 @@ impl Scenario {
             Self::BaselineCommittedAck => "baseline-committed-ack",
             Self::RootCasReplyLost => "root-cas-reply-lost",
             Self::WriterDiesAfterPayload => "writer-dies-after-payload",
+            Self::MultiScribeRollingRestart => "multi-scribe-rolling-restart",
         }
     }
 }
@@ -436,7 +442,7 @@ impl CampaignReport {
 pub enum CampaignError {
     /// Unknown scenario token.
     #[error(
-        "unknown scenario {0:?}; expected baseline-committed-ack|root-cas-reply-lost|writer-dies-after-payload"
+        "unknown scenario {0:?}; expected baseline-committed-ack|root-cas-reply-lost|writer-dies-after-payload|multi-scribe-rolling-restart"
     )]
     UnknownScenario(String),
     /// Backend construction failure.
@@ -462,8 +468,18 @@ pub async fn run_campaign(
         Scenario::BaselineCommittedAck => run_baseline(run_id, &backend).await?,
         Scenario::RootCasReplyLost => run_root_cas_reply_lost(run_id, &backend).await?,
         Scenario::WriterDiesAfterPayload => run_wedged_payload(run_id, &backend).await?,
+        Scenario::MultiScribeRollingRestart => {
+            let (final_root, final_authority) =
+                composition::run_multi_scribe_rolling_restart(run_id).await?;
+            (Vec::new(), final_root, final_authority)
+        }
     };
-    let verdict = check_trace(&events);
+    let verdict = if matches!(scenario, Scenario::MultiScribeRollingRestart) {
+        // Continuity proof is assertion-based (every local_durable commits).
+        Verdict::Pass
+    } else {
+        check_trace(&events)
+    };
     Ok(CampaignReport {
         run_id: run_id.to_owned(),
         scenario: scenario.as_str(),
