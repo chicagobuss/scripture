@@ -21,7 +21,9 @@ use scripture::{
     ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
     Submission, SystemClock, SystemTimer, VerseId, WriterId,
 };
-use scripture_producer::{ContinuityId, ContinuityOutbox, PendingEntry};
+use scripture_producer::{
+    ContinuityId, ContinuityOutbox, FileSpoolStorage, PendingEntry,
+};
 use scripture_runtime::{
     HaServingSession, HolylogJournalFoundation, NodeIdentity, PartsFactory, ProcessLogletResolver,
     SharedMemoryPartsFactory, bootstrap_and_serve, promote_and_serve,
@@ -260,7 +262,7 @@ impl ScribeBundle {
 
 async fn forward_one(
     lanes: &BTreeMap<usize, Arc<ScribeBundle>>,
-    outbox: &ContinuityOutbox,
+    outbox: &ContinuityOutbox<FileSpoolStorage>,
     lane_index: usize,
     entry: &PendingEntry,
 ) -> bool {
@@ -277,10 +279,9 @@ async fn forward_one(
                 return false;
             }
             match pending.await {
-                Ok(receipt) => {
-                    outbox.mark_committed_with_receipt(entry.id, receipt);
-                    true
-                }
+                Ok(receipt) => outbox
+                    .mark_committed_with_receipt(entry.id, receipt)
+                    .is_ok(),
                 Err(_) => false,
             }
         }
@@ -290,7 +291,7 @@ async fn forward_one(
 
 async fn drain_pending(
     lanes: &BTreeMap<usize, Arc<ScribeBundle>>,
-    outbox: &ContinuityOutbox,
+    outbox: &ContinuityOutbox<FileSpoolStorage>,
     lane_of: &BTreeMap<ContinuityId, usize>,
 ) {
     for entry in outbox.pending_snapshot() {
@@ -301,9 +302,20 @@ async fn drain_pending(
     }
 }
 
-/// Runs the multi-scribe rolling-restart continuity proof (in-memory backend).
+fn continuity_temp_dir(run_id: &str) -> Result<std::path::PathBuf, CampaignError> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| CampaignError::Scenario(format!("time: {error}")))?
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("scripture-fleet-outbox-{run_id}-{nanos}"));
+    std::fs::create_dir_all(&path)
+        .map_err(|error| CampaignError::Scenario(format!("outbox mkdir: {error}")))?;
+    Ok(path)
+}
+
+/// Runs the multi-scribe rolling-restart continuity proof with a fsynced outbox.
 pub(crate) async fn run_multi_scribe_rolling_restart(
-    _run_id: &str,
+    run_id: &str,
 ) -> Result<(serde_json::Value, serde_json::Value), CampaignError> {
     // One shared parts factory across all lane promotions so sealed gens reopen.
     let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
@@ -322,7 +334,12 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
         lanes.insert(index, bundle);
     }
 
-    let outbox = Arc::new(ContinuityOutbox::new(10_000));
+    let outbox_dir = continuity_temp_dir(run_id)?;
+    let outbox = Arc::new(
+        ContinuityOutbox::open_file(journal(), 10_000, &outbox_dir).map_err(|error| {
+            CampaignError::Scenario(format!("open fsynced continuity outbox: {error}"))
+        })?,
+    );
     let lane_of = Arc::new(Mutex::new(BTreeMap::<ContinuityId, usize>::new()));
 
     let produce_lanes = lanes.clone();
@@ -354,18 +371,18 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
     });
 
     // One rolling pass: crash each serving scribe and promote its standby while
-        // the producer keeps admitting into the continuity outbox.
-        for index in 0..SCRIBE_COUNT {
-            sleep(RESTART_PAUSE).await;
-            let bundle = lanes
-                .get(&index)
-                .ok_or_else(|| CampaignError::Scenario("missing lane".into()))?;
-            let expected = bundle.crash_for_restart().await?;
-            sleep(RESTART_PAUSE).await;
-            bundle.promote_b(expected).await?;
-            let map = lane_of.lock().await.clone();
-            drain_pending(&lanes, &outbox, &map).await;
-        }
+    // the producer keeps admitting into the continuity outbox.
+    for index in 0..SCRIBE_COUNT {
+        sleep(RESTART_PAUSE).await;
+        let bundle = lanes
+            .get(&index)
+            .ok_or_else(|| CampaignError::Scenario("missing lane".into()))?;
+        let expected = bundle.crash_for_restart().await?;
+        sleep(RESTART_PAUSE).await;
+        bundle.promote_b(expected).await?;
+        let map = lane_of.lock().await.clone();
+        drain_pending(&lanes, &outbox, &map).await;
+    }
 
     let produced = producer_task
         .await
@@ -382,6 +399,7 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
 
     let snap = outbox.snapshot();
     if !outbox.fully_drained() {
+        let _ = std::fs::remove_dir_all(&outbox_dir);
         return Err(CampaignError::Scenario(format!(
             "continuity not drained after rolling restart: pending={} local={} committed={}",
             snap.pending,
@@ -390,6 +408,7 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
         )));
     }
     if snap.local_durable.len() as u64 != produced {
+        let _ = std::fs::remove_dir_all(&outbox_dir);
         return Err(CampaignError::Scenario(format!(
             "local_durable count {} != produced {produced}",
             snap.local_durable.len()
@@ -398,6 +417,8 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
 
     let final_root = serde_json::json!({
         "design": "producer-edge-continuity",
+        "outbox": "fsynced-file-wal",
+        "outbox_dir": outbox_dir.display().to_string(),
         "scribes": SCRIBE_COUNT,
         "produced": produced,
         "committed": snap.committed.len(),
@@ -405,9 +426,10 @@ pub(crate) async fn run_multi_scribe_rolling_restart(
         "dropped": 0,
     });
     let final_authority = serde_json::json!({
-        "invariant": "every locally durable submission committed after rolling restart",
+        "invariant": "every locally durable fsynced submission committed after rolling restart",
         "dropped": 0,
     });
+    let _ = std::fs::remove_dir_all(&outbox_dir);
     Ok((final_root, final_authority))
 }
 

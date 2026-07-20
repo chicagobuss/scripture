@@ -17,7 +17,8 @@ records."
 Ship a **different** continuity design alongside the legacy path:
 
 1. **Active-active Scribes** serve disjoint Verses concurrently.
-2. Producers admit into a **ContinuityOutbox** (local-durable) before routing.
+2. Producers admit into a **ContinuityOutbox** only after append+fsync
+   (local-durable); progress frames are synced on Canon commit.
 3. Route / Scribe unavailability retains pending work and retries after promote.
 4. Rolling restart crashes a serving Scribe and promotes a successor; the
    outbox absorbs the gap.
@@ -25,7 +26,8 @@ Ship a **different** continuity design alongside the legacy path:
    receipt — zero drop of outbox-admitted work.
 
 This is implemented as campaign Composition scenario
-`multi-scribe-rolling-restart` and `scripture_producer::ContinuityOutbox`.
+`multi-scribe-rolling-restart` and `scripture_producer::ContinuityOutbox`
+(`open_file` / `FileSpoolStorage`).
 
 ## Correctness
 
@@ -36,11 +38,15 @@ This is implemented as campaign Composition scenario
 ## Deterministic validation
 
 `cargo test -p scripture-campaign multi_scribe` runs three concurrent Verses,
-continuous produce (≥600 admissions), one rolling restart pass per Verse, and
-asserts `local_durable == committed` with `pending == 0`.
+continuous produce (≥600 admissions) through a **fsynced file outbox**, one
+rolling restart pass per Verse, and asserts `local_durable == committed` with
+`pending == 0`.
+
+`cargo test -p scripture-producer file_outbox_survives` proves reopen after
+process drop recovers pending submissions and committed progress.
 
 ## Non-claims
 
 - Does not replace drain→seal→replace for lost-sequencer recovery.
-- In-memory outbox is lab-grade; production requires a fsynced store.
 - Does not yet prove multi-process / multi-pod placement.
+- Local-disk outbox survival is under that producer's disk assumptions only.
