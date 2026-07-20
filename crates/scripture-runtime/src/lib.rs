@@ -31,7 +31,7 @@ pub use ha_session::{
 pub use holylog_foundation::{
     DefaultFreshLogletIdPolicy, FoundationTransitionCheckpoint, FoundationTransitionObserver,
     FreshLogletIdPolicy, HolylogJournalFoundation, NoopFoundationTransitionObserver,
-    owned_with_writer_term,
+    TimingTransitionObserver, owned_with_writer_term,
 };
 pub use ingress::{
     serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,

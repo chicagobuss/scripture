@@ -88,6 +88,37 @@ pub enum FoundationTransitionCheckpoint {
     SuccessorProvisioned,
 }
 
+/// Prints each replacement boundary with its elapsed time.
+///
+/// The handoff window -- predecessor sealed until successor serving -- is a
+/// measured production outage, so it matters which phase inside it is
+/// expensive. Wall-clock per checkpoint answers that without a profiler.
+#[derive(Debug)]
+pub struct TimingTransitionObserver {
+    started: std::time::Instant,
+}
+
+impl Default for TimingTransitionObserver {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl FoundationTransitionObserver for TimingTransitionObserver {
+    fn checkpoint(
+        &self,
+        checkpoint: FoundationTransitionCheckpoint,
+    ) -> Result<(), FoundationTransitionError> {
+        eprintln!(
+            "scripture: transition-phase {checkpoint:?} at +{:.0}ms",
+            self.started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
+    }
+}
+
 /// Observes an internal Foundation replacement boundary.
 pub trait FoundationTransitionObserver: Send + Sync {
     /// Returning an error models interruption of the current process.
@@ -197,7 +228,15 @@ impl HolylogJournalFoundation {
             parts,
             claims,
             loglet_ids,
-            Arc::new(NoopFoundationTransitionObserver),
+            // Lab instrumentation: the handoff window is a measured outage, so
+            // being able to attribute it to a phase without a rebuild is worth
+            // one env check at construction.
+            if std::env::var_os("SCRIPTURE_TIME_TRANSITIONS").is_some() {
+                Arc::new(TimingTransitionObserver::default())
+                    as Arc<dyn FoundationTransitionObserver>
+            } else {
+                Arc::new(NoopFoundationTransitionObserver)
+            },
             k,
         )
     }
