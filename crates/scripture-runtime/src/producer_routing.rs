@@ -453,19 +453,50 @@ impl<S: RouteSource> RoutingProducer<S> {
         &mut self,
         record: &OutboundRecord,
     ) -> Result<CommittedAck, ProducerRoutingError> {
-        if record.payload.iter().any(|&b| b == b'\n' || b == b'\r') {
-            return Err(ProducerRoutingError::PayloadContainsNewline {
-                record_id: record.id,
+        self.send_batch(std::slice::from_ref(record)).await
+    }
+
+    /// Send one multi-record submission (lab / internal batch path).
+    ///
+    /// When `records.len() > 1`, the wire frame is `BATCH N` plus N payload
+    /// lines so the Scribe admits one Submission. Ordinary one-line traffic
+    /// (`N == 1`) is unchanged. [`CommittedAck::record_id`] is the first
+    /// record's id; the offset span covers the whole unit.
+    pub async fn send_batch(
+        &mut self,
+        records: &[OutboundRecord],
+    ) -> Result<CommittedAck, ProducerRoutingError> {
+        let Some(first) = records.first() else {
+            return Err(ProducerRoutingError::Exhausted {
+                record_id: RecordId::from_bytes([0; 16]),
+                attempts: 0,
+                last_failure: "send_batch requires at least one record".to_owned(),
             });
+        };
+        for record in records {
+            if record.payload.iter().any(|&b| b == b'\n' || b == b'\r') {
+                return Err(ProducerRoutingError::PayloadContainsNewline {
+                    record_id: record.id,
+                });
+            }
         }
         if self.policy.max_attempts == 0 {
             return Err(ProducerRoutingError::Exhausted {
-                record_id: record.id,
+                record_id: first.id,
                 attempts: 0,
                 last_failure: "retry policy max_attempts is 0".to_owned(),
             });
         }
 
+        let frame = encode_raw_lines_batch_frame(records);
+        self.send_frame(first.id, &frame).await
+    }
+
+    async fn send_frame(
+        &mut self,
+        record_id: RecordId,
+        frame: &[u8],
+    ) -> Result<CommittedAck, ProducerRoutingError> {
         // Per-attempt tracing, off unless SCRIPTURE_TRACE_ATTEMPTS is set.
         // A rolling restart cost a 4.8s write stall while the fleet took 176ms
         // to hand over, so the delay is inside this loop; attributing it needs
@@ -516,7 +547,7 @@ impl<S: RouteSource> RoutingProducer<S> {
             }
             let attempt_started = std::time::Instant::now();
 
-            match self.exchange_once(&endpoint, &record.payload).await {
+            match self.exchange_frame(&endpoint, frame).await {
                 Ok((first_offset, next_offset)) => {
                     if trace && attempt > 1 {
                         eprintln!(
@@ -529,7 +560,7 @@ impl<S: RouteSource> RoutingProducer<S> {
                     return Ok(CommittedAck {
                         first_offset,
                         next_offset,
-                        record_id: record.id,
+                        record_id,
                         endpoint,
                     });
                 }
@@ -596,7 +627,7 @@ impl<S: RouteSource> RoutingProducer<S> {
         }
 
         Err(ProducerRoutingError::Exhausted {
-            record_id: record.id,
+            record_id,
             attempts: self.policy.max_attempts,
             last_failure,
         })
@@ -609,10 +640,10 @@ impl<S: RouteSource> RoutingProducer<S> {
         Ok(())
     }
 
-    async fn exchange_once(
+    async fn exchange_frame(
         &self,
         endpoint: &str,
-        payload: &[u8],
+        frame: &[u8],
     ) -> Result<(u64, u64), AttemptFailure> {
         let addr = match dial_address(endpoint) {
             Ok(addr) => addr,
@@ -638,11 +669,7 @@ impl<S: RouteSource> RoutingProducer<S> {
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
 
-        let mut frame = Vec::with_capacity(payload.len() + 1);
-        frame.extend_from_slice(payload);
-        frame.push(b'\n');
-
-        if let Err(error) = writer.write_all(&frame).await {
+        if let Err(error) = writer.write_all(frame).await {
             return Err(AttemptFailure::DeadScribe {
                 detail: format!("write to {endpoint}: {error}"),
             });
@@ -699,6 +726,21 @@ fn dial_address(endpoint: &str) -> Result<String, String> {
         ));
     }
     Ok(without_scheme.to_owned())
+}
+
+fn encode_raw_lines_batch_frame(records: &[OutboundRecord]) -> Vec<u8> {
+    if records.len() == 1 {
+        let mut frame = Vec::with_capacity(records[0].payload.len() + 1);
+        frame.extend_from_slice(&records[0].payload);
+        frame.push(b'\n');
+        return frame;
+    }
+    let mut frame = format!("BATCH {}\n", records.len()).into_bytes();
+    for record in records {
+        frame.extend_from_slice(&record.payload);
+        frame.push(b'\n');
+    }
+    frame
 }
 
 fn parse_ok(line: &str) -> Option<(u64, u64)> {

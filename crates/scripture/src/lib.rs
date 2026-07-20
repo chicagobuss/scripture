@@ -46,7 +46,7 @@ pub use clock::{
 };
 pub use dataref::{
     DataRef, DataRefError, LogPayload, MAX_BLOB_KEY_BYTES, decode_data_ref, decode_log_payload,
-    encode_data_ref,
+    decode_reference_batch, encode_data_ref, encode_reference_batch,
 };
 pub use driver::{
     AckLevel, ChunkDriverActor, ChunkDriverHandle, ChunkPolicy, DriverError, DriverMetrics,

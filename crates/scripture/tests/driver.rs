@@ -926,6 +926,179 @@ fn multi_record_submission_admits_when_each_record_under_limit() {
 }
 
 #[test]
+fn a_multi_record_submission_yields_exactly_one_receipt_spanning_all_records() {
+    let drive = ScriptedLogDrive::new();
+    let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+        .build()
+        .expect("log");
+    let writer = ChunkLogWriter::new(journal(), cohort(), 1, log, RecordOffset::new(0));
+    let clock = Arc::new(ManualClock::new());
+    let timer = ManualTimer::new(Arc::clone(&clock));
+    let (handle, actor) = ChunkDriverActor::new(
+        journal(),
+        cohort(),
+        writer_id(),
+        1,
+        writer,
+        &[],
+        policy(),
+        clock,
+        timer,
+        8,
+        None,
+    )
+    .expect("actor");
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    spawner
+        .spawn(async move {
+            actor.run().await.expect("run");
+        })
+        .expect("spawn");
+
+    let receipt = pool.run_until(async move {
+        let future = handle
+            .submit(submission(0, &[10, 20, 30, 40]))
+            .await
+            .expect("admitted");
+        handle.flush().await.expect("flush");
+        future.await.expect("receipt")
+    });
+    assert_eq!(receipt.first_offset, RecordOffset::new(0));
+    assert_eq!(receipt.next_offset, RecordOffset::new(4));
+    assert!(!receipt.deduplicated);
+    assert_eq!(drive.write_count(), 1);
+}
+
+#[test]
+fn an_oversized_submission_is_rejected_and_not_split_across_chunks() {
+    let values: Vec<i64> = (0..8).collect();
+    let oversized = submission(0, &values);
+    let encoded = solo_submission_encoded_bytes(&oversized);
+    let one = record_encoded_contribution(&record(0));
+    let policy = ChunkPolicy {
+        // Room for several records individually, but not eight at once.
+        max_chunk_bytes: encoded.saturating_sub(1).max(one + 256),
+        max_record_bytes: one,
+        max_chunk_records: 4,
+        max_chunk_age: Duration::from_secs(60),
+        max_buffered_bytes: encoded.saturating_mul(2),
+        max_inflight_chunks: 1,
+        max_uncommitted_age: Duration::from_secs(60),
+        recovery_scan: RecoveryBound::new(8).expect("bound"),
+    };
+    policy.validate().expect("policy");
+    assert!(
+        oversized.records.len() > policy.max_chunk_records,
+        "test setup: unit must exceed max_chunk_records"
+    );
+
+    let drive = ScriptedLogDrive::new();
+    let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+        .build()
+        .expect("log");
+    let writer = ChunkLogWriter::new(journal(), cohort(), 1, log, RecordOffset::new(0));
+    let clock = Arc::new(ManualClock::new());
+    let timer = ManualTimer::new(Arc::clone(&clock));
+    let (handle, actor) = ChunkDriverActor::new(
+        journal(),
+        cohort(),
+        writer_id(),
+        1,
+        writer,
+        &[],
+        policy,
+        clock,
+        timer,
+        8,
+        None,
+    )
+    .expect("actor");
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    spawner
+        .spawn(async move {
+            actor.run().await.expect("run");
+        })
+        .expect("spawn");
+
+    let error = pool.run_until(async move {
+        match handle.submit(oversized).await {
+            Err(error) => error,
+            Ok(_) => panic!("oversized unit must reject at admission"),
+        }
+    });
+    assert!(
+        matches!(
+            error,
+            DriverError::SubmissionTooLarge {
+                records: 8,
+                max_records: 4,
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
+    assert_eq!(drive.write_count(), 0, "reject must not seal or split");
+}
+
+#[test]
+fn a_retry_of_the_same_multi_record_submission_identity_is_deduplicated_as_one_unit() {
+    let drive = ScriptedLogDrive::new();
+    let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+        .build()
+        .expect("log");
+    let writer = ChunkLogWriter::new(journal(), cohort(), 1, log, RecordOffset::new(0));
+    let clock = Arc::new(ManualClock::new());
+    let timer = ManualTimer::new(Arc::clone(&clock));
+    let (handle, actor) = ChunkDriverActor::new(
+        journal(),
+        cohort(),
+        writer_id(),
+        1,
+        writer,
+        &[],
+        policy(),
+        clock,
+        timer,
+        8,
+        None,
+    )
+    .expect("actor");
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    spawner
+        .spawn(async move {
+            actor.run().await.expect("run");
+        })
+        .expect("spawn");
+
+    let (first, retry) = pool.run_until(async move {
+        let future = handle
+            .submit(submission(0, &[1, 2, 3]))
+            .await
+            .expect("admitted");
+        handle.flush().await.expect("flush");
+        let first = future.await.expect("receipt");
+        let retry_future = handle
+            .submit(submission(0, &[1, 2, 3]))
+            .await
+            .expect("dedup admitted");
+        let retry = retry_future.await.expect("dedup receipt");
+        (first, retry)
+    });
+    assert_eq!(first.first_offset, RecordOffset::new(0));
+    assert_eq!(first.next_offset, RecordOffset::new(3));
+    assert_eq!(retry.first_offset, first.first_offset);
+    assert_eq!(retry.next_offset, first.next_offset);
+    assert!(retry.deduplicated);
+    assert_eq!(drive.write_count(), 1);
+}
+
+#[test]
 fn command_winning_select_does_not_leak_timer_sleepers() {
     let drive = ScriptedLogDrive::new();
     let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)

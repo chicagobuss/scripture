@@ -146,13 +146,14 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Parses `produce-lab --config <p> --canon <c> --verse <v> [--workers N]
-/// [--per-worker N] [--payload-bytes N]`.
+/// [--per-worker N] [--payload-bytes N] [--records-per-submission N]`.
 fn parse_produce_lab_args(
     arguments: &mut impl Iterator<Item = String>,
 ) -> Result<(String, produce_lab::LabOptions), Box<dyn Error>> {
     let mut config_path = None;
     let (mut canon, mut verse) = (None, None);
-    let (mut workers, mut per_worker, mut payload_bytes) = (3usize, 200u64, 64usize);
+    let (mut workers, mut per_worker, mut payload_bytes, mut records_per_submission) =
+        (3usize, 200u64, 64usize, 1usize);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--config" => config_path = Some(arguments.next().ok_or("--config requires a path")?),
@@ -166,6 +167,12 @@ fn parse_produce_lab_args(
                 payload_bytes = arguments
                     .next()
                     .ok_or("--payload-bytes requires N")?
+                    .parse()?;
+            }
+            "--records-per-submission" => {
+                records_per_submission = arguments
+                    .next()
+                    .ok_or("--records-per-submission requires N")?
                     .parse()?;
             }
             "--help" | "-h" => {
@@ -183,6 +190,7 @@ fn parse_produce_lab_args(
             workers,
             per_worker,
             payload_bytes,
+            records_per_submission,
         },
     ))
 }

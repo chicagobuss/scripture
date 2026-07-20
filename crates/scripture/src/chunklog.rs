@@ -13,7 +13,7 @@ use crate::canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, OwnerId, VerseId, observe_canon_authority,
 };
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
-use crate::dataref::{DataRef, DataRefError, encode_data_ref};
+use crate::dataref::{DataRef, DataRefError, encode_data_ref, encode_reference_batch};
 use crate::model::{JournalId, RecordOffset};
 use crate::sequencer_key::sequencer_request_key_for_chunk;
 
@@ -524,6 +524,111 @@ impl ChunkLogWriter {
         })
     }
 
+    /// Appends several DataRefs in one Holylog entry under this Verse's fence.
+    ///
+    /// Validates each sealed chunk exactly as [`Self::append_data_ref`] does, and
+    /// requires dense contiguous offsets across the batch so one append advances
+    /// the journal by the sum of their record counts. Cross-Verse metadata
+    /// batching is out of scope — callers must not mix Verses into one payload.
+    pub async fn append_reference_batch(
+        &mut self,
+        items: &[(&SealedChunk, &DataRef)],
+    ) -> Result<ChunkAppendAck, ChunkLogError> {
+        if self.poisoned {
+            return Err(ChunkLogError::Poisoned);
+        }
+        if items.is_empty() {
+            return Err(ChunkLogError::DataRef(DataRefError::EmptyBatch));
+        }
+
+        let mut expected_offset = self.next_offset;
+        let mut total_records: u32 = 0;
+        let mut refs = Vec::with_capacity(items.len());
+        let mut first_frame_base = None;
+        let mut first_chunk_id = None;
+        let mut writer_id = None;
+
+        for &(chunk, data_ref) in items {
+            data_ref.validate()?;
+            let index = decode_index(&chunk.bytes)?;
+            if index.header.chunk_id != chunk.chunk_id
+                || ChunkDigest::of(&chunk.bytes) != chunk.digest
+            {
+                return Err(ChunkLogError::SealedMetadataMismatch);
+            }
+            if index.header.cohort_id != self.cohort_id {
+                return Err(ChunkLogError::CohortMismatch);
+            }
+            if index.header.generation != self.generation {
+                return Err(ChunkLogError::GenerationMismatch {
+                    expected: self.generation,
+                    actual: index.header.generation,
+                });
+            }
+            let [frame] = index.frames.as_slice() else {
+                return Err(ChunkLogError::JournalFrameMismatch {
+                    journal: self.journal_id,
+                });
+            };
+            if frame.journal_id != self.journal_id {
+                return Err(ChunkLogError::JournalFrameMismatch {
+                    journal: self.journal_id,
+                });
+            }
+            if frame.base_offset != expected_offset {
+                return Err(ChunkLogError::OffsetDiscontinuity {
+                    expected: expected_offset.get(),
+                    actual: frame.base_offset.get(),
+                });
+            }
+            if data_ref.record_count != frame.record_count {
+                return Err(ChunkLogError::DataRefRecordCountMismatch {
+                    expected: frame.record_count,
+                    actual: data_ref.record_count,
+                });
+            }
+            if data_ref.chunk_id != chunk.chunk_id {
+                return Err(ChunkLogError::DataRefChunkIdMismatch);
+            }
+            if data_ref.chunk_digest != chunk.digest {
+                return Err(ChunkLogError::DataRefChunkDigestMismatch);
+            }
+            expected_offset = frame
+                .base_offset
+                .checked_add(frame.record_count as usize)
+                .ok_or(ChunkError::OffsetOverflow)?;
+            total_records = total_records
+                .checked_add(frame.record_count)
+                .ok_or(ChunkError::OffsetOverflow)?;
+            if first_frame_base.is_none() {
+                first_frame_base = Some(frame.base_offset);
+                first_chunk_id = Some(chunk.chunk_id);
+                writer_id = Some(index.header.writer_id);
+            }
+            refs.push(data_ref.clone());
+        }
+
+        let first_offset = first_frame_base.expect("non-empty batch");
+        let chunk_id = first_chunk_id.expect("non-empty batch");
+        let writer_id = writer_id.expect("non-empty batch");
+        let payload = encode_reference_batch(&refs)?;
+
+        self.poisoned = true;
+        let slot = self
+            .log
+            .append(payload, self.generation, writer_id, chunk_id)
+            .await?;
+        self.poisoned = false;
+        self.next_offset = expected_offset;
+        Ok(ChunkAppendAck {
+            slot,
+            chunk_id,
+            first_offset,
+            next_offset: expected_offset,
+            record_count: total_records,
+        })
+    }
+
     /// Appends a superseding rewritten [`DataRef`] without re-supplying sealed bytes.
     ///
     /// Used after a background rewrite has verified the per-Verse object. Does
@@ -666,6 +771,41 @@ impl ChunkLogWriter {
         })
     }
 
+    async fn fetch_data_ref_chunk_bytes(
+        blob_store: Option<&dyn crate::blob_store::ChunkBlobStore>,
+        data_ref: &DataRef,
+    ) -> Result<bytes::Bytes, ChunkLogError> {
+        let store = blob_store.ok_or(ChunkLogError::DataRefRecoveryRequiresBlobStore)?;
+        let blob = match store.get(&data_ref.blob_key).await {
+            Ok(bytes) => bytes,
+            Err(ChunkLogError::DataRefBlobMissing { key }) => {
+                return Err(ChunkLogError::DataRefBlobMissing { key });
+            }
+            Err(error) => return Err(error),
+        };
+        if ChunkDigest::of(&blob) != data_ref.blob_digest {
+            return Err(ChunkLogError::DataRef(
+                crate::dataref::DataRefError::BlobDigestMismatch,
+            ));
+        }
+        let start = usize::try_from(data_ref.offset)
+            .map_err(|_| ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow))?;
+        let end = usize::try_from(data_ref.offset.checked_add(data_ref.length).ok_or(
+            ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow),
+        )?)
+        .map_err(|_| ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow))?;
+        let range = blob.get(start..end).ok_or_else(|| {
+            ChunkLogError::BlobStore(format!(
+                "dataref range {}..{} outside blob {}",
+                data_ref.offset,
+                data_ref.offset + data_ref.length,
+                data_ref.blob_key
+            ))
+        })?;
+        data_ref.verify_chunk_bytes(range)?;
+        Ok(bytes::Bytes::copy_from_slice(range))
+    }
+
     async fn recover_from_log(
         journal_id: JournalId,
         cohort_id: CohortId,
@@ -716,94 +856,71 @@ impl ChunkLogWriter {
                 }
                 Err(error) => return Err(error),
             };
-            let chunk_bytes = match crate::dataref::decode_log_payload(&payload)? {
-                crate::dataref::LogPayload::InlineChunk(bytes) => bytes,
+            let chunk_byte_sets = match crate::dataref::decode_log_payload(&payload)? {
+                crate::dataref::LogPayload::InlineChunk(bytes) => vec![bytes],
                 crate::dataref::LogPayload::DataRef(data_ref) => {
-                    let store =
-                        blob_store.ok_or(ChunkLogError::DataRefRecoveryRequiresBlobStore)?;
-                    let blob = match store.get(&data_ref.blob_key).await {
-                        Ok(bytes) => bytes,
-                        Err(ChunkLogError::DataRefBlobMissing { key }) => {
-                            return Err(ChunkLogError::DataRefBlobMissing { key });
+                    vec![Self::fetch_data_ref_chunk_bytes(blob_store, &data_ref).await?]
+                }
+                crate::dataref::LogPayload::ReferenceBatch(refs) => {
+                    let mut set = Vec::with_capacity(refs.len());
+                    for data_ref in &refs {
+                        set.push(Self::fetch_data_ref_chunk_bytes(blob_store, data_ref).await?);
+                    }
+                    set
+                }
+            };
+            for chunk_bytes in chunk_byte_sets {
+                let index = decode_index(&chunk_bytes)?;
+                if index.header.cohort_id != cohort_id {
+                    return Err(ChunkLogError::CohortMismatch);
+                }
+                match generation_policy {
+                    GenerationPolicy::Exact(expected) => {
+                        if index.header.generation != expected {
+                            return Err(ChunkLogError::GenerationMismatch {
+                                expected,
+                                actual: index.header.generation,
+                            });
                         }
-                        Err(error) => return Err(error),
-                    };
-                    if ChunkDigest::of(&blob) != data_ref.blob_digest {
-                        return Err(ChunkLogError::DataRef(
-                            crate::dataref::DataRefError::BlobDigestMismatch,
-                        ));
                     }
-                    let start = usize::try_from(data_ref.offset).map_err(|_| {
-                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow)
-                    })?;
-                    let end = usize::try_from(data_ref.offset.checked_add(data_ref.length).ok_or(
-                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow),
-                    )?)
-                    .map_err(|_| {
-                        ChunkLogError::DataRef(crate::dataref::DataRefError::RangeOverflow)
-                    })?;
-                    let range = blob.get(start..end).ok_or_else(|| {
-                        ChunkLogError::BlobStore(format!(
-                            "dataref range {}..{} outside blob {}",
-                            data_ref.offset,
-                            data_ref.offset + data_ref.length,
-                            data_ref.blob_key
-                        ))
-                    })?;
-                    data_ref.verify_chunk_bytes(range)?;
-                    bytes::Bytes::copy_from_slice(range)
-                }
-            };
-            let index = decode_index(&chunk_bytes)?;
-            if index.header.cohort_id != cohort_id {
-                return Err(ChunkLogError::CohortMismatch);
-            }
-            match generation_policy {
-                GenerationPolicy::Exact(expected) => {
-                    if index.header.generation != expected {
-                        return Err(ChunkLogError::GenerationMismatch {
-                            expected,
-                            actual: index.header.generation,
-                        });
+                    GenerationPolicy::AtMost(active) => {
+                        if index.header.generation > active {
+                            return Err(ChunkLogError::FutureChunkGeneration {
+                                active,
+                                actual: index.header.generation,
+                            });
+                        }
+                        if let Some(previous) = previous_virtual_generation
+                            && index.header.generation < previous
+                        {
+                            return Err(ChunkLogError::RecoveredGenerationRegression {
+                                previous,
+                                actual: index.header.generation,
+                            });
+                        }
+                        previous_virtual_generation = Some(index.header.generation);
                     }
                 }
-                GenerationPolicy::AtMost(active) => {
-                    if index.header.generation > active {
-                        return Err(ChunkLogError::FutureChunkGeneration {
-                            active,
-                            actual: index.header.generation,
-                        });
-                    }
-                    if let Some(previous) = previous_virtual_generation
-                        && index.header.generation < previous
-                    {
-                        return Err(ChunkLogError::RecoveredGenerationRegression {
-                            previous,
-                            actual: index.header.generation,
-                        });
-                    }
-                    previous_virtual_generation = Some(index.header.generation);
+                let [frame] = index.frames.as_slice() else {
+                    return Err(ChunkLogError::JournalFrameMismatch {
+                        journal: journal_id,
+                    });
+                };
+                if frame.journal_id != journal_id {
+                    return Err(ChunkLogError::JournalFrameMismatch {
+                        journal: journal_id,
+                    });
                 }
-            }
-            let [frame] = index.frames.as_slice() else {
-                return Err(ChunkLogError::JournalFrameMismatch {
-                    journal: journal_id,
-                });
-            };
-            if frame.journal_id != journal_id {
-                return Err(ChunkLogError::JournalFrameMismatch {
-                    journal: journal_id,
+                chunks.push(RecoveredChunk {
+                    slot,
+                    chunk_id: index.header.chunk_id,
+                    digest: ChunkDigest::of(&chunk_bytes),
+                    generation: index.header.generation,
+                    first_offset: frame.base_offset,
+                    record_count: frame.record_count,
+                    frame: frame.clone(),
                 });
             }
-            chunks.push(RecoveredChunk {
-                slot,
-                chunk_id: index.header.chunk_id,
-                digest: ChunkDigest::of(&chunk_bytes),
-                generation: index.header.generation,
-                first_offset: frame.base_offset,
-                record_count: frame.record_count,
-                frame: frame.clone(),
-            });
         }
 
         let mut next_offset = chunks

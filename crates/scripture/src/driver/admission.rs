@@ -148,6 +148,27 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             }
         };
 
+        // A submission is one atomic unit. If it cannot fit in a single chunk,
+        // reject it — never split it across chunks (that would invent two
+        // identities for one producer sequence).
+        if submission.records.len() > self.policy.max_chunk_records
+            || encoded_bytes > self.policy.max_chunk_bytes
+        {
+            self.ledger.event(Event::SubmissionRejected {
+                producer_id: submission.producer_id,
+                sequence: submission.sequence,
+                reason: RejectReason::SubmissionTooLarge,
+            });
+            let _ = admission.send(Err(DriverError::SubmissionTooLarge {
+                records: submission.records.len(),
+                encoded_bytes,
+                max_records: self.policy.max_chunk_records,
+                max_bytes: self.policy.max_chunk_bytes,
+            }));
+            self.bump_rejected();
+            return;
+        }
+
         match self.known_producers.get(&submission.producer_id).copied() {
             Some(highest) if submission.producer_epoch < highest => {
                 self.ledger.event(Event::SubmissionRejected {

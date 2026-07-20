@@ -107,6 +107,25 @@ pub trait DataRefAppendTarget: Send {
         sealed: &SealedChunk,
         data_ref: &DataRef,
     ) -> Result<ChunkAppendAck, BlobWriterError>;
+
+    /// Appends one or more DataRefs under a single Verse fence.
+    ///
+    /// Default: one SRDF append when `items.len() == 1`, otherwise one SRRB
+    /// ReferenceBatch. Override only when the target cannot speak SRRB yet.
+    async fn append_data_refs(
+        &mut self,
+        items: &[(&SealedChunk, &DataRef)],
+    ) -> Result<ChunkAppendAck, BlobWriterError> {
+        match items {
+            [] => Err(BlobWriterError::Invariant(
+                "append_data_refs requires at least one DataRef".into(),
+            )),
+            [(sealed, data_ref)] => self.append_data_ref(sealed, data_ref).await,
+            _ => Err(BlobWriterError::Invariant(
+                "default append_data_refs cannot encode ReferenceBatch; override required".into(),
+            )),
+        }
+    }
 }
 
 /// Why a blob was cut.
@@ -241,30 +260,90 @@ pub async fn commit_cut_plan(
     let blob_key = format!("{}/{blob_digest}", plan_prefix(plan)?);
     put_and_verify(store, &blob_key, bytes.clone(), blob_digest).await?;
 
-    let mut outcomes = Vec::with_capacity(placements.len());
+    // Group placements by Verse so many DataRefs share one lawful append
+    // (ReferenceBatch). Never batch metadata across Verses.
+    let mut by_verse: Vec<(String, Vec<Placement>)> = Vec::new();
     for placement in placements {
-        let data_ref = DataRef {
-            blob_key: blob_key.clone(),
-            offset: placement.offset,
-            length: placement.length,
-            record_count: placement.record_count,
-            chunk_id: placement.sealed.chunk_id,
-            chunk_digest: placement.sealed.digest,
-            blob_digest,
-        };
-        let _ = encode_data_ref(&data_ref)?;
-        let result = match targets.get_mut(&placement.verse_key) {
-            Some(target) => target.append_data_ref(&placement.sealed, &data_ref).await,
+        if let Some((_, group)) = by_verse
+            .iter_mut()
+            .find(|(key, _)| key == &placement.verse_key)
+        {
+            group.push(placement);
+        } else {
+            by_verse.push((placement.verse_key.clone(), vec![placement]));
+        }
+    }
+
+    let mut outcomes = Vec::new();
+    for (verse_key, group) in by_verse {
+        let mut prepared = Vec::with_capacity(group.len());
+        for placement in &group {
+            let data_ref = DataRef {
+                blob_key: blob_key.clone(),
+                offset: placement.offset,
+                length: placement.length,
+                record_count: placement.record_count,
+                chunk_id: placement.sealed.chunk_id,
+                chunk_digest: placement.sealed.digest,
+                blob_digest,
+            };
+            let _ = encode_data_ref(&data_ref)?;
+            prepared.push((placement, data_ref));
+        }
+        let items: Vec<(&SealedChunk, &DataRef)> = prepared
+            .iter()
+            .map(|(placement, data_ref)| (&placement.sealed, data_ref))
+            .collect();
+        let batch_result = match targets.get_mut(&verse_key) {
+            Some(target) => target.append_data_refs(&items).await,
             None => Err(BlobWriterError::Invariant(format!(
-                "no DataRef append target for verse {}",
-                placement.verse_key
+                "no DataRef append target for verse {verse_key}"
             ))),
         };
-        outcomes.push(PlacementCommitOutcome {
-            verse_key: placement.verse_key,
-            chunk_id: placement.sealed.chunk_id,
-            result,
-        });
+        match batch_result {
+            Ok(ack) => {
+                let mut next = ack.first_offset;
+                for (placement, data_ref) in prepared {
+                    let placement_next = next
+                        .checked_add(data_ref.record_count as usize)
+                        .ok_or_else(|| {
+                            BlobWriterError::Invariant("placement offset overflow".into())
+                        })?;
+                    outcomes.push(PlacementCommitOutcome {
+                        verse_key: verse_key.clone(),
+                        chunk_id: placement.sealed.chunk_id,
+                        result: Ok(ChunkAppendAck {
+                            slot: ack.slot,
+                            chunk_id: placement.sealed.chunk_id,
+                            first_offset: next,
+                            next_offset: placement_next,
+                            record_count: data_ref.record_count,
+                        }),
+                    });
+                    next = placement_next;
+                }
+            }
+            Err(error) => {
+                let mut group = group.into_iter();
+                if let Some(first) = group.next() {
+                    outcomes.push(PlacementCommitOutcome {
+                        verse_key: verse_key.clone(),
+                        chunk_id: first.sealed.chunk_id,
+                        result: Err(error),
+                    });
+                    for placement in group {
+                        outcomes.push(PlacementCommitOutcome {
+                            verse_key: verse_key.clone(),
+                            chunk_id: placement.sealed.chunk_id,
+                            result: Err(BlobWriterError::Invariant(
+                                "verse ReferenceBatch rejected; sibling placements share the failure"
+                                    .into(),
+                            )),
+                        });
+                    }
+                }
+            }
+        }
     }
     Ok(outcomes)
 }

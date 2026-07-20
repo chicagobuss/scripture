@@ -106,6 +106,26 @@ impl DataRefAppendTarget for WriterTarget {
         self.refs.lock().expect("refs").push(data_ref.clone());
         Ok(ack)
     }
+
+    async fn append_data_refs(
+        &mut self,
+        items: &[(&SealedChunk, &DataRef)],
+    ) -> Result<ChunkAppendAck, BlobWriterError> {
+        match items {
+            [] => Err(BlobWriterError::Invariant(
+                "append_data_refs requires at least one DataRef".into(),
+            )),
+            [(sealed, data_ref)] => self.append_data_ref(sealed, data_ref).await,
+            _ => {
+                let ack = self.writer.append_reference_batch(items).await?;
+                let mut refs = self.refs.lock().expect("refs");
+                for (_, data_ref) in items {
+                    refs.push((*data_ref).clone());
+                }
+                Ok(ack)
+            }
+        }
+    }
 }
 
 struct RejectTarget;
@@ -115,6 +135,15 @@ impl DataRefAppendTarget for RejectTarget {
         &mut self,
         _: &SealedChunk,
         _: &DataRef,
+    ) -> Result<ChunkAppendAck, BlobWriterError> {
+        Err(BlobWriterError::Invariant(
+            "simulated authority loss".into(),
+        ))
+    }
+
+    async fn append_data_refs(
+        &mut self,
+        _: &[(&SealedChunk, &DataRef)],
     ) -> Result<ChunkAppendAck, BlobWriterError> {
         Err(BlobWriterError::Invariant(
             "simulated authority loss".into(),
@@ -369,7 +398,8 @@ async fn handoff_replay_reseals_same_envelopes_under_successor_generation() {
     let resolved = resolve_log_payload(&store, &payload)
         .await
         .expect("resolve");
-    assert_eq!(resolved.chunk.header.generation, 2);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].chunk.header.generation, 2);
 }
 
 #[tokio::test]
@@ -418,4 +448,74 @@ async fn reads_across_two_blob_generations_return_exact_records() {
         )
         .collect();
     assert_eq!(values, vec![20, 21]);
+}
+
+#[tokio::test]
+async fn same_verse_multi_chunk_cut_commits_one_reference_batch() {
+    use scripture::{LogPayload, decode_log_payload};
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let drive = Arc::new(InMemoryLogDrive::new());
+    let log = AtomicLog::builder(drive, 0).build().expect("log");
+    let refs = Arc::new(Mutex::new(Vec::new()));
+    let mut sealers: Sealers = BTreeMap::new();
+    sealers.insert(
+        "a".into(),
+        Box::new(TestSealer {
+            generation: 1,
+            next: RecordOffset::new(0),
+        }),
+    );
+    let mut targets: Targets = BTreeMap::new();
+    targets.insert(
+        "a".into(),
+        Box::new(WriterTarget {
+            writer: ChunkLogWriter::new(
+                journal(b'a'),
+                cohort(),
+                1,
+                log.clone(),
+                RecordOffset::new(0),
+            ),
+            refs: Arc::clone(&refs),
+        }),
+    );
+
+    let mut writer = writer(1024 * 1024);
+    writer
+        .push(envelope("a", 1, journal(b'a'), &[1]))
+        .expect("push");
+    writer
+        .push(envelope("a", 2, journal(b'a'), &[2]))
+        .expect("push");
+    let plan = writer.flush_drained().expect("flush").expect("plan");
+    let outcomes = commit_cut_plan(&store, &plan, &mut sealers, &mut targets)
+        .await
+        .expect("commit");
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|o| o.result.is_ok()));
+    let slot0 = outcomes[0].result.as_ref().expect("ack0").slot;
+    let slot1 = outcomes[1].result.as_ref().expect("ack1").slot;
+    assert_eq!(slot0, slot1, "both placements share one Holylog slot");
+    assert_eq!(outcomes[0].chunk_id, ChunkId::from_bytes([1; 16]));
+    assert_eq!(outcomes[1].chunk_id, ChunkId::from_bytes([2; 16]));
+
+    let entry = log.read_next(0, 1).await.expect("read");
+    let LogPayload::ReferenceBatch(batch) = decode_log_payload(&entry.payload).expect("dispatch")
+    else {
+        panic!("multi-chunk same-Verse cut must write SRRB, not SRDF");
+    };
+    assert_eq!(batch.len(), 2);
+    let resolved = resolve_log_payload(&store, &entry.payload)
+        .await
+        .expect("expand");
+    assert_eq!(resolved.len(), 2);
+    assert_eq!(
+        resolved[0].chunk.header.chunk_id,
+        ChunkId::from_bytes([1; 16])
+    );
+    assert_eq!(
+        resolved[1].chunk.header.chunk_id,
+        ChunkId::from_bytes([2; 16])
+    );
 }

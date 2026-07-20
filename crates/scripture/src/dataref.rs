@@ -16,6 +16,13 @@
 //! based retention applies to rewritten objects; staging blobs become
 //! collectable only after every referenced [`ChunkId`] has a durable superseding
 //! pointer in the log.
+//!
+//! # ReferenceBatch
+//!
+//! Several DataRefs may share **one lawful Holylog append for one Verse**
+//! (`SRRB`). Cross-Verse metadata append-many is out of scope and must preserve
+//! per-Verse fences; do not batch metadata across Verses in one authoritative
+//! append.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -25,8 +32,12 @@ use crate::chunk::{ChunkDigest, ChunkId};
 const INLINE_CHUNK_MAGIC: &[u8; 4] = b"SCRC";
 /// Magic for a Scripture DataRef log payload (`SCRC` is an inline chunk).
 const DATAREF_MAGIC: &[u8; 4] = b"SRDF";
+/// Magic for a per-Verse ReferenceBatch of DataRefs.
+const REFERENCE_BATCH_MAGIC: &[u8; 4] = b"SRRB";
 /// Codec version 2 adds immutable chunk/blob evidence fields.
 const DATAREF_VERSION: u8 = 2;
+/// ReferenceBatch codec version.
+const REFERENCE_BATCH_VERSION: u8 = 1;
 /// Bound blob keys so a malformed pointer cannot allocate unbounded memory.
 pub const MAX_BLOB_KEY_BYTES: usize = 1024;
 
@@ -100,13 +111,15 @@ impl DataRef {
     }
 }
 
-/// A Holylog entry payload: either a legacy inline chunk or a DataRef.
+/// A Holylog entry payload: inline chunk, single DataRef, or ReferenceBatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogPayload {
     /// Legacy path: the log entry bytes *are* the sealed chunk (`SCRC…`).
     InlineChunk(Bytes),
     /// Pointer at a portion of a shared blob (`SRDF…`).
     DataRef(DataRef),
+    /// Ordered DataRefs under one Verse fence (`SRRB…`).
+    ReferenceBatch(Vec<DataRef>),
 }
 
 /// DataRef codec / validation failures.
@@ -165,9 +178,26 @@ pub enum DataRefError {
     /// Blob key bytes were not valid UTF-8.
     #[error("dataref blob_key is not valid UTF-8")]
     InvalidUtf8,
-    /// Payload is neither an inline chunk nor a DataRef.
+    /// Payload is neither an inline chunk, a DataRef, nor a ReferenceBatch.
     #[error("unrecognized log payload magic")]
     UnrecognizedPayload,
+    /// A ReferenceBatch must name at least one DataRef.
+    #[error("reference batch is empty")]
+    EmptyBatch,
+    /// ReferenceBatch count exceeds what a u16 can name.
+    #[error("reference batch length {len} exceeds u16::MAX")]
+    BatchTooLarge {
+        /// Observed item count.
+        len: usize,
+    },
+    /// Decoded member count did not match the header count.
+    #[error("reference batch count mismatch: header {expected}, decoded {actual}")]
+    BatchCountMismatch {
+        /// Count from the SRRB header.
+        expected: usize,
+        /// Members successfully decoded.
+        actual: usize,
+    },
 }
 
 /// Encodes a DataRef as a Holylog payload.
@@ -190,8 +220,11 @@ pub fn encode_data_ref(data_ref: &DataRef) -> Result<Bytes, DataRefError> {
     Ok(out.freeze())
 }
 
-/// Decodes a DataRef Holylog payload.
-pub fn decode_data_ref(bytes: &[u8]) -> Result<DataRef, DataRefError> {
+/// Decodes one DataRef from a byte prefix; returns the value and bytes consumed.
+///
+/// Used by ReferenceBatch decoding where several full `SRDF` blobs are
+/// concatenated. Trailing bytes after this member are allowed.
+fn decode_data_ref_prefix(bytes: &[u8]) -> Result<(DataRef, usize), DataRefError> {
     // Minimum: magic+ver+key_len+empty key+offset+len+count+ids
     if bytes.len() < 4 + 1 + 2 + 8 + 8 + 4 + 16 + 32 + 32 {
         return Err(DataRefError::Truncated);
@@ -213,9 +246,6 @@ pub fn decode_data_ref(bytes: &[u8]) -> Result<DataRef, DataRefError> {
         .ok_or(DataRefError::Truncated)?;
     if bytes.len() < fixed_end {
         return Err(DataRefError::Truncated);
-    }
-    if bytes.len() != fixed_end {
-        return Err(DataRefError::TrailingBytes);
     }
     let key =
         std::str::from_utf8(&bytes[key_start..key_end]).map_err(|_| DataRefError::InvalidUtf8)?;
@@ -259,18 +289,94 @@ pub fn decode_data_ref(bytes: &[u8]) -> Result<DataRef, DataRefError> {
         blob_digest,
     };
     data_ref.validate()?;
+    Ok((data_ref, fixed_end))
+}
+
+/// Decodes a DataRef Holylog payload.
+pub fn decode_data_ref(bytes: &[u8]) -> Result<DataRef, DataRefError> {
+    let (data_ref, consumed) = decode_data_ref_prefix(bytes)?;
+    if consumed != bytes.len() {
+        return Err(DataRefError::TrailingBytes);
+    }
     Ok(data_ref)
 }
 
-/// Dispatches a Holylog payload to an inline chunk or a DataRef.
+/// Encodes several DataRefs as one per-Verse ReferenceBatch Holylog payload.
 ///
-/// Chunk magic is `SCRC`; DataRef magic is `SRDF`. Anything else fails closed.
+/// Cross-Verse metadata append-many is out of scope: this payload is lawful
+/// only under a single Verse fence.
+pub fn encode_reference_batch(refs: &[DataRef]) -> Result<Bytes, DataRefError> {
+    if refs.is_empty() {
+        return Err(DataRefError::EmptyBatch);
+    }
+    let count =
+        u16::try_from(refs.len()).map_err(|_| DataRefError::BatchTooLarge { len: refs.len() })?;
+    let mut out = BytesMut::new();
+    out.put_slice(REFERENCE_BATCH_MAGIC);
+    out.put_u8(REFERENCE_BATCH_VERSION);
+    out.put_u16(count);
+    for data_ref in refs {
+        out.extend_from_slice(&encode_data_ref(data_ref)?);
+    }
+    Ok(out.freeze())
+}
+
+/// Decodes a ReferenceBatch Holylog payload into ordered DataRefs.
+pub fn decode_reference_batch(bytes: &[u8]) -> Result<Vec<DataRef>, DataRefError> {
+    if bytes.len() < 4 + 1 + 2 {
+        return Err(DataRefError::Truncated);
+    }
+    if bytes[..4] != *REFERENCE_BATCH_MAGIC {
+        return Err(DataRefError::InvalidMagic);
+    }
+    let version = bytes[4];
+    if version != REFERENCE_BATCH_VERSION {
+        return Err(DataRefError::UnsupportedVersion { version });
+    }
+    let expected = usize::from(u16::from_be_bytes([bytes[5], bytes[6]]));
+    if expected == 0 {
+        return Err(DataRefError::EmptyBatch);
+    }
+    let mut cursor = 7;
+    let mut out = Vec::with_capacity(expected);
+    while out.len() < expected {
+        if cursor >= bytes.len() {
+            return Err(DataRefError::BatchCountMismatch {
+                expected,
+                actual: out.len(),
+            });
+        }
+        let (data_ref, consumed) = decode_data_ref_prefix(&bytes[cursor..])?;
+        cursor = cursor
+            .checked_add(consumed)
+            .ok_or(DataRefError::Truncated)?;
+        out.push(data_ref);
+    }
+    if cursor != bytes.len() {
+        return Err(DataRefError::TrailingBytes);
+    }
+    if out.len() != expected {
+        return Err(DataRefError::BatchCountMismatch {
+            expected,
+            actual: out.len(),
+        });
+    }
+    Ok(out)
+}
+
+/// Dispatches a Holylog payload to an inline chunk, DataRef, or ReferenceBatch.
+///
+/// Chunk magic is `SCRC`; DataRef magic is `SRDF`; ReferenceBatch is `SRRB`.
+/// Anything else fails closed.
 pub fn decode_log_payload(bytes: &[u8]) -> Result<LogPayload, DataRefError> {
     if bytes.len() < 4 {
         return Err(DataRefError::Truncated);
     }
     if bytes[..4] == *DATAREF_MAGIC {
         return Ok(LogPayload::DataRef(decode_data_ref(bytes)?));
+    }
+    if bytes[..4] == *REFERENCE_BATCH_MAGIC {
+        return Ok(LogPayload::ReferenceBatch(decode_reference_batch(bytes)?));
     }
     if bytes[..4] == *INLINE_CHUNK_MAGIC {
         return Ok(LogPayload::InlineChunk(Bytes::copy_from_slice(bytes)));
@@ -294,6 +400,18 @@ mod tests {
         }
     }
 
+    fn sample_at(offset: u64, chunk_byte: u8) -> DataRef {
+        DataRef {
+            blob_key: "blobs/v1/abc".into(),
+            offset,
+            length: 64,
+            record_count: 2,
+            chunk_id: ChunkId::from_bytes([chunk_byte; 16]),
+            chunk_digest: ChunkDigest::from_bytes([chunk_byte.wrapping_add(1); 32]),
+            blob_digest: ChunkDigest::from_bytes([9; 32]),
+        }
+    }
+
     #[test]
     fn round_trip_including_nonzero_offset() {
         let encoded = encode_data_ref(&sample()).expect("encode");
@@ -308,7 +426,41 @@ mod tests {
         match decode_log_payload(&encoded).expect("dispatch") {
             LogPayload::DataRef(data_ref) => assert_eq!(data_ref, sample()),
             LogPayload::InlineChunk(_) => panic!("expected DataRef"),
+            LogPayload::ReferenceBatch(_) => panic!("expected DataRef"),
         }
+    }
+
+    #[test]
+    fn reference_batch_round_trip_preserves_order() {
+        let refs = vec![sample_at(0, 1), sample_at(64, 2), sample_at(128, 3)];
+        let encoded = encode_reference_batch(&refs).expect("encode");
+        assert_eq!(&encoded[..4], b"SRRB");
+        let decoded = decode_reference_batch(&encoded).expect("decode");
+        assert_eq!(decoded, refs);
+        match decode_log_payload(&encoded).expect("dispatch") {
+            LogPayload::ReferenceBatch(batch) => assert_eq!(batch, refs),
+            other => panic!("expected ReferenceBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reference_batch_rejects_empty_and_count_mismatch() {
+        assert!(matches!(
+            encode_reference_batch(&[]),
+            Err(DataRefError::EmptyBatch)
+        ));
+        let mut encoded = encode_reference_batch(&[sample()])
+            .expect("encode")
+            .to_vec();
+        // Corrupt the count to 2 while leaving one member — decode must fail closed.
+        encoded[5..7].copy_from_slice(&2u16.to_be_bytes());
+        assert!(matches!(
+            decode_reference_batch(&encoded),
+            Err(DataRefError::BatchCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
     }
 
     #[test]

@@ -177,7 +177,7 @@ pub async fn scan_log_deduped(
     let mut order: Vec<ChunkId> = Vec::new();
 
     for payload in payloads {
-        match decode_log_payload(payload)? {
+        let refs = match decode_log_payload(payload)? {
             LogPayload::InlineChunk(bytes) => {
                 let chunk = decode_chunk(&bytes)?;
                 let chunk_id = chunk.header.chunk_id;
@@ -192,25 +192,27 @@ pub async fn scan_log_deduped(
                         best.insert(chunk_id, Entry::Inline(chunk));
                     }
                 }
+                continue;
             }
-            LogPayload::DataRef(data_ref) => {
-                let chunk_id = data_ref.chunk_id;
-                match best.get(&chunk_id) {
-                    None => {
-                        order.push(chunk_id);
+            LogPayload::DataRef(data_ref) => vec![data_ref],
+            LogPayload::ReferenceBatch(refs) => refs,
+        };
+        for data_ref in refs {
+            let chunk_id = data_ref.chunk_id;
+            match best.get(&chunk_id) {
+                None => {
+                    order.push(chunk_id);
+                    best.insert(chunk_id, Entry::Ref(data_ref));
+                }
+                Some(Entry::Ref(existing)) => {
+                    let chosen = prefer_data_ref(existing, &data_ref, config);
+                    if chosen.blob_key != existing.blob_key || chosen.offset != existing.offset {
+                        best.insert(chunk_id, Entry::Ref(chosen.clone()));
+                    }
+                }
+                Some(Entry::Inline(_)) => {
+                    if is_rewritten_blob_key(&data_ref.blob_key, config) {
                         best.insert(chunk_id, Entry::Ref(data_ref));
-                    }
-                    Some(Entry::Ref(existing)) => {
-                        let chosen = prefer_data_ref(existing, &data_ref, config);
-                        if chosen.blob_key != existing.blob_key || chosen.offset != existing.offset
-                        {
-                            best.insert(chunk_id, Entry::Ref(chosen.clone()));
-                        }
-                    }
-                    Some(Entry::Inline(_)) => {
-                        if is_rewritten_blob_key(&data_ref.blob_key, config) {
-                            best.insert(chunk_id, Entry::Ref(data_ref));
-                        }
                     }
                 }
             }
@@ -228,7 +230,7 @@ pub async fn scan_log_deduped(
                 data_ref: None,
             }),
             Entry::Ref(data_ref) => {
-                out.push(resolve_log_payload(store, &encode_data_ref(&data_ref)?).await?);
+                out.extend(resolve_log_payload(store, &encode_data_ref(&data_ref)?).await?);
             }
         }
     }
@@ -454,11 +456,15 @@ pub fn superseded_chunk_ids(
 ) -> Result<BTreeSet<ChunkId>, DataRefError> {
     let mut superseded = BTreeSet::new();
     for payload in log_payloads {
-        let LogPayload::DataRef(data_ref) = decode_log_payload(payload)? else {
-            continue;
+        let refs = match decode_log_payload(payload)? {
+            LogPayload::DataRef(data_ref) => vec![data_ref],
+            LogPayload::ReferenceBatch(refs) => refs,
+            LogPayload::InlineChunk(_) => continue,
         };
-        if is_rewritten_blob_key(&data_ref.blob_key, config) {
-            superseded.insert(data_ref.chunk_id);
+        for data_ref in refs {
+            if is_rewritten_blob_key(&data_ref.blob_key, config) {
+                superseded.insert(data_ref.chunk_id);
+            }
         }
     }
     Ok(superseded)

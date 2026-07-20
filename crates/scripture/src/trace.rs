@@ -166,6 +166,9 @@ pub enum RejectReason {
     /// A record larger than the policy admits. Rejected rather than sealed
     /// alone, because sealing it alone would breach the bytes-at-risk ceiling.
     RecordTooLarge,
+    /// A multi-record unit larger than one chunk may hold. Rejected rather
+    /// than split: splitting would break the one-identity / one-receipt contract.
+    SubmissionTooLarge,
     /// The driver is poisoned and accepts nothing.
     DriverStopped,
 }

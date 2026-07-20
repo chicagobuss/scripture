@@ -134,6 +134,7 @@ fn driver_append_emits_dataref_and_record_reads_end_to_end() {
             assert_eq!(chunk.frames[0].records[0], record(42));
         }
         LogPayload::InlineChunk(_) => panic!("expected DataRef payload on live path"),
+        LogPayload::ReferenceBatch(_) => panic!("expected single DataRef payload on live path"),
     }
 }
 

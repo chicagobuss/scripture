@@ -181,7 +181,7 @@ async fn activate_one(
                 foundation.as_ref(),
                 key,
                 term,
-                config.assignment_runtime_config(assignment)?,
+                assembled.verse_config.clone(),
                 Arc::clone(&assembled.register),
                 Arc::clone(&assembled.resolver),
                 clock,
@@ -257,7 +257,7 @@ async fn promote_one(
         key,
         term,
         expected,
-        config.assignment_runtime_config(assignment)?,
+        assembled.verse_config.clone(),
         Arc::clone(&assembled.register),
         Arc::clone(&assembled.resolver),
         clock,
@@ -341,6 +341,7 @@ pub async fn bootstrap_multi_assignment(
         Arc::clone(&shared.store),
         Arc::clone(&shared.metrics),
         Arc::clone(&shared.authority_counters),
+        Arc::clone(&shared.blob_counters),
         listeners,
     )
     .await
@@ -406,6 +407,7 @@ pub async fn promote_multi_assignment(
         Arc::clone(&shared.store),
         Arc::clone(&shared.metrics),
         Arc::clone(&shared.authority_counters),
+        Arc::clone(&shared.blob_counters),
         listeners,
     )
     .await
@@ -497,6 +499,7 @@ async fn run_multi_ingress(
     store: Arc<dyn ObjectStore>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
     authority: Arc<scripture_runtime::counting_store::RequestCounters>,
+    blobs: Arc<scripture_runtime::counting_store::RequestCounters>,
     mut prebound: HashMap<String, TcpListener>,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
@@ -513,8 +516,9 @@ async fn run_multi_ingress(
         let alive = Arc::clone(&alive);
         let metrics = Arc::clone(&metrics);
         let authority = Arc::clone(&authority);
+        let blobs = Arc::clone(&blobs);
         tokio::spawn(async move {
-            serve_probe_loop(listener, supervisor, alive, metrics, authority).await;
+            serve_probe_loop(listener, supervisor, alive, metrics, authority, blobs).await;
         });
     }
 
@@ -669,6 +673,7 @@ async fn serve_probe_loop(
     alive: Arc<AtomicBool>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
     authority: Arc<scripture_runtime::counting_store::RequestCounters>,
+    blobs: Arc<scripture_runtime::counting_store::RequestCounters>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -678,8 +683,9 @@ async fn serve_probe_loop(
         let alive = Arc::clone(&alive);
         let metrics = Arc::clone(&metrics);
         let authority = Arc::clone(&authority);
+        let blobs = Arc::clone(&blobs);
         tokio::spawn(async move {
-            serve_probe_connection(stream, supervisor, alive, metrics, authority).await;
+            serve_probe_connection(stream, supervisor, alive, metrics, authority, blobs).await;
         });
     }
 }
@@ -690,6 +696,7 @@ async fn serve_probe_connection(
     alive: Arc<AtomicBool>,
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
     authority: Arc<scripture_runtime::counting_store::RequestCounters>,
+    blobs: Arc<scripture_runtime::counting_store::RequestCounters>,
 ) {
     let mut buf = [0_u8; 1024];
     let _ = stream.read(&mut buf).await;
@@ -737,6 +744,10 @@ async fn serve_probe_connection(
             let (a_puts, a_gets, a_lists, a_deletes) = authority.snapshot();
             body.push_str(&format!(
                 "authority_puts={a_puts} authority_gets={a_gets} authority_lists={a_lists} authority_deletes={a_deletes}\n"
+            ));
+            let (b_puts, b_gets, b_lists, b_deletes) = blobs.snapshot();
+            body.push_str(&format!(
+                "blob_puts={b_puts} blob_gets={b_gets} blob_lists={b_lists} blob_deletes={b_deletes}\n"
             ));
             body.push_str("live authority (re-observed from the root):\n");
             for (id, effective) in supervisor.effective_writers().await {

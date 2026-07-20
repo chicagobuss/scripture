@@ -129,6 +129,24 @@ pub enum DriverError {
         /// Policy ceiling.
         max: usize,
     },
+    /// A submission exceeds the hard chunk ceiling and will not be split.
+    ///
+    /// Rejecting (rather than silently splitting) keeps one producer identity
+    /// mapped to one receipt span. Splitting would acknowledge a unit that
+    /// never existed as a single durable identity.
+    #[error(
+        "submission too large: {records} records / {encoded_bytes} bytes (limits {max_records} / {max_bytes})"
+    )]
+    SubmissionTooLarge {
+        /// Records offered in the unit.
+        records: usize,
+        /// Solo-encoded size of the unit.
+        encoded_bytes: usize,
+        /// Policy record ceiling for one chunk.
+        max_records: usize,
+        /// Policy byte ceiling for one chunk.
+        max_bytes: usize,
+    },
     /// An empty record list is never admitted.
     #[error("submission carries no records")]
     EmptySubmission,

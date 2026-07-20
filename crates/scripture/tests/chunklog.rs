@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::executor::block_on;
 use holylog::atomic::{AtomicLog, InMemorySeal, InMemoryTrimPoint, Seal, TrimPoint};
 use holylog::drive::LogDrive;
@@ -782,6 +782,7 @@ fn append_data_ref_writes_pointer_not_chunk_bytes() {
         match decode_log_payload(&entry.payload).expect("dispatch") {
             LogPayload::DataRef(decoded) => assert_eq!(decoded, data_ref),
             LogPayload::InlineChunk(_) => panic!("expected DataRef payload"),
+            LogPayload::ReferenceBatch(_) => panic!("expected single DataRef payload"),
         }
     });
 }
@@ -841,5 +842,126 @@ fn superseding_an_earlier_chunk_reports_that_chunks_offsets() {
             RecordOffset::new(5),
             "a superseding append must not advance the dense offset"
         );
+    });
+}
+
+#[test]
+fn append_reference_batch_writes_one_srrb_and_advances_by_total_records() {
+    use std::collections::HashMap;
+
+    use futures::future::BoxFuture;
+    use scripture::{
+        ChunkBlobStore, ChunkDigest, ChunkLogError, DataRef, LogPayload, decode_log_payload,
+    };
+
+    #[derive(Default)]
+    struct MemoryBlobStore {
+        objects: Mutex<HashMap<String, Bytes>>,
+    }
+
+    impl ChunkBlobStore for MemoryBlobStore {
+        fn put_verified<'a>(
+            &'a self,
+            key: &'a str,
+            bytes: Bytes,
+            digest: ChunkDigest,
+        ) -> BoxFuture<'a, Result<(), ChunkLogError>> {
+            Box::pin(async move {
+                if ChunkDigest::of(&bytes) != digest {
+                    return Err(ChunkLogError::BlobStore("digest mismatch".into()));
+                }
+                self.objects
+                    .lock()
+                    .expect("objects")
+                    .insert(key.to_owned(), bytes);
+                Ok(())
+            })
+        }
+
+        fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Bytes, ChunkLogError>> {
+            Box::pin(async move {
+                self.objects
+                    .lock()
+                    .expect("objects")
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| ChunkLogError::DataRefBlobMissing { key: key.into() })
+            })
+        }
+    }
+
+    block_on(async {
+        let drive = Arc::new(InMemoryLogDrive::new());
+        let log = AtomicLog::builder(drive, 0).build().expect("log");
+        let mut writer =
+            ChunkLogWriter::new(journal(), cohort(), 4, log.clone(), RecordOffset::new(0));
+        let first = chunk(1, 0, 2);
+        let second = chunk(2, 2, 3);
+        let mut blob = BytesMut::new();
+        blob.extend_from_slice(&first.bytes);
+        blob.extend_from_slice(&second.bytes);
+        let blob = blob.freeze();
+        let blob_digest = ChunkDigest::of(&blob);
+        let blob_key = format!("blobs/v1/{blob_digest}");
+        let store = MemoryBlobStore::default();
+        store
+            .put_verified(&blob_key, blob.clone(), blob_digest)
+            .await
+            .expect("put");
+
+        let first_ref = DataRef {
+            blob_key: blob_key.clone(),
+            offset: 0,
+            length: first.bytes.len() as u64,
+            record_count: 2,
+            chunk_id: first.chunk_id,
+            chunk_digest: first.digest,
+            blob_digest,
+        };
+        let second_ref = DataRef {
+            blob_key: blob_key.clone(),
+            offset: first.bytes.len() as u64,
+            length: second.bytes.len() as u64,
+            record_count: 3,
+            chunk_id: second.chunk_id,
+            chunk_digest: second.digest,
+            blob_digest,
+        };
+        let ack = writer
+            .append_reference_batch(&[(&first, &first_ref), (&second, &second_ref)])
+            .await
+            .expect("batch");
+        assert_eq!(ack.chunk_id, first.chunk_id);
+        assert_eq!(ack.first_offset, RecordOffset::new(0));
+        assert_eq!(ack.record_count, 5);
+        assert_eq!(ack.next_offset, RecordOffset::new(5));
+        assert_eq!(ack.slot, 0);
+        assert_eq!(writer.next_offset(), RecordOffset::new(5));
+
+        let entry = log.read_next(0, 1).await.expect("read");
+        match decode_log_payload(&entry.payload).expect("dispatch") {
+            LogPayload::ReferenceBatch(batch) => {
+                assert_eq!(batch, vec![first_ref, second_ref]);
+            }
+            other => panic!("expected SRRB, got {other:?}"),
+        }
+
+        let recovery = ChunkLogWriter::recover(
+            journal(),
+            cohort(),
+            4,
+            log,
+            RecoveryBound::new(8).expect("bound"),
+            Some(&store as &dyn ChunkBlobStore),
+        )
+        .await
+        .expect("recover");
+        assert_eq!(recovery.chunks.len(), 2);
+        assert_eq!(recovery.chunks[0].slot, recovery.chunks[1].slot);
+        assert_eq!(recovery.chunks[0].chunk_id, first.chunk_id);
+        assert_eq!(recovery.chunks[1].chunk_id, second.chunk_id);
+        assert_eq!(recovery.chunks[0].first_offset, RecordOffset::new(0));
+        assert_eq!(recovery.chunks[1].first_offset, RecordOffset::new(2));
+        assert_eq!(recovery.writer.next_offset(), RecordOffset::new(5));
     });
 }

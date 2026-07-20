@@ -102,11 +102,10 @@ pub async fn consume_lab(
         let mut advanced = false;
         while cursor < end {
             let entry = log.read_next(cursor, end).await?;
-            let resolved = resolve_log_payload(&shared.store, &entry.payload).await?;
-            let in_entry: u64 = resolved
-                .chunk
-                .frames
+            let resolved_chunks = resolve_log_payload(&shared.store, &entry.payload).await?;
+            let in_entry: u64 = resolved_chunks
                 .iter()
+                .flat_map(|resolved| resolved.chunk.frames.iter())
                 .map(|frame| frame.records.len() as u64)
                 .sum();
             records += in_entry;

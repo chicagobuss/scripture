@@ -169,6 +169,19 @@ impl DataRefAppendTarget for WriterTarget {
     ) -> Result<ChunkAppendAck, scripture_runtime::BlobWriterError> {
         Ok(self.writer.append_data_ref(sealed, data_ref).await?)
     }
+
+    async fn append_data_refs(
+        &mut self,
+        items: &[(&SealedChunk, &scripture::DataRef)],
+    ) -> Result<ChunkAppendAck, scripture_runtime::BlobWriterError> {
+        match items {
+            [] => Err(scripture_runtime::BlobWriterError::Invariant(
+                "append_data_refs requires at least one DataRef".into(),
+            )),
+            [(sealed, data_ref)] => self.append_data_ref(sealed, data_ref).await,
+            _ => Ok(self.writer.append_reference_batch(items).await?),
+        }
+    }
 }
 
 async fn commit_one(

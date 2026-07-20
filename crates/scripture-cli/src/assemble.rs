@@ -29,6 +29,11 @@ pub struct AssembledNode {
     pub backend: BackendProfile,
     pub store_root: String,
     pub advertise: scripture::OwnerEndpoint,
+    /// Runtime config actually used to assemble the supervisor — including
+    /// mounted DataRef blob config. Pass this to `bootstrap_and_serve` /
+    /// `promote_and_serve`; a fresh `assignment_runtime_config()` has
+    /// `dataref_blobs: None` and silently leaves the driver on inline chunks.
+    pub verse_config: VerseRuntimeConfig,
 }
 
 /// Shared object-store connection reused across multi-assignment roots.
@@ -36,6 +41,9 @@ pub struct SharedStore {
     pub store: Arc<dyn ObjectStore>,
     /// Request counts for the Serving-Authority register / claim paths.
     pub authority_counters: Arc<RequestCounters>,
+    /// Request counts for DataRef staging blob PUT/GET (separate from authority
+    /// and from the LogDrive metrics path).
+    pub blob_counters: Arc<RequestCounters>,
     pub backend: BackendProfile,
     /// Process-level advertise (single-assignment / SharedStore identity).
     /// Multi-assignment seams must use each assignment's advertise instead.
@@ -68,6 +76,7 @@ pub fn connect_shared_store(config: &ScriptureConfig) -> Result<SharedStore, Box
     Ok(SharedStore {
         store,
         authority_counters: Arc::new(RequestCounters::default()),
+        blob_counters: Arc::new(RequestCounters::default()),
         backend,
         advertise,
         owner_id,
@@ -86,9 +95,17 @@ pub fn assemble_assignment_seams(
     // Mount DataRefs on the live serve path: sealed chunks become staging blobs
     // and the Verse log receives pointers. Without this the blob writer stays a
     // lab seam and requests-per-record cannot move.
+    //
+    // Count staging blob traffic on its own ledger. Building on the raw store
+    // would make PUTs invisible to every counter — the same class of defect the
+    // authority CountingStore was added to fix.
     if verse_config.dataref_blobs.is_none() {
+        let blob_store: Arc<dyn ObjectStore> = Arc::new(CountingStore::new(
+            Arc::clone(&shared.store),
+            Arc::clone(&shared.blob_counters),
+        ));
         verse_config.dataref_blobs = Some(DataRefBlobConfig::new(Arc::new(
-            ObjectStoreChunkBlobStore::new(Arc::clone(&shared.store)),
+            ObjectStoreChunkBlobStore::new(blob_store),
         )));
     }
     // The register and claim store carry the Serving-Authority traffic, which
@@ -124,7 +141,7 @@ pub fn assemble_assignment_seams(
         Arc::clone(&register),
         Arc::clone(&resolver),
         Arc::clone(&parts),
-        verse_config,
+        verse_config.clone(),
         Arc::clone(&claims),
     );
     Ok(AssembledNode {
@@ -136,6 +153,7 @@ pub fn assemble_assignment_seams(
         backend: shared.backend,
         store_root,
         advertise,
+        verse_config,
     })
 }
 
@@ -156,4 +174,70 @@ pub fn assemble_assignment(
     let verse_config = config.assignment_runtime_config(assignment)?;
     let advertise = config.assignment_advertise(assignment)?;
     assemble_assignment_seams(shared, &store_root, verse_config, advertise)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+    use scripture::{
+        ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, VerseId, WriterId,
+    };
+    use scripture_runtime::BackendProfile;
+    use std::time::Duration;
+
+    fn test_shared() -> SharedStore {
+        SharedStore {
+            store: Arc::new(InMemory::new()),
+            authority_counters: Arc::new(RequestCounters::default()),
+            blob_counters: Arc::new(RequestCounters::default()),
+            backend: BackendProfile::RustFs,
+            advertise: OwnerEndpoint::new("tcp://assemble-test:9000").expect("endpoint"),
+            owner_id: OwnerId::from_bytes(*b"assemble-owner!!"),
+            metrics: Arc::new(ObjectStoreMetrics::default()),
+        }
+    }
+
+    fn bare_verse_config() -> VerseRuntimeConfig {
+        VerseRuntimeConfig {
+            journal_id: JournalId::from_bytes(*b"assemble-jrnl!!!"),
+            verse_id: VerseId::from_bytes(*b"assemble-verse!!"),
+            owner_id: OwnerId::from_bytes(*b"assemble-owner!!"),
+            cohort_id: CohortId::from_bytes(*b"assemble-cohort!"),
+            writer_id: WriterId::from_bytes(*b"assemble-writer!"),
+            policy: ChunkPolicy {
+                max_chunk_bytes: 64 * 1024,
+                max_record_bytes: 16 * 1024,
+                max_chunk_records: 8,
+                max_chunk_age: Duration::from_secs(60),
+                max_buffered_bytes: 64 * 1024,
+                max_inflight_chunks: 1,
+                max_uncommitted_age: Duration::from_secs(60),
+                recovery_scan: RecoveryBound::new(8).expect("bound"),
+            },
+            recovery_bound: RecoveryBound::new(8).expect("bound"),
+            queue_capacity: 16,
+            dataref_blobs: None,
+        }
+    }
+
+    #[test]
+    fn assemble_mounts_dataref_blobs_onto_the_verse_config_passed_to_serve() {
+        let shared = test_shared();
+        let assembled = assemble_assignment_seams(
+            &shared,
+            "assemble-root",
+            bare_verse_config(),
+            shared.advertise.clone(),
+        )
+        .expect("assemble");
+        assert!(
+            assembled.verse_config.dataref_blobs.is_some(),
+            "assemble must mount DataRefs onto the config bootstrap_and_serve uses"
+        );
+        // A fresh config from the YAML path is still None — that is the bug this
+        // field exists to prevent. Serve must use assembled.verse_config, not a
+        // newly built assignment_runtime_config().
+        assert!(bare_verse_config().dataref_blobs.is_none());
+    }
 }

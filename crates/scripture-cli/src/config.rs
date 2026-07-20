@@ -539,11 +539,13 @@ impl ScriptureConfig {
 
 fn default_chunk_policy() -> ChunkPolicy {
     ChunkPolicy {
-        max_chunk_bytes: 64 * 1024,
+        // Sized so produce-lab can measure --records-per-submission up to 1000
+        // with modest payloads without rejecting the unit as SubmissionTooLarge.
+        max_chunk_bytes: 256 * 1024,
         max_record_bytes: 16 * 1024,
-        max_chunk_records: 256,
+        max_chunk_records: 1024,
         max_chunk_age: Duration::from_secs(60),
-        max_buffered_bytes: 256 * 1024,
+        max_buffered_bytes: 512 * 1024,
         max_inflight_chunks: 1,
         max_uncommitted_age: Duration::from_secs(60),
         recovery_scan: RecoveryBound::new(8).expect("bound"),

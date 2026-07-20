@@ -23,12 +23,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::assemble;
 use crate::config::ScriptureConfig;
 
-/// One committed record, kept so the run can be audited after the fact.
+/// One committed submission, kept so the run can be audited after the fact.
 #[derive(Debug, Clone)]
 struct AckSample {
     worker: usize,
+    /// First producer sequence covered by this submission.
     seq: u64,
     first_offset: u64,
+    /// Records covered by the ACK span (`next_offset - first_offset`).
+    record_count: u64,
     endpoint: String,
     /// Milliseconds from send to committed ACK.
     latency_ms: f64,
@@ -43,26 +46,35 @@ pub struct LabOptions {
     pub workers: usize,
     pub per_worker: u64,
     pub payload_bytes: usize,
+    /// Records packed into one Submission (authority amortisation lever).
+    pub records_per_submission: usize,
 }
 
 /// Object-store request counts scraped from a Scribe's `/status`.
 ///
 /// Read before and after a run so the report states requests *per record*
 /// rather than leaving an operator to diff two snapshots by hand. Throughput
-/// without the request count is only half the cost picture: on this path the
-/// authority reads dominate and do not amortise with batching, so a run that
-/// reports only records/second hides the term that actually bills.
+/// without the request count is only half the cost picture: authority reads
+/// dominate when submissions are size-one, and amortise at the submission
+/// boundary when `--records-per-submission` packs N records into one unit.
 #[derive(Debug, Clone, Copy, Default)]
 struct StoreCounters {
     data_puts: u64,
     data_gets: u64,
     authority_puts: u64,
     authority_gets: u64,
+    blob_puts: u64,
+    blob_gets: u64,
 }
 
 impl StoreCounters {
     fn total(&self) -> u64 {
-        self.data_puts + self.data_gets + self.authority_puts + self.authority_gets
+        self.data_puts
+            + self.data_gets
+            + self.authority_puts
+            + self.authority_gets
+            + self.blob_puts
+            + self.blob_gets
     }
 
     fn delta(self, before: Self) -> Self {
@@ -71,6 +83,8 @@ impl StoreCounters {
             data_gets: self.data_gets.saturating_sub(before.data_gets),
             authority_puts: self.authority_puts.saturating_sub(before.authority_puts),
             authority_gets: self.authority_gets.saturating_sub(before.authority_gets),
+            blob_puts: self.blob_puts.saturating_sub(before.blob_puts),
+            blob_gets: self.blob_gets.saturating_sub(before.blob_gets),
         }
     }
 }
@@ -97,6 +111,8 @@ async fn scrape_counters(status_bind: Option<&String>) -> Option<StoreCounters> 
         data_gets: field("store_gets="),
         authority_puts: field("authority_puts="),
         authority_gets: field("authority_gets="),
+        blob_puts: field("blob_puts="),
+        blob_gets: field("blob_gets="),
     })
 }
 
@@ -109,10 +125,18 @@ pub async fn produce_lab(
     let prefix = config.store.prefix.clone();
 
     println!(
-        "scripture produce-lab: canon={} verse={} workers={} per_worker={} payload_bytes={}",
-        options.canon, options.verse, options.workers, options.per_worker, options.payload_bytes
+        "scripture produce-lab: canon={} verse={} workers={} per_worker={} payload_bytes={} records_per_submission={}",
+        options.canon,
+        options.verse,
+        options.workers,
+        options.per_worker,
+        options.payload_bytes,
+        options.records_per_submission
     );
     println!("scripture produce-lab: this is a lab instrument; nothing here is optimised");
+    if options.records_per_submission == 0 {
+        return Err("records_per_submission must be >= 1".into());
+    }
 
     let before = scrape_counters(config.metrics.status_bind.as_ref()).await;
 
@@ -126,9 +150,12 @@ pub async fn produce_lab(
         let verse = options.verse.clone();
         let per_worker = options.per_worker;
         let payload_bytes = options.payload_bytes;
+        let records_per_submission = options.records_per_submission;
 
         handles.push(tokio::spawn(async move {
-            let mut acks: Vec<AckSample> = Vec::with_capacity(per_worker as usize);
+            let mut acks: Vec<AckSample> = Vec::with_capacity(
+                (per_worker / records_per_submission as u64).saturating_add(1) as usize,
+            );
             let mut failures: Vec<String> = Vec::new();
 
             // A generous attempt budget: a failover drill deliberately spends
@@ -152,33 +179,42 @@ pub async fn produce_lab(
                     }
                 };
 
-            for seq in 0..per_worker {
-                // Payload carries worker/seq so a readback can attribute every
-                // record, and is padded to the requested size.
-                let mut payload = format!("w{worker:03}-s{seq:08}-").into_bytes();
-                payload.resize(payload_bytes.max(payload.len()), b'x');
-                let record = match OutboundRecord::new(payload) {
-                    Ok(record) => record,
-                    Err(error) => {
-                        failures.push(format!(
-                            "w{worker} seq={seq}: cannot mint record id: {error}"
-                        ));
-                        break;
+            let mut seq = 0_u64;
+            while seq < per_worker {
+                let batch_n = ((per_worker - seq) as usize).min(records_per_submission);
+                let mut batch = Vec::with_capacity(batch_n);
+                for i in 0..batch_n {
+                    let record_seq = seq + i as u64;
+                    let mut payload = format!("w{worker:03}-s{record_seq:08}-").into_bytes();
+                    payload.resize(payload_bytes.max(payload.len()), b'x');
+                    match OutboundRecord::new(payload) {
+                        Ok(record) => batch.push(record),
+                        Err(error) => {
+                            failures.push(format!(
+                                "w{worker} seq={record_seq}: cannot mint record id: {error}"
+                            ));
+                            return (acks, failures);
+                        }
                     }
-                };
+                }
 
                 let sent = Instant::now();
-                match producer.send(&record).await {
-                    Ok(ack) => acks.push(AckSample {
-                        worker,
-                        seq,
-                        first_offset: ack.first_offset,
-                        endpoint: ack.endpoint.clone(),
-                        latency_ms: sent.elapsed().as_secs_f64() * 1000.0,
-                        at_s: start.elapsed().as_secs_f64(),
-                    }),
+                match producer.send_batch(&batch).await {
+                    Ok(ack) => {
+                        let span = ack.next_offset.saturating_sub(ack.first_offset);
+                        acks.push(AckSample {
+                            worker,
+                            seq,
+                            first_offset: ack.first_offset,
+                            record_count: span.max(1),
+                            endpoint: ack.endpoint.clone(),
+                            latency_ms: sent.elapsed().as_secs_f64() * 1000.0,
+                            at_s: start.elapsed().as_secs_f64(),
+                        });
+                    }
                     Err(error) => failures.push(format!("w{worker} seq={seq}: {error}")),
                 }
+                seq += batch_n as u64;
             }
             (acks, failures)
         }));
@@ -195,21 +231,24 @@ pub async fn produce_lab(
     let after = scrape_counters(config.metrics.status_bind.as_ref()).await;
 
     report(&acks, &failures, &options, wall);
-    report_cost(before, after, acks.len());
+    let committed_records: u64 = acks.iter().map(|a| a.record_count).sum();
+    report_cost(before, after, committed_records as usize);
     Ok(())
 }
 
 fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f64) {
     let requested = options.workers as u64 * options.per_worker;
+    let committed_records: u64 = acks.iter().map(|a| a.record_count).sum();
     println!("\n=== throughput ===");
     println!("wall_seconds={wall:.2}");
     println!(
-        "requested={requested} committed={} failed={}",
+        "requested_records={requested} committed_records={committed_records} committed_submissions={} failed_submissions={}",
         acks.len(),
         failures.len()
     );
+    println!("records_per_submission={}", options.records_per_submission);
     if wall > 0.0 {
-        let rps = acks.len() as f64 / wall;
+        let rps = committed_records as f64 / wall;
         println!(
             "records_per_second={rps:.1}  bytes_per_second={:.0}",
             rps * options.payload_bytes as f64
@@ -218,6 +257,7 @@ fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f
             "per_worker_records_per_second={:.1}",
             rps / options.workers.max(1) as f64
         );
+        println!("submissions_per_second={:.1}", acks.len() as f64 / wall);
     }
 
     if !acks.is_empty() {
@@ -237,24 +277,28 @@ fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f
 
     // Correctness evidence. Offsets are the log's own opinion of what it
     // accepted, so duplicates or gaps here are stronger than any client count.
+    // Multi-record submissions advance by record_count, not by one.
     println!("\n=== correctness evidence ===");
-    let mut offsets: Vec<u64> = acks.iter().map(|a| a.first_offset).collect();
-    offsets.sort_unstable();
-    let dupes = offsets.windows(2).filter(|w| w[0] == w[1]).count();
-    let gaps: Vec<(u64, u64)> = offsets
-        .windows(2)
-        .filter(|w| w[1] != w[0] + 1 && w[1] != w[0])
-        .map(|w| (w[0], w[1]))
+    let mut spans: Vec<(u64, u64)> = acks
+        .iter()
+        .map(|a| (a.first_offset, a.first_offset + a.record_count))
         .collect();
-    println!("duplicate_offsets={dupes}");
-    if let (Some(lo), Some(hi)) = (offsets.first(), offsets.last()) {
+    spans.sort_unstable_by_key(|(first, _)| *first);
+    let dupes = spans.windows(2).filter(|w| w[0].0 == w[1].0).count();
+    let gaps: Vec<(u64, u64)> = spans
+        .windows(2)
+        .filter(|w| w[1].0 != w[0].1)
+        .map(|w| (w[0].1, w[1].0))
+        .collect();
+    println!("duplicate_submission_starts={dupes}");
+    if let (Some((lo, _)), Some((_, hi))) = (spans.first(), spans.last()) {
         println!(
             "offset_range={lo}..{hi} contiguous={} gap_count={}",
             gaps.is_empty(),
             gaps.len()
         );
         for gap in gaps.iter().take(5) {
-            println!("  gap after {} -> {}", gap.0, gap.1);
+            println!("  gap {} -> {}", gap.0, gap.1);
         }
         if !gaps.is_empty() {
             println!(
@@ -307,14 +351,19 @@ fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f
     // Per-worker completeness catches a worker that silently stopped early.
     println!("\n=== per-worker ===");
     for worker in 0..options.workers {
-        let count = acks.iter().filter(|a| a.worker == worker).count();
+        let submissions = acks.iter().filter(|a| a.worker == worker).count();
+        let records: u64 = acks
+            .iter()
+            .filter(|a| a.worker == worker)
+            .map(|a| a.record_count)
+            .sum();
         let max_seq = acks
             .iter()
             .filter(|a| a.worker == worker)
             .map(|a| a.seq)
             .max();
         println!(
-            "  worker {worker}: committed={count}/{} highest_seq={max_seq:?}",
+            "  worker {worker}: committed_records={records}/{} submissions={submissions} highest_seq={max_seq:?}",
             options.per_worker
         );
     }
@@ -343,13 +392,23 @@ fn report_cost(before: Option<StoreCounters>, after: Option<StoreCounters>, comm
         d.authority_puts as f64 / n,
         d.authority_gets as f64 / n
     );
+    println!(
+        "blob_put={:.3} blob_get={:.3}",
+        d.blob_puts as f64 / n,
+        d.blob_gets as f64 / n
+    );
     println!("total_requests_per_record={:.3}", d.total() as f64 / n);
     let authority = (d.authority_puts + d.authority_gets) as f64;
     if d.total() > 0 {
         println!(
-            "authority_share={:.0}%  (does not amortise with batching)",
+            "authority_share={:.0}%  (amortises with --records-per-submission)",
             100.0 * authority / d.total() as f64
         );
+    }
+    if d.blob_puts == 0 {
+        println!("warning: blob_puts=0 — DataRefs may not be mounted on the serve path");
+    } else {
+        println!("staging_blob_puts_per_record={:.3}", d.blob_puts as f64 / n);
     }
     if d.data_puts > 0 {
         println!(

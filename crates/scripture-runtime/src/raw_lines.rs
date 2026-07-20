@@ -165,6 +165,7 @@ impl BatchingSnapshot {
 struct Pending {
     receipt: ReceiptFuture,
     payload_bytes: usize,
+    record_count: usize,
     budget_reserved: bool,
 }
 
@@ -216,14 +217,15 @@ where
                     return Ok(());
                 }
                 Ok(Some(payload)) => {
-                    if let Err(reason) = admit_line(
+                    if let Err(reason) = admit_payload(
                         &sink,
+                        &mut reader,
                         &mut pending,
                         &mut pending_bytes,
                         &mut sequence,
                         &mut exhausted,
                         producer_id,
-                        &config.attributes,
+                        &config,
                         payload,
                         &metrics,
                         &budgets,
@@ -248,10 +250,11 @@ where
                 biased;
                 result = &mut head.receipt => {
                     let payload_bytes = head.payload_bytes;
+                    let record_count = head.record_count;
                     let budget_reserved = head.budget_reserved;
                     let _ = pending.pop_front();
                     pending_bytes = pending_bytes.saturating_sub(payload_bytes);
-                    release_budget(&budgets, budget_reserved, payload_bytes);
+                    release_budget(&budgets, budget_reserved, record_count, payload_bytes);
                     match result {
                         Ok(receipt) => {
                             write_ok(&mut writer, &receipt).await?;
@@ -280,14 +283,15 @@ where
                             .await;
                         }
                         Ok(Some(payload)) => {
-                            if let Err(reason) = admit_line(
+                            if let Err(reason) = admit_payload(
                                 &sink,
+                                &mut reader,
                                 &mut pending,
                                 &mut pending_bytes,
                                 &mut sequence,
                                 &mut exhausted,
                                 producer_id,
-                                &config.attributes,
+                                &config,
                                 payload,
                                 &metrics,
                                 &budgets,
@@ -337,10 +341,11 @@ where
             let head = pending.front_mut().expect("non-empty");
             let result = (&mut head.receipt).await;
             let payload_bytes = head.payload_bytes;
+            let record_count = head.record_count;
             let budget_reserved = head.budget_reserved;
             let _ = pending.pop_front();
             pending_bytes = pending_bytes.saturating_sub(payload_bytes);
-            release_budget(&budgets, budget_reserved, payload_bytes);
+            release_budget(&budgets, budget_reserved, record_count, payload_bytes);
             match result {
                 Ok(receipt) => {
                     write_ok(&mut writer, &receipt).await?;
@@ -360,9 +365,14 @@ where
     }
 }
 
-fn release_budget(budgets: &Option<IngressBudgets>, reserved: bool, payload_bytes: usize) {
+fn release_budget(
+    budgets: &Option<IngressBudgets>,
+    reserved: bool,
+    record_count: usize,
+    payload_bytes: usize,
+) {
     if reserved && let Some(budgets) = budgets {
-        budgets.release_pending(1, payload_bytes);
+        budgets.release_pending(record_count, payload_bytes);
     }
 }
 
@@ -402,7 +412,71 @@ async fn read_capped_line<R: AsyncRead + Unpin>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn admit_line<S: RawLinesSink>(
+async fn admit_payload<R, S>(
+    sink: &S,
+    reader: &mut BufReader<R>,
+    pending: &mut VecDeque<Pending>,
+    pending_bytes: &mut usize,
+    sequence: &mut u64,
+    exhausted: &mut bool,
+    producer_id: ProducerId,
+    config: &RawLinesConfig,
+    first_line: Vec<u8>,
+    metrics: &Option<Arc<RawLinesConnectionMetrics>>,
+    budgets: &Option<IngressBudgets>,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+    S: RawLinesSink,
+{
+    // Lab / internal multi-record framing: `BATCH N` followed by N payload
+    // lines becomes one Submission. This is not a public producer protocol —
+    // raw-lines remains line-oriented for ordinary traffic (N=1).
+    let payloads = if let Some(count) = parse_batch_header(&first_line) {
+        if count == 0 {
+            return Err("BATCH count must be >= 1".into());
+        }
+        let mut lines = Vec::with_capacity(count);
+        for _ in 0..count {
+            match read_capped_line(reader, config.max_line_bytes).await {
+                Ok(Some(line)) => lines.push(line),
+                Ok(None) => {
+                    return Err("BATCH truncated: connection closed before all records".into());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        lines
+    } else {
+        vec![first_line]
+    };
+    admit_records(
+        sink,
+        pending,
+        pending_bytes,
+        sequence,
+        exhausted,
+        producer_id,
+        &config.attributes,
+        payloads,
+        metrics,
+        budgets,
+    )
+    .await
+}
+
+/// Parses `BATCH <n>` control lines used by produce-lab multi-record submits.
+fn parse_batch_header(payload: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("BATCH ")?;
+    if rest.is_empty() || rest.as_bytes().iter().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_records<S: RawLinesSink>(
     sink: &S,
     pending: &mut VecDeque<Pending>,
     pending_bytes: &mut usize,
@@ -410,16 +484,20 @@ async fn admit_line<S: RawLinesSink>(
     exhausted: &mut bool,
     producer_id: ProducerId,
     attributes: &BTreeMap<String, AttributeValue>,
-    payload: Vec<u8>,
+    payloads: Vec<Vec<u8>>,
     metrics: &Option<Arc<RawLinesConnectionMetrics>>,
     budgets: &Option<IngressBudgets>,
 ) -> Result<(), String> {
     if *exhausted {
         return Err("producer sequence space exhausted".into());
     }
-    let payload_bytes = payload.len();
+    if payloads.is_empty() {
+        return Err("submission carries no records".into());
+    }
+    let record_count = payloads.len();
+    let payload_bytes: usize = payloads.iter().map(Vec::len).sum();
     let budget_reserved = if let Some(budgets) = budgets {
-        if !budgets.try_reserve_pending(1, payload_bytes) {
+        if !budgets.try_reserve_pending(record_count, payload_bytes) {
             return Err("node/assignment pending budget exhausted".into());
         }
         true
@@ -430,10 +508,13 @@ async fn admit_line<S: RawLinesSink>(
         producer_id,
         producer_epoch: 0,
         sequence: *sequence,
-        records: vec![Record {
-            attributes: attributes.clone(),
-            payload: Bytes::from(payload),
-        }],
+        records: payloads
+            .into_iter()
+            .map(|payload| Record {
+                attributes: attributes.clone(),
+                payload: Bytes::from(payload),
+            })
+            .collect(),
     };
     match next_producer_sequence(*sequence) {
         Some(next) => *sequence = next,
@@ -442,13 +523,14 @@ async fn admit_line<S: RawLinesSink>(
     let receipt = match sink.submit(submission).await {
         Ok(receipt) => receipt,
         Err(error) => {
-            release_budget(budgets, budget_reserved, payload_bytes);
+            release_budget(budgets, budget_reserved, record_count, payload_bytes);
             return Err(error);
         }
     };
     pending.push_back(Pending {
         receipt,
         payload_bytes,
+        record_count,
         budget_reserved,
     });
     *pending_bytes = pending_bytes.saturating_add(payload_bytes);
@@ -469,7 +551,12 @@ async fn drain_all<W: AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     while let Some(mut front) = pending.pop_front() {
         *pending_bytes = pending_bytes.saturating_sub(front.payload_bytes);
-        release_budget(budgets, front.budget_reserved, front.payload_bytes);
+        release_budget(
+            budgets,
+            front.budget_reserved,
+            front.record_count,
+            front.payload_bytes,
+        );
         match (&mut front.receipt).await {
             Ok(receipt) => {
                 write_ok(writer, &receipt).await?;
@@ -544,11 +631,18 @@ mod tests {
         );
     }
 
+    type HeldReceipt = (
+        oneshot::Sender<Result<Receipt, scripture::DriverError>>,
+        u64,
+    );
+
     /// Sink that holds every receipt until `release_all` — models wedged receipts.
     struct WedgedSink {
-        held: Mutex<Vec<oneshot::Sender<Result<Receipt, scripture::DriverError>>>>,
+        held: Mutex<Vec<HeldReceipt>>,
         admitted: Mutex<u64>,
         flushes: Mutex<u64>,
+        /// Sum of records across admitted submissions (BATCH path).
+        admitted_records: Mutex<u64>,
     }
 
     impl WedgedSink {
@@ -557,11 +651,16 @@ mod tests {
                 held: Mutex::new(Vec::new()),
                 admitted: Mutex::new(0),
                 flushes: Mutex::new(0),
+                admitted_records: Mutex::new(0),
             })
         }
 
         fn admitted(&self) -> u64 {
             *self.admitted.lock().expect("admitted")
+        }
+
+        fn admitted_records(&self) -> u64 {
+            *self.admitted_records.lock().expect("admitted_records")
         }
 
         fn held_count(&self) -> usize {
@@ -570,9 +669,11 @@ mod tests {
 
         fn release_all(&self) {
             let senders = std::mem::take(&mut *self.held.lock().expect("held"));
-            for (index, sender) in senders.into_iter().enumerate() {
-                let offset = RecordOffset::new(index as u64);
-                let next = RecordOffset::new(index as u64 + 1);
+            let mut cursor = 0_u64;
+            for (index, (sender, record_count)) in senders.into_iter().enumerate() {
+                let offset = RecordOffset::new(cursor);
+                let next = RecordOffset::new(cursor + record_count);
+                cursor += record_count;
                 let _ = sender.send(Ok(Receipt {
                     level: AckLevel::Committed,
                     journal_id: JournalId::from_bytes(*b"rawlines-bounds!"),
@@ -588,13 +689,15 @@ mod tests {
     }
 
     impl RawLinesSink for Arc<WedgedSink> {
-        async fn submit(
-            &self,
-            _submission: scripture::Submission,
-        ) -> Result<ReceiptFuture, String> {
+        async fn submit(&self, submission: scripture::Submission) -> Result<ReceiptFuture, String> {
             let (tx, rx) = oneshot::channel();
-            self.held.lock().expect("held").push(tx);
+            self.held
+                .lock()
+                .expect("held")
+                .push((tx, submission.records.len() as u64));
             *self.admitted.lock().expect("admitted") += 1;
+            *self.admitted_records.lock().expect("admitted_records") +=
+                submission.records.len() as u64;
             Ok(ReceiptFuture::from_receiver(rx))
         }
 
@@ -749,5 +852,51 @@ mod tests {
         let _ = pipeline.await;
         assert!(sink.admitted() <= 3);
         assert!(metrics.snapshot().committed_ok <= sink.admitted());
+    }
+
+    #[tokio::test]
+    async fn batch_header_admits_one_submission_spanning_n_records() {
+        let sink = WedgedSink::new();
+        let metrics = Arc::new(RawLinesConnectionMetrics::default());
+        let config = RawLinesConfig {
+            max_line_bytes: 64,
+            max_pending_records: 8,
+            max_pending_bytes: 1024,
+            idle_flush: None,
+            attributes: Default::default(),
+        };
+        let (mut client, server) = duplex(4096);
+        let (reader, writer) = tokio::io::split(server);
+        let pipeline = {
+            let sink = Arc::clone(&sink);
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(async move {
+                serve_raw_lines_pipeline(reader, writer, sink, config, 0, Some(metrics), None).await
+            })
+        };
+        client
+            .write_all(b"BATCH 3\none\ntwo\nthree\n")
+            .await
+            .expect("write");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(sink.admitted(), 1, "BATCH is one submission");
+        assert_eq!(sink.admitted_records(), 3);
+        sink.release_all();
+        client.shutdown().await.expect("shutdown");
+        for _ in 0..10 {
+            if pipeline.is_finished() {
+                break;
+            }
+            sink.release_all();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.lines().any(|line| line == "OK 0 3"),
+            "one receipt must span all three records; got {text:?}"
+        );
+        let _ = pipeline.await;
     }
 }

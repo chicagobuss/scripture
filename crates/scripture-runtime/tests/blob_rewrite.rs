@@ -121,6 +121,37 @@ impl DataRefAppendTarget for WriterTarget {
             .push(encode_data_ref(data_ref).expect("encode").to_vec());
         Ok(ack)
     }
+
+    async fn append_data_refs(
+        &mut self,
+        items: &[(&SealedChunk, &DataRef)],
+    ) -> Result<ChunkAppendAck, scripture_runtime::BlobWriterError> {
+        match items {
+            [] => Err(scripture_runtime::BlobWriterError::Invariant(
+                "append_data_refs requires at least one DataRef".into(),
+            )),
+            [(sealed, data_ref)] => self.append_data_ref(sealed, data_ref).await,
+            _ => {
+                let ack = self
+                    .writer
+                    .lock()
+                    .await
+                    .append_reference_batch(items)
+                    .await?;
+                let batch: Vec<DataRef> = items.iter().map(|(_, r)| (*r).clone()).collect();
+                self.payloads.lock().expect("payloads").push(
+                    scripture::encode_reference_batch(&batch)
+                        .expect("encode batch")
+                        .to_vec(),
+                );
+                let mut refs = self.refs.lock().expect("refs");
+                for data_ref in batch {
+                    refs.push(data_ref);
+                }
+                Ok(ack)
+            }
+        }
+    }
 }
 
 struct SupersedingTarget {
@@ -615,10 +646,14 @@ async fn rewrite_measurement_per_verse_objects_and_single_get() {
     let rewritten_keys: BTreeSet<String> = all
         .iter()
         .filter_map(|payload| {
-            let LogPayload::DataRef(data_ref) = scripture::decode_log_payload(payload).ok()? else {
-                return None;
+            let refs = match scripture::decode_log_payload(payload).ok()? {
+                LogPayload::DataRef(data_ref) => vec![data_ref],
+                LogPayload::ReferenceBatch(refs) => refs,
+                LogPayload::InlineChunk(_) => return None,
             };
-            is_rewritten_blob_key(&data_ref.blob_key, &config).then_some(data_ref.blob_key.clone())
+            refs.into_iter().find_map(|data_ref| {
+                is_rewritten_blob_key(&data_ref.blob_key, &config).then_some(data_ref.blob_key)
+            })
         })
         .collect();
     assert_eq!(rewritten_keys.len(), 2, "one rewritten object per Verse");
@@ -694,6 +729,9 @@ async fn shared_staging_blob_is_not_collectable_from_one_verses_payloads() {
             Ok(scripture::LogPayload::DataRef(data_ref)) => {
                 data_ref.chunk_id == ChunkId::from_bytes([1; 16])
             }
+            Ok(scripture::LogPayload::ReferenceBatch(refs)) => refs
+                .iter()
+                .any(|data_ref| data_ref.chunk_id == ChunkId::from_bytes([1; 16])),
             _ => false,
         })
         .cloned()

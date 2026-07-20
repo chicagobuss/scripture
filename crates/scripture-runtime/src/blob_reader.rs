@@ -1,9 +1,9 @@
-//! Resolve Holylog payloads that may be inline chunks or DataRefs.
+//! Resolve Holylog payloads that may be inline chunks, DataRefs, or ReferenceBatches.
 //!
 //! Readers must not assume every log entry is an inline `SCRC` chunk. A DataRef
-//! (`SRDF`) is resolved only after verifying both the blob and the exact chunk
-//! evidence it names. Adjacent DataRefs retain a coalescing plan for a future
-//! verified range-read cache.
+//! (`SRDF`) or ReferenceBatch (`SRRB`) is resolved only after verifying both the
+//! blob and the exact chunk evidence each pointer names. Adjacent DataRefs
+//! retain a coalescing plan for a future verified range-read cache.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use scripture::{
 /// Failures resolving a log payload into decoded chunk(s).
 #[derive(Debug, thiserror::Error)]
 pub enum BlobReadError {
-    /// Payload was neither a chunk nor a DataRef.
+    /// Payload was neither a chunk, a DataRef, nor a ReferenceBatch.
     #[error(transparent)]
     Payload(#[from] DataRefError),
     /// Chunk bytes were malformed.
@@ -49,28 +49,42 @@ pub struct ResolvedChunk {
     pub data_ref: Option<DataRef>,
 }
 
-/// Resolves one Holylog payload into a decoded chunk.
+/// Resolves one Holylog payload into one or more decoded chunks.
+///
+/// A ReferenceBatch expands to one [`ResolvedChunk`] per member DataRef.
 pub async fn resolve_log_payload(
     store: &Arc<dyn ObjectStore>,
     payload: &[u8],
-) -> Result<ResolvedChunk, BlobReadError> {
+) -> Result<Vec<ResolvedChunk>, BlobReadError> {
     match decode_log_payload(payload)? {
-        LogPayload::InlineChunk(bytes) => Ok(ResolvedChunk {
+        LogPayload::InlineChunk(bytes) => Ok(vec![ResolvedChunk {
             chunk: decode_chunk(&bytes)?,
             data_ref: None,
-        }),
-        LogPayload::DataRef(data_ref) => {
-            let bytes = fetch_data_ref(store, &data_ref).await?;
-            let chunk = decode_chunk(&bytes)?;
-            if chunk.header.chunk_id != data_ref.chunk_id {
-                return Err(BlobReadError::ChunkIdMismatch);
+        }]),
+        LogPayload::DataRef(data_ref) => Ok(vec![resolve_one_data_ref(store, data_ref).await?]),
+        LogPayload::ReferenceBatch(refs) => {
+            let mut out = Vec::with_capacity(refs.len());
+            for data_ref in refs {
+                out.push(resolve_one_data_ref(store, data_ref).await?);
             }
-            Ok(ResolvedChunk {
-                chunk,
-                data_ref: Some(data_ref),
-            })
+            Ok(out)
         }
     }
+}
+
+async fn resolve_one_data_ref(
+    store: &Arc<dyn ObjectStore>,
+    data_ref: DataRef,
+) -> Result<ResolvedChunk, BlobReadError> {
+    let bytes = fetch_data_ref(store, &data_ref).await?;
+    let chunk = decode_chunk(&bytes)?;
+    if chunk.header.chunk_id != data_ref.chunk_id {
+        return Err(BlobReadError::ChunkIdMismatch);
+    }
+    Ok(ResolvedChunk {
+        chunk,
+        data_ref: Some(data_ref),
+    })
 }
 
 /// Fetches and verifies the object before extracting the exact referenced range.
