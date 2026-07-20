@@ -10,6 +10,7 @@ pub mod canon;
 pub mod chunk;
 pub mod chunklog;
 pub mod clock;
+pub mod dataref;
 pub mod driver;
 pub mod journal;
 pub mod model;
@@ -36,6 +37,10 @@ pub use chunklog::{
 pub use clock::{
     BatchAccumulator, BatchPolicy, Clock, ManualClock, ManualTimer, PushResult, SystemClock,
     SystemTimer, Timer,
+};
+pub use dataref::{
+    DataRef, DataRefError, LogPayload, MAX_BLOB_KEY_BYTES, decode_data_ref, decode_log_payload,
+    encode_data_ref,
 };
 pub use driver::{
     AckLevel, ChunkDriverActor, ChunkDriverHandle, ChunkPolicy, DriverError, DriverMetrics,

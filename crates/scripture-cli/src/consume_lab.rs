@@ -18,8 +18,9 @@ use holylog::virtual_log::{ConditionalRegister, LogletResolver, VirtualLog};
 use holylog_object_store::{ObjectStoreMetrics, WritePolicy};
 use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
 use object_store::path::Path;
-use scripture::decode_chunk;
-use scripture_runtime::{ObjectStorePartsFactory, PartsFactory, ProcessLogletResolver};
+use scripture_runtime::{
+    ObjectStorePartsFactory, PartsFactory, ProcessLogletResolver, resolve_log_payload,
+};
 
 use crate::assemble;
 use crate::config::{AssignmentConfig, ScriptureConfig};
@@ -101,8 +102,9 @@ pub async fn consume_lab(
         let mut advanced = false;
         while cursor < end {
             let entry = log.read_next(cursor, end).await?;
-            let chunk = decode_chunk(&entry.payload)?;
-            let in_entry: u64 = chunk
+            let resolved = resolve_log_payload(&shared.store, &entry.payload).await?;
+            let in_entry: u64 = resolved
+                .chunk
                 .frames
                 .iter()
                 .map(|frame| frame.records.len() as u64)

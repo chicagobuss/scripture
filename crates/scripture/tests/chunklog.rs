@@ -739,3 +739,39 @@ fn virtual_recovery_fails_closed_when_canon_advances_mid_recovery() {
         ));
     });
 }
+
+#[test]
+fn append_data_ref_writes_pointer_not_chunk_bytes() {
+    use scripture::{ChunkDigest, DataRef, LogPayload, decode_log_payload};
+    block_on(async {
+        let drive: Arc<dyn LogDrive> = Arc::new(InMemoryLogDrive::new());
+        let log = AtomicLog::builder(Arc::clone(&drive), 0)
+            .build()
+            .expect("log");
+        let mut writer = ChunkLogWriter::new(journal(), cohort(), 4, log, RecordOffset::new(0));
+        let sealed = chunk(1, 0, 2);
+        let data_ref = DataRef {
+            blob_key: "blobs/v1/demo".into(),
+            offset: 32,
+            length: sealed.bytes.len() as u64,
+            record_count: 2,
+            chunk_id: sealed.chunk_id,
+            chunk_digest: sealed.digest,
+            blob_digest: ChunkDigest::of(b"blob evidence"),
+        };
+        let ack = writer
+            .append_data_ref(&sealed, &data_ref)
+            .await
+            .expect("append dataref");
+        assert_eq!(ack.record_count, 2);
+        assert_eq!(ack.first_offset, RecordOffset::new(0));
+        assert_eq!(writer.next_offset(), RecordOffset::new(2));
+
+        let log = AtomicLog::builder(drive, 0).build().expect("log2");
+        let entry = log.read_next(0, 1).await.expect("read");
+        match decode_log_payload(&entry.payload).expect("dispatch") {
+            LogPayload::DataRef(decoded) => assert_eq!(decoded, data_ref),
+            LogPayload::InlineChunk(_) => panic!("expected DataRef payload"),
+        }
+    });
+}

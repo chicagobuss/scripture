@@ -13,6 +13,7 @@ use crate::canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, OwnerId, VerseId, observe_canon_authority,
 };
 use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
+use crate::dataref::{DataRef, DataRefError, encode_data_ref};
 use crate::model::{JournalId, RecordOffset};
 use crate::sequencer_key::sequencer_request_key_for_chunk;
 
@@ -138,6 +139,23 @@ pub enum ChunkLogError {
     /// Chunk bytes are malformed.
     #[error(transparent)]
     Chunk(#[from] ChunkError),
+    /// DataRef codec / validation failed.
+    #[error(transparent)]
+    DataRef(#[from] DataRefError),
+    /// DataRef record_count does not match the sealed chunk frame.
+    #[error("dataref record_count {actual} does not match sealed chunk frame {expected}")]
+    DataRefRecordCountMismatch {
+        /// Count from the sealed chunk.
+        expected: u32,
+        /// Count declared on the DataRef.
+        actual: u32,
+    },
+    /// A DataRef must name the exact sealed chunk that will be appended.
+    #[error("dataref chunk identity does not match sealed chunk")]
+    DataRefChunkIdMismatch,
+    /// A DataRef must carry the digest of the exact sealed bytes.
+    #[error("dataref chunk digest does not match sealed chunk")]
+    DataRefChunkDigestMismatch,
     /// A chunk belongs to another cohort.
     #[error("chunk cohort does not match this writer")]
     CohortMismatch,
@@ -369,6 +387,90 @@ impl ChunkLogWriter {
             .log
             .append(
                 chunk.bytes.clone(),
+                self.generation,
+                index.header.writer_id,
+                chunk.chunk_id,
+            )
+            .await?;
+        self.poisoned = false;
+        self.next_offset = next_offset;
+        Ok(ChunkAppendAck {
+            slot,
+            chunk_id: chunk.chunk_id,
+            first_offset: frame.base_offset,
+            next_offset,
+            record_count: frame.record_count,
+        })
+    }
+
+    /// Appends a DataRef for an already-sealed chunk instead of the chunk bytes.
+    ///
+    /// Validates the sealed chunk against this writer exactly as [`Self::append`]
+    /// does (cohort, generation, journal, dense offset), then writes only the
+    /// encoded pointer. The blob PUT is the caller's responsibility and grants
+    /// nothing — authority fencing lives on this append.
+    pub async fn append_data_ref(
+        &mut self,
+        chunk: &SealedChunk,
+        data_ref: &DataRef,
+    ) -> Result<ChunkAppendAck, ChunkLogError> {
+        if self.poisoned {
+            return Err(ChunkLogError::Poisoned);
+        }
+        data_ref.validate()?;
+        let index = decode_index(&chunk.bytes)?;
+        if index.header.chunk_id != chunk.chunk_id || ChunkDigest::of(&chunk.bytes) != chunk.digest
+        {
+            return Err(ChunkLogError::SealedMetadataMismatch);
+        }
+        if index.header.cohort_id != self.cohort_id {
+            return Err(ChunkLogError::CohortMismatch);
+        }
+        if index.header.generation != self.generation {
+            return Err(ChunkLogError::GenerationMismatch {
+                expected: self.generation,
+                actual: index.header.generation,
+            });
+        }
+        let [frame] = index.frames.as_slice() else {
+            return Err(ChunkLogError::JournalFrameMismatch {
+                journal: self.journal_id,
+            });
+        };
+        if frame.journal_id != self.journal_id {
+            return Err(ChunkLogError::JournalFrameMismatch {
+                journal: self.journal_id,
+            });
+        }
+        if frame.base_offset != self.next_offset {
+            return Err(ChunkLogError::OffsetDiscontinuity {
+                expected: self.next_offset.get(),
+                actual: frame.base_offset.get(),
+            });
+        }
+        if data_ref.record_count != frame.record_count {
+            return Err(ChunkLogError::DataRefRecordCountMismatch {
+                expected: frame.record_count,
+                actual: data_ref.record_count,
+            });
+        }
+        if data_ref.chunk_id != chunk.chunk_id {
+            return Err(ChunkLogError::DataRefChunkIdMismatch);
+        }
+        if data_ref.chunk_digest != chunk.digest {
+            return Err(ChunkLogError::DataRefChunkDigestMismatch);
+        }
+        let next_offset = frame
+            .base_offset
+            .checked_add(frame.record_count as usize)
+            .ok_or(ChunkError::OffsetOverflow)?;
+        let payload = encode_data_ref(data_ref)?;
+
+        self.poisoned = true;
+        let slot = self
+            .log
+            .append(
+                payload,
                 self.generation,
                 index.header.writer_id,
                 chunk.chunk_id,

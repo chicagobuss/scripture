@@ -157,7 +157,15 @@ pub async fn produce_lab(
                 // record, and is padded to the requested size.
                 let mut payload = format!("w{worker:03}-s{seq:08}-").into_bytes();
                 payload.resize(payload_bytes.max(payload.len()), b'x');
-                let record = OutboundRecord::new(payload);
+                let record = match OutboundRecord::new(payload) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        failures.push(format!(
+                            "w{worker} seq={seq}: cannot mint record id: {error}"
+                        ));
+                        break;
+                    }
+                };
 
                 let sent = Instant::now();
                 match producer.send(&record).await {

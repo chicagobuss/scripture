@@ -173,7 +173,8 @@ fn assert_malformed(decision: &AuthorityGateDecision) {
         matches!(
             decision,
             AuthorityGateDecision::Denied {
-                reason: AuthorityGateDenial::AuthorityMalformed { .. }
+                reason: AuthorityGateDenial::AuthorityMalformed { .. },
+                ..
             }
         ),
         "expected AuthorityMalformed, got {decision:?}"

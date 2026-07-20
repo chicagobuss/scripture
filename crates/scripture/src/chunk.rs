@@ -96,6 +96,12 @@ impl ChunkDigest {
         Self(*blake3::hash(bytes).as_bytes())
     }
 
+    /// Constructs a digest from its durable 32-byte representation.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Returns the durable representation.
     #[must_use]
     pub const fn as_bytes(self) -> [u8; 32] {

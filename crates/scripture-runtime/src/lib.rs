@@ -7,6 +7,8 @@
 mod assignment_root;
 mod authority_bootstrap;
 mod authority_gate;
+pub mod blob_reader;
+pub mod blob_writer;
 pub mod counting_store;
 mod credentials;
 pub mod directory;
@@ -23,6 +25,15 @@ mod status;
 pub use assignment_root::assignment_durable_root;
 pub use authority_bootstrap::bootstrap_authority_domain;
 pub use authority_gate::{AuthorityGateDecision, AuthorityGateDenial, evaluate_authority_gate};
+pub use blob_reader::{
+    BlobReadError, CoalescedGet, ResolvedChunk, fetch_data_ref, plan_coalesced_gets,
+    resolve_data_refs_coalesced, resolve_log_payload,
+};
+pub use blob_writer::{
+    BlobCutReason, BlobEnvelope, BlobEnvelopeSource, BlobWriter, BlobWriterConfig, BlobWriterError,
+    CutPlan, DEFAULT_MAX_LINGER, DEFAULT_TARGET_BLOB_BYTES, DataRefAppendTarget,
+    PlacementCommitOutcome, VerseSealer, commit_cut_plan,
+};
 pub use credentials::{CredentialError, StoreCredentials, resolve_credentials};
 pub use ha_session::{
     HaActivationError, HaAdmissionError, HaServingSession, bootstrap_and_serve, promote_and_serve,

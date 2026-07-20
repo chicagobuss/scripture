@@ -50,13 +50,10 @@ pub struct RecordId([u8; 16]);
 
 impl RecordId {
     /// Mint a fresh random identity.
-    #[must_use]
-    pub fn new() -> Self {
+    pub fn try_new() -> Result<Self, getrandom::Error> {
         let mut bytes = [0_u8; 16];
-        // Fall back to zeros only if the OS RNG is unavailable; tests still
-        // pass explicit ids when they need deterministic assertions.
-        let _ = getrandom::fill(&mut bytes);
-        Self(bytes)
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(bytes))
     }
 
     /// Build from an explicit 16-byte identity.
@@ -78,12 +75,6 @@ impl RecordId {
     }
 }
 
-impl Default for RecordId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// One record ready to send: stable id plus opaque payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundRecord {
@@ -95,12 +86,11 @@ pub struct OutboundRecord {
 
 impl OutboundRecord {
     /// Mint a fresh id for `payload`.
-    #[must_use]
-    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
-        Self {
-            id: RecordId::new(),
+    pub fn new(payload: impl Into<Vec<u8>>) -> Result<Self, getrandom::Error> {
+        Ok(Self {
+            id: RecordId::try_new()?,
             payload: payload.into(),
-        }
+        })
     }
 
     /// Use a caller-supplied identity (tests, outbox replay).
@@ -1130,7 +1120,7 @@ mod tests {
                 .await
                 .expect("open");
 
-        let record = OutboundRecord::new(b"follows-redirect".to_vec());
+        let record = OutboundRecord::new(b"follows-redirect".to_vec()).expect("os rng");
         let ack = producer
             .send(&record)
             .await
@@ -1165,7 +1155,7 @@ mod tests {
                 .await
                 .expect("open");
 
-        let record = OutboundRecord::new(b"survives-stale-roster".to_vec());
+        let record = OutboundRecord::new(b"survives-stale-roster".to_vec()).expect("os rng");
         let ack = producer
             .send(&record)
             .await
@@ -1241,7 +1231,7 @@ mod tests {
                 .await
                 .expect("open");
 
-        let record = OutboundRecord::new(b"hello");
+        let record = OutboundRecord::new(b"hello").expect("os rng");
         let id = record.id;
         let ack = producer.send(&record).await.expect("ack");
         assert_eq!(ack.record_id, id);
@@ -1291,7 +1281,7 @@ mod tests {
         let mut producer = RoutingProducer::open_with_source(source, "canon-a", "verse-a", policy)
             .await
             .expect("open");
-        let record = OutboundRecord::new(b"alone");
+        let record = OutboundRecord::new(b"alone").expect("os rng");
         let err = producer.send(&record).await.expect_err("exhaust");
         assert!(matches!(err, ProducerRoutingError::Exhausted { .. }));
     }
