@@ -9,6 +9,7 @@ use holylog::virtual_log::{
     ConditionalRegister, FenceUpdate, LogletResolver, VirtualLog, VirtualLogError,
 };
 use scripture::canon::OwnerId;
+use scripture::root_authority::{RootAuthority, observe_root_authority};
 use scripture::serving_authority::{
     AuthorityKey, AuthorityState, FoundationPrecondition, JournalGenerationRef, RouteHint,
     ServingAuthorityRecord, TransitionId, TransitionIntent, TransitionKind, WriterAuthority,
@@ -264,19 +265,13 @@ impl AuthorityCoordinator {
         match self.virtual_log().observe_membership().await {
             Err(VirtualLogError::Uninitialized) => Ok(ObservedRootAuthority::Uninitialized),
             Err(error) => Err(CoordinatorError::Root(error)),
-            Ok(observed) => {
-                if observed.state.application_fence.as_bytes().is_empty() {
-                    return Ok(ObservedRootAuthority::AbsentOrMalformed { message: None });
+            Ok(observed) => Ok(match observe_root_authority(&observed.state) {
+                RootAuthority::Uninitialized => ObservedRootAuthority::Uninitialized,
+                RootAuthority::AbsentOrMalformed { message } => {
+                    ObservedRootAuthority::AbsentOrMalformed { message }
                 }
-                match ServingAuthorityRecord::decode_application_fence(
-                    &observed.state.application_fence,
-                ) {
-                    Ok(record) => Ok(ObservedRootAuthority::Record(Box::new(record))),
-                    Err(error) => Ok(ObservedRootAuthority::AbsentOrMalformed {
-                        message: Some(error.to_string()),
-                    }),
-                }
-            }
+                RootAuthority::Record(record) => ObservedRootAuthority::Record(record),
+            }),
         }
     }
 

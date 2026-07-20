@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use crate::chunk::ProducerId;
-use crate::driver::Submission;
-use crate::model::{AttributeValue, JournalId, Record};
+use scripture::chunk::ProducerId;
+use scripture::driver::Submission;
+use scripture::model::{AttributeValue, JournalId, Record};
 
 use super::progress::ProgressIdentity;
 
@@ -396,7 +396,7 @@ fn take_len_bytes<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8], SpoolFrameError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::AttributeValue;
+    use scripture::model::AttributeValue;
     use bytes::Bytes;
 
     fn sample_submission() -> SpoolFrame {

@@ -13,7 +13,8 @@ use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scripture::{FileSpoolStorage, SpoolCell, SpoolCellHandle, SpoolConfig, SystemClock};
+use scripture::SystemClock;
+use scripture_producer::{FileSpoolStorage, SpoolCell, SpoolCellHandle, SpoolConfig};
 use scripture_runtime::{
     RawLinesConfig, VerseControlOutcome, disposition_label, is_ready_to_serve,
     serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_spool, status_body,

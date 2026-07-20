@@ -11,12 +11,16 @@ use futures::future::poll_fn;
 use futures::task::SpawnExt;
 use holylog::atomic::AtomicLog;
 use holylog::drive::LogDrive;
+use holylog::virtual_log::LogletId;
 use scripture::{
-    AttributeValue, ChunkDriverActor, ChunkLogWriter, FileSpoolStorage, FrameClassification,
-    InMemorySpoolStorage, ManualClock, ManualTimer, ProducerId, ProgressIdentity, Record,
-    RecordOffset, RecoveryClassification, ScanTail, SpoolCell, SpoolCellHandle, SpoolConfig,
-    SpoolError, SpoolFrame, SpoolPoisonCause, SpoolStorage, SpoolStorageFaults, Submission,
-    ValidFrame, classify_frames, decode_spool_frame, encode_spool_frame, scan_and_classify,
+    AttributeValue, ChunkDriverActor, ChunkLogWriter, ManualClock, ManualTimer, ProducerId,
+    Record, RecordOffset, Submission, WriterId,
+};
+use scripture_producer::{
+    FileSpoolStorage, FrameClassification, InMemorySpoolStorage, ProgressIdentity,
+    RecoveryClassification, ScanTail, SpoolCell, SpoolCellHandle, SpoolCellState, SpoolConfig,
+    SpoolError, SpoolFrame, SpoolPoisonCause, SpoolStorage, SpoolStorageFaults, ValidFrame,
+    classify_frames, decode_frame, encode_frame, scan_and_classify,
 };
 
 #[path = "support/mod.rs"]
@@ -215,7 +219,7 @@ fn progress_sync_failure_poisons_and_never_emits_success() {
         assert!(matches!(err, SpoolError::ProgressFailed));
         assert!(matches!(
             cell.state(),
-            scripture::SpoolCellState::Poisoned {
+            SpoolCellState::Poisoned {
                 cause: SpoolPoisonCause::ProgressFailed
             }
         ));
@@ -278,10 +282,10 @@ fn torn_terminal_and_corrupt_middle() {
     drop(file);
     let segment = dir.join("segment-000001.wal");
     let mut on_disk = std::fs::read(&segment).expect("read");
-    let mut bad = encode_spool_frame(&frame_for(1)).expect("enc").to_vec();
+    let mut bad = encode_frame(&frame_for(1)).expect("enc").to_vec();
     let last = bad.len() - 1;
     bad[last] ^= 0xff;
-    let third = encode_spool_frame(&frame_for(2)).expect("enc");
+    let third = encode_frame(&frame_for(2)).expect("enc");
     on_disk.extend_from_slice(&bad);
     on_disk.extend_from_slice(&third);
     std::fs::write(&segment, &on_disk).expect("write");
@@ -294,8 +298,8 @@ fn torn_terminal_and_corrupt_middle() {
 #[test]
 fn submission_plus_progress_budget_enforced_before_forward() {
     // Encode once to size a budget that fits submission alone but not +progress.
-    let sub = encode_spool_frame(&frame_for(0)).expect("enc");
-    let prog = encode_spool_frame(&SpoolFrame::Progress(ProgressIdentity {
+    let sub = encode_frame(&frame_for(0)).expect("enc");
+    let prog = encode_frame(&SpoolFrame::Progress(ProgressIdentity {
         journal_id: journal(),
         producer_id: producer(),
         producer_epoch: 1,
@@ -411,11 +415,11 @@ fn frame_round_trip_and_arbitrary_bytes() {
             )],
         },
     };
-    let encoded = encode_spool_frame(&frame).expect("encode");
-    let (decoded, n) = decode_spool_frame(&encoded).expect("decode");
+    let encoded = encode_frame(&frame).expect("encode");
+    let (decoded, n) = decode_frame(&encoded).expect("decode");
     assert_eq!(n, encoded.len());
     assert_eq!(decoded, frame);
-    assert!(decode_spool_frame(&[0xff; 32]).is_err());
+    assert!(decode_frame(&[0xff; 32]).is_err());
 }
 
 #[test]
@@ -456,7 +460,7 @@ fn post_wal_receipt_failure_poisons_second_submit() {
         assert!(matches!(err, SpoolError::Forward(_)));
         assert!(matches!(
             cell.state(),
-            scripture::SpoolCellState::Poisoned {
+            SpoolCellState::Poisoned {
                 cause: SpoolPoisonCause::ReceiptFailed
             }
         ));
@@ -488,7 +492,7 @@ fn forward_failure_poison_is_visible_before_submit_returns() {
         assert!(matches!(error, SpoolError::Forward(_)));
         assert!(matches!(
             cell.state(),
-            scripture::SpoolCellState::Poisoned {
+            SpoolCellState::Poisoned {
                 cause: SpoolPoisonCause::ForwardFailed
             }
         ));

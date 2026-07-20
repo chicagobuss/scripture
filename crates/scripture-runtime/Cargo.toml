@@ -15,6 +15,7 @@ holylog-object-store = { workspace = true, features = ["s3"] }
 holylog-object-store-register = { workspace = true, features = ["aws"] }
 object_store = { workspace = true, default-features = false }
 scripture = { path = "../scripture" }
+scripture-producer = { path = "../scripture-producer" }
 scripture-service = { path = "../scripture-service" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }

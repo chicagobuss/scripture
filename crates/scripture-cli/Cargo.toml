@@ -20,6 +20,7 @@ holylog-object-store-register = { workspace = true, features = ["aws"] }
 object_store = { workspace = true, default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 scripture = { path = "../scripture" }
+scripture-producer = { path = "../scripture-producer" }
 scripture-runtime = { path = "../scripture-runtime" }
 scripture-service = { path = "../scripture-service" }
 serde.workspace = true

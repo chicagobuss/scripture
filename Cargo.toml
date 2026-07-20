@@ -2,6 +2,7 @@
 members = [
     "crates/protoscripture",
     "crates/scripture",
+    "crates/scripture-producer",
     "crates/scripture-service",
     "crates/scripture-runtime",
     "crates/scripture-cli",

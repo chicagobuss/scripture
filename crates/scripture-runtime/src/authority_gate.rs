@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use holylog::virtual_log::{ConditionalRegister, LogletResolver, VirtualLog, VirtualLogError};
 use scripture::OwnerId;
+use scripture::root_authority::{RootAuthority, observe_root_authority};
 use scripture::serving_authority::{AuthorityKey, AuthorityState, ServingAuthorityRecord};
 
 /// Outcome of an authority-gated admission decision.
@@ -78,23 +79,22 @@ pub async fn evaluate_authority_gate(
         }
     };
 
-    if observed.state.application_fence.as_bytes().is_empty() {
-        return AuthorityGateDecision::Denied {
-            reason: AuthorityGateDenial::AuthorityAbsent,
-        };
-    }
-
-    let record =
-        match ServingAuthorityRecord::decode_application_fence(&observed.state.application_fence) {
-            Ok(record) => record,
-            Err(error) => {
-                return AuthorityGateDecision::Denied {
-                    reason: AuthorityGateDenial::AuthorityMalformed {
-                        message: error.to_string(),
-                    },
-                };
-            }
-        };
+    let record = match observe_root_authority(&observed.state) {
+        RootAuthority::Uninitialized => {
+            return AuthorityGateDecision::Denied {
+                reason: AuthorityGateDenial::FoundationUninitialized,
+            };
+        }
+        RootAuthority::AbsentOrMalformed { message } => {
+            return AuthorityGateDecision::Denied {
+                reason: match message {
+                    None => AuthorityGateDenial::AuthorityAbsent,
+                    Some(message) => AuthorityGateDenial::AuthorityMalformed { message },
+                },
+            };
+        }
+        RootAuthority::Record(record) => *record,
+    };
 
     if record.key != key {
         return AuthorityGateDecision::Denied {

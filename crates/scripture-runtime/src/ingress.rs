@@ -7,7 +7,8 @@
 use std::io;
 use std::sync::Arc;
 
-use scripture::{ReceiptFuture, Submission};
+use scripture::{DriverError, ReceiptFuture, Submission};
+use scripture_producer::{FileSpoolStorage, SpoolCellHandle, SpoolError};
 use scripture_service::{CanonRoute, VerseRuntime};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,7 +40,7 @@ impl RawLinesSink for CanonSink {
 
 struct SpoolCanonSink {
     runtime: Arc<VerseRuntime>,
-    spool: Arc<scripture::SpoolCellHandle<scripture::FileSpoolStorage>>,
+    spool: Arc<SpoolCellHandle<FileSpoolStorage>>,
 }
 
 impl RawLinesSink for SpoolCanonSink {
@@ -53,7 +54,7 @@ impl RawLinesSink for SpoolCanonSink {
                     runtime
                         .submit(submission)
                         .await
-                        .map_err(|error| scripture::SpoolError::Forward(error.to_string()))
+                        .map_err(|error| SpoolError::Forward(error.to_string()))
                 }
             })
             .await
@@ -62,14 +63,11 @@ impl RawLinesSink for SpoolCanonSink {
         tokio::spawn(async move {
             let mapped = match spool_fut.await {
                 Ok(receipt) => Ok(receipt),
-                Err(scripture::SpoolError::ProgressFailed) => {
-                    Err(scripture::DriverError::NotWritten)
+                Err(SpoolError::ProgressFailed) => Err(DriverError::NotWritten),
+                Err(SpoolError::Poisoned { .. }) | Err(SpoolError::RecoveryRequired) => {
+                    Err(DriverError::Poisoned)
                 }
-                Err(scripture::SpoolError::Poisoned { .. })
-                | Err(scripture::SpoolError::RecoveryRequired) => {
-                    Err(scripture::DriverError::Poisoned)
-                }
-                Err(_) => Err(scripture::DriverError::Unavailable),
+                Err(_) => Err(DriverError::Unavailable),
             };
             let _ = tx.send(mapped);
         });
@@ -185,7 +183,7 @@ pub async fn serve_canon_raw_lines_connection_with_metrics(
 pub async fn serve_canon_raw_lines_connection_with_spool(
     stream: TcpStream,
     runtime: Arc<VerseRuntime>,
-    spool: Arc<scripture::SpoolCellHandle<scripture::FileSpoolStorage>>,
+    spool: Arc<SpoolCellHandle<FileSpoolStorage>>,
     config: RawLinesConfig,
 ) -> io::Result<()> {
     if let Err(reason) = config.validate() {

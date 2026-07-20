@@ -1,0 +1,24 @@
+[package]
+name = "scripture-producer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Producer-side durability: local outbox/spool and edge store-and-forward for Scripture"
+license = "MIT"
+publish = false
+
+[dependencies]
+scripture = { path = "../scripture" }
+bytes.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+futures.workspace = true
+holylog.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

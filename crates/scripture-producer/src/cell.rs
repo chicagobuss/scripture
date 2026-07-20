@@ -19,8 +19,8 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
 
-use crate::driver::{DriverError, Receipt, ReceiptFuture, Submission};
-use crate::model::JournalId;
+use scripture::driver::{DriverError, Receipt, ReceiptFuture, Submission};
+use scripture::model::JournalId;
 
 use super::frame::SpoolFrame;
 use super::progress::ProgressIdentity;
@@ -218,10 +218,10 @@ impl<S: SpoolStorage + 'static> SpoolCellHandle<S> {
         }
     }
 
-    /// Convenience forward through a [`crate::driver::ChunkDriverHandle`].
+    /// Convenience forward through a [`scripture::driver::ChunkDriverHandle`].
     pub async fn submit(
         &self,
-        driver: &crate::driver::ChunkDriverHandle,
+        driver: &scripture::driver::ChunkDriverHandle,
         submission: Submission,
     ) -> Result<SpoolReceiptFuture, SpoolError> {
         self.submit_forwarded(submission, |submission| async move {

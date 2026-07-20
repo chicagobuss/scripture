@@ -1559,11 +1559,25 @@ dependencies = [
  "object_store",
  "rustls",
  "scripture",
+ "scripture-producer",
  "scripture-runtime",
  "scripture-service",
  "serde",
  "serde_yaml",
  "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "scripture-producer"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "holylog",
+ "scripture",
  "thiserror",
  "tokio",
 ]
@@ -1580,6 +1594,7 @@ dependencies = [
  "holylog-object-store-register",
  "object_store",
  "scripture",
+ "scripture-producer",
  "scripture-service",
  "thiserror",
  "tokio",
