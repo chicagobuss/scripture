@@ -276,15 +276,15 @@ fn report(acks: &[AckSample], failures: &[String], options: &LabOptions, wall: f
     // A write outage is the interesting number in a failover run.
     let mut times: Vec<f64> = acks.iter().map(|a| a.at_s).collect();
     times.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timestamps"));
-    let outages: Vec<f64> = times
+    let outages: Vec<(f64, f64)> = times
         .windows(2)
-        .map(|w| w[1] - w[0])
-        .filter(|gap| *gap > 1.0)
+        .filter(|w| w[1] - w[0] > 1.0)
+        .map(|w| (w[0], w[1] - w[0]))
         .collect();
     if !outages.is_empty() {
         println!("\n=== write outages (>1s with no commit) ===");
-        for outage in outages.iter().take(5) {
-            println!("  {outage:.1}s");
+        for (at, gap) in outages.iter().take(5) {
+            println!("  {gap:.1}s starting at t+{at:.1}s");
         }
     }
 

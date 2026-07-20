@@ -23,6 +23,13 @@ pub enum AuthorityGateDecision {
     Denied {
         /// Operator-useful refusal reason.
         reason: AuthorityGateDenial,
+        /// Endpoint currently named by the root, when the root names one.
+        ///
+        /// Carried so a refused producer can be redirected instead of being
+        /// left to rediscover the route by itself. The record was already read
+        /// to make this decision, so the redirect costs no extra request. It
+        /// is a hint, not a grant: the named Scribe runs its own gate.
+        serving_endpoint: Option<String>,
     },
 }
 
@@ -67,6 +74,7 @@ pub async fn evaluate_authority_gate(
         Err(VirtualLogError::Uninitialized) => {
             return AuthorityGateDecision::Denied {
                 reason: AuthorityGateDenial::FoundationUninitialized,
+                serving_endpoint: None,
             };
         }
         Err(error) => {
@@ -74,6 +82,7 @@ pub async fn evaluate_authority_gate(
                 reason: AuthorityGateDenial::FoundationUnavailable {
                     message: error.to_string(),
                 },
+                serving_endpoint: None,
             };
         }
     };
@@ -81,6 +90,7 @@ pub async fn evaluate_authority_gate(
     if observed.state.application_fence.as_bytes().is_empty() {
         return AuthorityGateDecision::Denied {
             reason: AuthorityGateDenial::AuthorityAbsent,
+            serving_endpoint: None,
         };
     }
 
@@ -92,6 +102,7 @@ pub async fn evaluate_authority_gate(
                     reason: AuthorityGateDenial::AuthorityMalformed {
                         message: error.to_string(),
                     },
+                    serving_endpoint: None,
                 };
             }
         };
@@ -101,6 +112,7 @@ pub async fn evaluate_authority_gate(
             reason: AuthorityGateDenial::AuthorityMalformed {
                 message: "root fence AuthorityKey does not match gate key".into(),
             },
+            serving_endpoint: None,
         };
     }
 
@@ -115,6 +127,10 @@ pub async fn evaluate_authority_gate(
                     AuthorityState::Serving { .. } => "Serving",
                     AuthorityState::ReconciliationRequired { .. } => "ReconciliationRequired",
                 },
+            },
+            serving_endpoint: match &record.state {
+                AuthorityState::Serving { route_hint, .. } => Some(route_hint.as_str().to_owned()),
+                _ => None,
             },
         }
     }
@@ -161,7 +177,8 @@ mod tests {
         assert!(matches!(
             decision,
             AuthorityGateDecision::Denied {
-                reason: AuthorityGateDenial::FoundationUninitialized
+                reason: AuthorityGateDenial::FoundationUninitialized,
+                ..
             }
         ));
     }
@@ -213,7 +230,8 @@ mod tests {
         assert!(matches!(
             sealed,
             AuthorityGateDecision::Denied {
-                reason: AuthorityGateDenial::NotEffectiveWriter { .. }
+                reason: AuthorityGateDenial::NotEffectiveWriter { .. },
+                ..
             }
         ));
     }

@@ -354,6 +354,15 @@ impl AttemptFailure {
 const DEPOSED_MARKER: &str = r#"NotEffectiveWriter { state: "Serving" }"#;
 const TRANSITIONING_MARKER: &str = r#"NotEffectiveWriter { state: "Transitioning" }"#;
 
+/// Extracts `serving-endpoint=<addr>` from a refusal, when the Scribe supplied
+/// one. A refused producer that is told where the writer moved skips a round
+/// of directory discovery, which is most of a planned-handoff stall.
+fn redirect_from_err_line(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix("serving-endpoint="))
+        .map(str::to_owned)
+}
+
 fn classify_err_line(line: &str) -> AttemptFailure {
     if line.contains(DEPOSED_MARKER) {
         AttemptFailure::DeposedWriter {
@@ -500,6 +509,27 @@ impl<S: RouteSource> RoutingProducer<S> {
                 Err(failure) => {
                     last_failure = failure.detail().to_owned();
                     match failure {
+                        AttemptFailure::DeposedWriter { ref detail }
+                            if redirect_from_err_line(detail)
+                                .is_some_and(|hint| !tried.contains(&hint)) =>
+                        {
+                            // The Scribe named its successor. Prefer it over a
+                            // directory round trip, whose roster is stale for a
+                            // full TTL after a handoff anyway.
+                            let hint = redirect_from_err_line(detail)
+                                .expect("guard proved a redirect is present");
+                            self.route.candidates.insert(
+                                0,
+                                RankedCandidate {
+                                    owner_id: "redirect".to_owned(),
+                                    endpoint: hint,
+                                    disposition: "Serving".to_owned(),
+                                    claims_serving: true,
+                                    fresh: true,
+                                    age_ms: 0,
+                                },
+                            );
+                        }
                         AttemptFailure::DeposedWriter { .. }
                         | AttemptFailure::DeadScribe { .. }
                         | AttemptFailure::LostReply { .. }
@@ -1011,6 +1041,58 @@ mod tests {
     /// at the top. A send that trusts the ranking alone burns its whole attempt
     /// budget on a corpse while a promoted peer is serving. Observed cost:
     /// 176 records lost to exhaustion in a SIGKILL drill.
+    /// A refusal that names the successor must be followed directly.
+    ///
+    /// Without this the producer falls back to the directory, whose roster
+    /// still ranks the deposed Scribe first for a full TTL after a handoff --
+    /// so the redirect is what turns a planned move into a route change rather
+    /// than a stall.
+    #[tokio::test]
+    async fn deposed_refusal_carrying_a_redirect_is_followed_directly() {
+        let (old_listener, old_endpoint) = bind_local().await;
+        let (new_listener, new_endpoint) = bind_local().await;
+        let refusal: &'static str = Box::leak(
+            format!(
+                r#"effective-writer gate denied: NotEffectiveWriter {{ state: "Serving" }} serving-endpoint={new_endpoint}"#
+            )
+            .into_boxed_str(),
+        );
+        let old = spawn_scripted_ingress(old_listener, vec![IngressStep::Err(refusal)]).await;
+        let new = spawn_scripted_ingress(
+            new_listener,
+            vec![IngressStep::Ok {
+                first: 11,
+                next: 12,
+            }],
+        )
+        .await;
+
+        // The directory knows only the deposed Scribe, as it would inside the
+        // TTL: the redirect is the sole route to the new writer.
+        let source = ScriptedSource::new(vec![
+            route_with(&[old_endpoint.as_str()]),
+            route_with(&[old_endpoint.as_str()]),
+        ]);
+        let mut producer =
+            RoutingProducer::open_with_source(source, "canon-a", "verse-a", policy_fast())
+                .await
+                .expect("open");
+
+        let record = OutboundRecord::new(b"follows-redirect".to_vec());
+        let ack = producer
+            .send(&record)
+            .await
+            .expect("redirect must be followed");
+        assert_eq!(ack.endpoint, new_endpoint);
+        assert_eq!((ack.first_offset, ack.next_offset), (11, 12));
+
+        assert_eq!(old.await.expect("join old").len(), 1);
+        assert_eq!(
+            new.await.expect("join new"),
+            vec![b"follows-redirect".to_vec()]
+        );
+    }
+
     #[tokio::test]
     async fn stale_top_ranked_dead_endpoint_does_not_starve_a_live_peer() {
         // Dead endpoint: bind then drop, so connections are refused.

@@ -52,10 +52,21 @@ pub enum HaActivationError {
 pub enum HaAdmissionError {
     /// A current authority observation denies this process permission to admit
     /// work or return a committed acknowledgement.
-    #[error("effective-writer gate denied: {reason:?}")]
+    /// The message carries the endpoint the root currently names, so a refused
+    /// producer can be redirected instead of rediscovering the route itself.
+    /// A producer that only learns it was deposed by failing must then go
+    /// looking; telling it where to go removes that round of discovery, which
+    /// is the larger part of a planned-handoff stall.
+    #[error("effective-writer gate denied: {reason:?}{}",
+        match serving_endpoint {
+            Some(endpoint) => format!(" serving-endpoint={endpoint}"),
+            None => String::new(),
+        })]
     GateDenied {
         /// Why the current authority observation denied admission.
         reason: AuthorityGateDenial,
+        /// Endpoint the root currently names, when it names one.
+        serving_endpoint: Option<String>,
     },
     /// The underlying Canon-bound runtime refused the operation.
     #[error(transparent)]
@@ -95,9 +106,13 @@ impl AuthorityAdmission {
         .await;
         match decision {
             AuthorityGateDecision::EffectiveWriter { .. } => Ok(()),
-            AuthorityGateDecision::Denied { reason } => {
-                Err(HaAdmissionError::GateDenied { reason })
-            }
+            AuthorityGateDecision::Denied {
+                reason,
+                serving_endpoint,
+            } => Err(HaAdmissionError::GateDenied {
+                reason,
+                serving_endpoint,
+            }),
         }
     }
 }
@@ -162,7 +177,7 @@ impl HaServingSession {
             let result = match receipt.await {
                 Ok(receipt) => match admission.ensure_root_authority().await {
                     Ok(()) => Ok(receipt),
-                    Err(HaAdmissionError::GateDenied { reason }) => {
+                    Err(HaAdmissionError::GateDenied { reason, .. }) => {
                         if let (Some(session), Some(ctx)) = (&observation, &ctx) {
                             session.admission_denied(ctx, &format!("gate: {reason:?}"));
                         }
@@ -319,7 +334,7 @@ where
     .await;
     match gate {
         AuthorityGateDecision::EffectiveWriter { .. } => {}
-        AuthorityGateDecision::Denied { reason } => {
+        AuthorityGateDecision::Denied { reason, .. } => {
             return Err(HaActivationError::GateDenied { reason });
         }
     }
@@ -344,7 +359,7 @@ where
     )
     .await;
     if !matches!(gate, AuthorityGateDecision::EffectiveWriter { .. }) {
-        let AuthorityGateDecision::Denied { reason } = gate else {
+        let AuthorityGateDecision::Denied { reason, .. } = gate else {
             unreachable!()
         };
         return Err(HaActivationError::GateDenied { reason });
