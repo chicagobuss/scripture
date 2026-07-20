@@ -155,8 +155,16 @@ pub struct RetryPolicy {
     pub connect_timeout: Duration,
     /// Timeout waiting for one ACK line after a successful write.
     pub ack_timeout: Duration,
-    /// Backoff after a Transitioning (recovery-gap) refusal.
+    /// First backoff after a Transitioning (recovery-gap) refusal.
+    ///
+    /// Doubled per consecutive refusal up to `max_transitioning_backoff`. A
+    /// flat backoff has to choose between discovering a fast handoff late and
+    /// hammering a slow one: at a flat 250ms, a 176ms transition was found up
+    /// to 250ms late, while a 2.5s transition under load cost ten pointless
+    /// round trips into a store the transition itself was competing with.
     pub transitioning_backoff: Duration,
+    /// Ceiling for the doubled Transitioning backoff.
+    pub max_transitioning_backoff: Duration,
     /// Backoff after a connect/transport failure.
     ///
     /// Without this an attempt budget is not a time budget: a refused
@@ -174,7 +182,8 @@ impl Default for RetryPolicy {
             max_attempts: 8,
             connect_timeout: Duration::from_secs(2),
             ack_timeout: Duration::from_secs(5),
-            transitioning_backoff: Duration::from_millis(50),
+            transitioning_backoff: Duration::from_millis(20),
+            max_transitioning_backoff: Duration::from_millis(500),
             transport_backoff: Duration::from_millis(50),
         }
     }
@@ -339,6 +348,17 @@ enum AttemptFailure {
 }
 
 impl AttemptFailure {
+    /// Short label for attempt tracing.
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::DeposedWriter { .. } => "deposed",
+            Self::Transitioning { .. } => "transitioning",
+            Self::DeadScribe { .. } => "dead",
+            Self::LostReply { .. } => "lost-reply",
+            Self::Other { .. } => "other",
+        }
+    }
+
     fn detail(&self) -> &str {
         match self {
             Self::DeposedWriter { detail }
@@ -456,6 +476,13 @@ impl<S: RouteSource> RoutingProducer<S> {
             });
         }
 
+        // Per-attempt tracing, off unless SCRIPTURE_TRACE_ATTEMPTS is set.
+        // A rolling restart cost a 4.8s write stall while the fleet took 176ms
+        // to hand over, so the delay is inside this loop; attributing it needs
+        // per-attempt timings rather than a total.
+        let trace = std::env::var_os("SCRIPTURE_TRACE_ATTEMPTS").is_some();
+        let send_started = std::time::Instant::now();
+
         let mut last_failure = String::from("no attempt completed");
         // Endpoints already tried during *this* send. Refreshing the directory
         // is not enough on its own: a Scribe that has just died stays `fresh`
@@ -465,6 +492,7 @@ impl<S: RouteSource> RoutingProducer<S> {
         // the serving Scribe cost 176 records to exhaustion against the dead
         // endpoint while a promoted peer was serving.
         let mut tried: Vec<String> = Vec::new();
+        let mut transitioning_wait = self.policy.transitioning_backoff;
         for attempt in 1..=self.policy.max_attempts {
             if self.route.candidates.is_empty() {
                 last_failure = format!(
@@ -496,9 +524,18 @@ impl<S: RouteSource> RoutingProducer<S> {
             if !tried.contains(&endpoint) {
                 tried.push(endpoint.clone());
             }
+            let attempt_started = std::time::Instant::now();
 
             match self.exchange_once(&endpoint, &record.payload).await {
                 Ok((first_offset, next_offset)) => {
+                    if trace && attempt > 1 {
+                        eprintln!(
+                            "attempt-trace ok attempt={attempt} endpoint={endpoint} \
+                             attempt_ms={:.0} send_ms={:.0}",
+                            attempt_started.elapsed().as_secs_f64() * 1000.0,
+                            send_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     return Ok(CommittedAck {
                         first_offset,
                         next_offset,
@@ -507,6 +544,15 @@ impl<S: RouteSource> RoutingProducer<S> {
                     });
                 }
                 Err(failure) => {
+                    if trace {
+                        eprintln!(
+                            "attempt-trace fail attempt={attempt} endpoint={endpoint} kind={} \
+                             attempt_ms={:.0} send_ms={:.0}",
+                            failure.kind_label(),
+                            attempt_started.elapsed().as_secs_f64() * 1000.0,
+                            send_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     last_failure = failure.detail().to_owned();
                     match failure {
                         AttemptFailure::DeposedWriter { ref detail }
@@ -540,12 +586,17 @@ impl<S: RouteSource> RoutingProducer<S> {
                             // a refresh that returns the same stale ranking
                             // cannot pin this send to a dead endpoint.
                             let _ = self.refresh_route().await;
+                            transitioning_wait = self.policy.transitioning_backoff;
                             sleep(self.policy.transport_backoff).await;
                         }
                         AttemptFailure::Transitioning { .. } => {
                             // Recovery gap is transient; back off and retry
-                            // without treating the refusal as permanent.
-                            sleep(self.policy.transitioning_backoff).await;
+                            // without treating the refusal as permanent. The
+                            // wait doubles so a short handoff is caught almost
+                            // immediately while a long one is not hammered.
+                            sleep(transitioning_wait).await;
+                            transitioning_wait =
+                                (transitioning_wait * 2).min(self.policy.max_transitioning_backoff);
                             let _ = self.refresh_route().await;
                         }
                     }
@@ -690,6 +741,7 @@ mod tests {
             connect_timeout: Duration::from_millis(200),
             ack_timeout: Duration::from_millis(500),
             transitioning_backoff: Duration::from_millis(5),
+            max_transitioning_backoff: Duration::from_millis(20),
             transport_backoff: Duration::from_millis(1),
         }
     }

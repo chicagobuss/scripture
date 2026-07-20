@@ -138,7 +138,8 @@ pub async fn produce_lab(
                 max_attempts: 60,
                 connect_timeout: Duration::from_secs(3),
                 ack_timeout: Duration::from_secs(20),
-                transitioning_backoff: Duration::from_millis(250),
+                transitioning_backoff: Duration::from_millis(20),
+                max_transitioning_backoff: Duration::from_millis(500),
                 transport_backoff: Duration::from_millis(500),
             };
 
