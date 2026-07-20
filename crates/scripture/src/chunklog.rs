@@ -109,6 +109,22 @@ pub struct VirtualChunkLogRecovery {
 /// Errors at the chunk-to-Holylog boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkLogError {
+    /// A superseding pointer names records this log has not appended.
+    ///
+    /// Guards against a caller deriving the superseded range from the wrong
+    /// place: the range must lie inside what this writer has already counted.
+    #[error(
+        "superseded range {first_offset}..{} lies outside the log (next_offset {next_offset})",
+        first_offset + u64::from(*record_count)
+    )]
+    SupersededRangeOutsideLog {
+        /// Claimed first offset of the superseded chunk.
+        first_offset: u64,
+        /// Records the superseding pointer claims to cover.
+        record_count: u32,
+        /// This writer's current dense tail.
+        next_offset: u64,
+    },
     /// An AtomicLog-backed Holylog failed, rejected the append, or observed a seal.
     #[error(transparent)]
     AtomicLog(#[from] AtomicLogError),
@@ -484,6 +500,60 @@ impl ChunkLogWriter {
             first_offset: frame.base_offset,
             next_offset,
             record_count: frame.record_count,
+        })
+    }
+
+    /// Appends a superseding rewritten [`DataRef`] without re-supplying sealed bytes.
+    ///
+    /// Used after a background rewrite has verified the per-Verse object. Does
+    /// **not** advance the dense journal offset — the records were already
+    /// counted when the staging pointer was appended. Immutable chunk evidence
+    /// lives in the pointer itself.
+    ///
+    /// `superseded_first_offset` is the offset the superseded chunk already
+    /// occupies. It must be supplied rather than derived from the writer's
+    /// tail: a rewrite runs while the Verse keeps taking writes, so the chunk
+    /// being superseded normally has newer appends behind it and
+    /// `next_offset - record_count` would name some later range instead.
+    pub async fn append_superseding_data_ref(
+        &mut self,
+        writer_id: crate::chunk::WriterId,
+        data_ref: &DataRef,
+        superseded_first_offset: RecordOffset,
+    ) -> Result<ChunkAppendAck, ChunkLogError> {
+        if self.poisoned {
+            return Err(ChunkLogError::Poisoned);
+        }
+        data_ref.validate()?;
+        let next_offset = self.next_offset;
+        let first_offset = superseded_first_offset;
+        // The superseded range must already be part of this log, or the pointer
+        // is describing records this writer never counted.
+        let range_end = first_offset
+            .get()
+            .checked_add(u64::from(data_ref.record_count))
+            .ok_or(ChunkError::OffsetOverflow)?;
+        if range_end > next_offset.get() {
+            return Err(ChunkLogError::SupersededRangeOutsideLog {
+                first_offset: first_offset.get(),
+                record_count: data_ref.record_count,
+                next_offset: next_offset.get(),
+            });
+        }
+        let payload = encode_data_ref(data_ref)?;
+
+        self.poisoned = true;
+        let slot = self
+            .log
+            .append(payload, self.generation, writer_id, data_ref.chunk_id)
+            .await?;
+        self.poisoned = false;
+        Ok(ChunkAppendAck {
+            slot,
+            chunk_id: data_ref.chunk_id,
+            first_offset,
+            next_offset,
+            record_count: data_ref.record_count,
         })
     }
 

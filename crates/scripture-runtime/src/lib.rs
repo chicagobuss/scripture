@@ -8,6 +8,7 @@ mod assignment_root;
 mod authority_bootstrap;
 mod authority_gate;
 pub mod blob_reader;
+pub mod blob_rewrite;
 pub mod blob_writer;
 pub mod counting_store;
 mod credentials;
@@ -28,6 +29,12 @@ pub use authority_gate::{AuthorityGateDecision, AuthorityGateDenial, evaluate_au
 pub use blob_reader::{
     BlobReadError, CoalescedGet, ResolvedChunk, fetch_data_ref, plan_coalesced_gets,
     resolve_data_refs_coalesced, resolve_log_payload,
+};
+pub use blob_rewrite::{
+    DEFAULT_REWRITTEN_PREFIX, DEFAULT_STAGING_PREFIX, RewriteConfig, RewriteError,
+    StagingBlobContents, StagingPointer, SupersedingAppendTarget, VerseRewriteOutcome,
+    VerseRewriteProgress, is_rewritten_blob_key, is_staging_blob_key, prefer_data_ref,
+    rewrite_verse_staging, scan_log_deduped, staging_blob_collectable, superseded_chunk_ids,
 };
 pub use blob_writer::{
     BlobCutReason, BlobEnvelope, BlobEnvelopeSource, BlobWriter, BlobWriterConfig, BlobWriterError,

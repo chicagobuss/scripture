@@ -775,3 +775,61 @@ fn append_data_ref_writes_pointer_not_chunk_bytes() {
         }
     });
 }
+
+/// Superseding a chunk that is **not** the latest must report that chunk's own
+/// offsets.
+///
+/// `append_superseding_data_ref` derives `first_offset` by subtracting the
+/// pointer's record count from the writer's current `next_offset`. That is only
+/// the superseded chunk's range when it happens to be the most recent append.
+/// A background rewrite runs while the Verse keeps taking writes, so the
+/// ordinary case is superseding an older chunk with newer ones already behind
+/// it.
+#[test]
+fn superseding_an_earlier_chunk_reports_that_chunks_offsets() {
+    block_on(async {
+        let drive = Arc::new(InMemoryLogDrive::new());
+        let log = AtomicLog::builder(drive, 0).build().expect("log");
+        let mut writer = ChunkLogWriter::new(journal(), cohort(), 4, log, RecordOffset::new(0));
+
+        // Two staging chunks: records 0..2, then 2..5.
+        let first = chunk(1, 0, 2);
+        let first_ack = writer.append(&first).await.expect("append first");
+        assert_eq!(first_ack.first_offset, RecordOffset::new(0));
+        let second = chunk(2, 2, 3);
+        writer.append(&second).await.expect("append second");
+        assert_eq!(writer.next_offset(), RecordOffset::new(5));
+
+        // Rewrite supersedes the *first* chunk while the second is already
+        // durable behind it.
+        let superseding = scripture::DataRef {
+            blob_key: "verses/v1/deadbeef/cafebabe".into(),
+            offset: 0,
+            length: first.bytes.len() as u64,
+            record_count: 2,
+            chunk_id: first.chunk_id,
+            chunk_digest: first.digest,
+            blob_digest: scripture::ChunkDigest::of(&first.bytes),
+        };
+        let ack = writer
+            .append_superseding_data_ref(
+                WriterId::from_bytes(*b"writer-id-012345"),
+                &superseding,
+                RecordOffset::new(0),
+            )
+            .await
+            .expect("supersede");
+
+        assert_eq!(
+            ack.first_offset,
+            RecordOffset::new(0),
+            "superseding pointer must report the offsets of the chunk it replaces, \
+             not the tail of the log"
+        );
+        assert_eq!(
+            writer.next_offset(),
+            RecordOffset::new(5),
+            "a superseding append must not advance the dense offset"
+        );
+    });
+}

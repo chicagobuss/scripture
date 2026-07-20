@@ -6,17 +6,12 @@
 //! loses authority between PUT and pointer append simply never commits its
 //! DataRef, and those blob bytes stay unreferenced garbage.
 //!
-//! # Retention (known gap)
-//!
-//! Cross-Verse blobs break prefix-based retention. A blob cannot be deleted
-//! until **every** Verse referencing it has trimmed past. The intended fix is
-//! the two-format lifecycle: short-lived cross-Verse write-optimised blobs,
-//! then a background rewrite into per-Verse read-optimised objects that restore
-//! clean prefix lifecycle rules. That rewrite is **not** implemented here.
-//!
-//! Therefore: cross-Verse blobs are **not** production-ready for retention
-//! until the rewrite exists. Do not add a half-measure refcount scheme in this
-//! module.
+//! Staging objects under [`crate::blob_rewrite::DEFAULT_STAGING_PREFIX`] are
+//! short-lived. A background rewrite (see [`crate::blob_rewrite`]) moves each
+//! Verse's chunks into per-Verse read-optimised objects and appends superseding
+//! pointers. Prefix-based retention applies to rewritten objects; staging
+//! blobs become collectable only after every referenced [`ChunkId`] has a
+//! durable superseding pointer in the log.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -283,7 +278,7 @@ fn plan_prefix(plan: &CutPlan) -> Result<&str, BlobWriterError> {
     Ok(&plan.blob_prefix)
 }
 
-async fn put_and_verify(
+pub(crate) async fn put_and_verify(
     store: &Arc<dyn ObjectStore>,
     key: &str,
     bytes: Bytes,

@@ -10,13 +10,12 @@
 //! whose pointer was committed. Locating a byte range alone is not enough —
 //! a truncated blob, reused key, or off-by-one offset must fail closed.
 //!
-//! # Retention (known gap)
-//!
-//! Cross-Verse blobs break prefix-based retention: a blob cannot be deleted
-//! until every Verse that references it has trimmed past. The intended fix is
-//! a background rewrite into per-Verse read-optimised objects. Until that
-//! rewrite exists, cross-Verse blobs are **not** production-ready for
-//! retention. Do not add a half-measure refcount scheme here.
+//! Staging blobs under `blobs/v1/` are short-lived write-optimised objects.
+//! A background rewrite (see `scripture_runtime::blob_rewrite`) materialises
+//! per-Verse read-optimised objects and appends superseding pointers. Prefix-
+//! based retention applies to rewritten objects; staging blobs become
+//! collectable only after every referenced [`ChunkId`] has a durable superseding
+//! pointer in the log.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
