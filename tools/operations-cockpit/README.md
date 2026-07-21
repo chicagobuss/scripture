@@ -59,6 +59,7 @@ Root `manifest.json`:
   "inputs": {
     "producer_ledger": "producer-ledger.jsonl",
     "messages": "messages.jsonl",
+    "console_readback": "console-readback.jsonl",
     "scribe_logs": ["scribes/scribe-a.jsonl"],
     "object_inventory": "objects.json",
     "outputs_register": "outputs/register.json",
@@ -80,6 +81,10 @@ Rules enforced by `lib/run-bundle.mjs`:
 - Iceberg is shown verbatim as `verified|configured_not_verified|absent|not_run`;
 - missing layers render as `not_supplied` / `not_run`, never healthy;
 - run-bundle mode advertises an empty action capability list.
+
+`console_readback` is optional JSONL emitted by `scripture consume --format jsonl`.
+The Cockpit displays it as a read-only observation of records printed by that
+command; it is not a checkpoint, acknowledgement, or durability verdict.
 
 Optional local collector stub (copy/validate only — no live scrape):
 
@@ -126,9 +131,48 @@ call a campaign runner, SSH, or Kubernetes. The Node process invokes it with
 `shell: false`; action names are allow-listed in `server.mjs`; no browser value
 is ever treated as a command.
 
-Default live actions are `produce`, pause/resume, stop/restart A, promote B,
-cut/restore the named secondary-store path, and cleanup. A real adapter must
-enforce its own isolated namespace/prefix and explicit live-run approval.
+Default live actions are `produce`, pause/resume, stop/restart a named Scribe,
+cut/restore the named secondary-store path, and cleanup. Fleet availability is
+observed as an automatic system behavior, never invoked as a promotion action.
+A real adapter must enforce its own isolated namespace/prefix and explicit
+live-run approval.
+
+## Control one local Scribe
+
+`local-scribe-adapter.mjs` is a concrete local controller for a configured
+Scribe on this machine. It has exactly three actions: start/restart the managed
+Scribe, stop it, and send a fixed three-record batch. It never accepts a command
+or a path from the browser.
+
+Build Scripture once, then start the Cockpit with the same environment that
+supplies your object-store credentials:
+
+```sh
+cd /path/to/scripture
+cargo build -p scripture-cli --bin scripture
+set -a; . /path/to/credentials.env; set +a
+SCRIPTURE_LOCAL_CONFIG="$PWD/config/local/consumer-e2e-r2.yaml" \
+SCRIPTURE_LOCAL_CANON=demo-canon-00001 \
+SCRIPTURE_LOCAL_VERSE=demo-verse-00001 \
+SCRIPTURE_LOCAL_BINARY="$PWD/target/debug/scripture" \
+npm --prefix tools/operations-cockpit run local:control
+```
+
+The adapter keeps its PID, event log, and Scribe output under
+`/tmp/scripture-operations-cockpit-local` (override with
+`SCRIPTURE_LOCAL_STATE_DIR`). The UI’s **Restart Scribe** button starts the
+managed process when it is down; **Stop Scribe A** sends that managed process
+SIGTERM. This is intentionally limited to the configured local process, not
+SSH, Docker, Kubernetes, or remote machines.
+
+For a live, read-only two-Scribe view, supply fixed readiness endpoints:
+
+```sh
+SCRIPTURE_LOCAL_FLEET='[
+  {"id":"Scribe A","verse":"cockpit-verse-a!","route":"127.0.0.1:19201","readyz":"http://127.0.0.1:19301/readyz"},
+  {"id":"Scribe B","verse":"cockpit-verse-b!","route":"127.0.0.1:19202","readyz":"http://127.0.0.1:19302/readyz"}
+]' npm run local:fleet
+```
 
 ## Evidence discipline
 

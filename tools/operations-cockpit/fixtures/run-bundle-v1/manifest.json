@@ -19,6 +19,7 @@
   "inputs": {
     "producer_ledger": "producer-ledger.jsonl",
     "messages": "messages.jsonl",
+    "console_readback": "console-readback.jsonl",
     "scribe_logs": [
       "scribes/scribe-a.jsonl",
       "scribes/scribe-b.jsonl"
@@ -42,6 +43,11 @@
       "label": "message index (digest-first)",
       "verdict": "observed",
       "source": "messages.jsonl"
+    },
+    {
+      "label": "console consumer readback",
+      "verdict": "observed",
+      "source": "console-readback.jsonl"
     },
     {
       "label": "Scribe A structured log",

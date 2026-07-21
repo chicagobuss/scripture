@@ -15,7 +15,7 @@ case "${1:-}" in
     ;;
   action)
     case "${2:-}" in
-      refresh|produce|pause-producer|resume-producer|kill-scribe-a|restart-scribe-a|promote-scribe-b|cut-store-b|restore-store-b|cleanup)
+      refresh|produce|pause-producer|resume-producer|kill-scribe-a|restart-scribe-a|cut-store-b|restore-store-b|cleanup)
         echo "live adapter action not implemented; invoke a scenario-owned runner here" >&2
         exit 64
         ;;

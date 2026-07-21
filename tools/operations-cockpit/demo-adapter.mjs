@@ -22,7 +22,7 @@ function event(state, kind, text) {
 }
 const state = await load();
 state.mode = "demo";
-state.capabilities = ["produce", "pause-producer", "resume-producer", "kill-scribe-a", "restart-scribe-a", "promote-scribe-b", "cut-store-b", "restore-store-b", "cleanup", "refresh"];
+state.capabilities = ["produce", "pause-producer", "resume-producer", "kill-scribe-a", "restart-scribe-a", "cut-store-b", "restore-store-b", "cleanup", "refresh"];
 if (command === "action") {
   const a = state.scribes.find((scribe) => scribe.id === "scribe-a");
   const b = state.scribes.find((scribe) => scribe.id === "scribe-b");
@@ -31,9 +31,8 @@ if (command === "action") {
     case "produce": state.producers.forEach((producer) => { producer.sequence += 1; }); event(state, "observed", "Producer submitted a bounded batch through the demo Wire path."); break;
     case "pause-producer": state.producers.forEach((producer) => { producer.state = "paused"; }); event(state, "observed", "Producers paused; no implied loss or ACK outcome."); break;
     case "resume-producer": state.producers.forEach((producer) => { producer.state = "sending"; }); event(state, "observed", "Producers resumed from their existing sequence state."); break;
-    case "kill-scribe-a": a.posture = "down"; a.reachable = false; event(state, "observed", "Scribe A stopped; B remains a candidate until explicit promotion."); break;
-    case "restart-scribe-a": a.posture = "candidate"; a.reachable = true; event(state, "observed", "Scribe A restarted as a non-serving candidate."); break;
-    case "promote-scribe-b": if (!b.reachable) throw new Error("Scribe B is unreachable"); a.posture = a.reachable ? "sealed" : "down"; b.posture = "serving"; b.term = Math.max(a.term, b.term) + 1; event(state, "oracle_pass", "Demo promotion: B is canonical serving route; A is fenced/sealed."); break;
+    case "kill-scribe-a": a.posture = "down"; a.reachable = false; event(state, "observed", "Scribe A stopped; the fleet continues to expose available members without an operator promotion step."); break;
+    case "restart-scribe-a": a.posture = "available"; a.reachable = true; event(state, "observed", "Scribe A restarted and rejoined the available fleet."); break;
     case "cut-store-b": storeB.state = "isolated"; event(state, "observed", "Demo directional store fault enabled for S3 path."); break;
     case "restore-store-b": storeB.state = "healthy"; event(state, "observed", "Demo directional store fault restored."); break;
     case "cleanup": await copyFile(fixture, statePath); console.log(await readFile(statePath, "utf8")); process.exit(0); break;

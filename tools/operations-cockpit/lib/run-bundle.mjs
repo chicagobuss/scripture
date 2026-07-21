@@ -204,6 +204,7 @@ function collectDeclaredInputPaths(inputs) {
   };
   add(inputs.producer_ledger);
   add(inputs.messages);
+  add(inputs.console_readback);
   add(inputs.scribe_logs);
   add(inputs.object_inventory);
   add(inputs.outputs_register);
@@ -271,6 +272,7 @@ export async function loadRunBundle(bundleRoot) {
   };
   pushRef(inputs.producer_ledger, "inputs.producer_ledger");
   pushRef(inputs.messages, "inputs.messages");
+  pushRef(inputs.console_readback, "inputs.console_readback");
   pushRef(inputs.scribe_logs, "inputs.scribe_logs");
   pushRef(inputs.object_inventory, "inputs.object_inventory");
   pushRef(inputs.outputs_register, "inputs.outputs_register");
@@ -293,6 +295,7 @@ export async function loadRunBundle(bundleRoot) {
 
   const producerLedger = await optionalJsonl(root, inputs.producer_ledger, "producer-ledger");
   const messages = await optionalJsonl(root, inputs.messages, "messages");
+  const consoleReadback = await optionalJsonl(root, inputs.console_readback, "console-readback");
   const objectInventory = await optionalJson(root, inputs.object_inventory, "objects");
   const register = await optionalJson(root, inputs.outputs_register, "outputs/register");
   const parquetSummary = await optionalJson(root, inputs.parquet_summary, "outputs/parquet-summary");
@@ -330,6 +333,7 @@ export async function loadRunBundle(bundleRoot) {
     layers: {
       producer_ledger: layerStatus(producerLedger),
       messages: layerStatus(messages),
+      console_readback: layerStatus(consoleReadback),
       scribe_logs: Object.keys(scribeLogs).length
         ? Object.values(scribeLogs).every((entry) => entry.status === "present") ? "present" : "partial"
         : "not_supplied",
@@ -348,6 +352,8 @@ export async function loadRunBundle(bundleRoot) {
       preview: previewsAllowed && row.preview_allowed === true ? row.preview ?? null : null
     })),
     messagesPath: messages.path,
+    consoleReadback: consoleReadback.rows,
+    consoleReadbackPath: consoleReadback.path,
     scribeLogs,
     objects: objectInventory.value,
     objectsPath: objectInventory.path,
@@ -401,6 +407,11 @@ export function bundleToSnapshot(bundle) {
       },
       layers: bundle.layers,
       messages: bundle.messages,
+      console_readback: {
+        status: bundle.layers.console_readback === "present" ? "present" : "not_supplied",
+        path: bundle.consoleReadbackPath,
+        rows: bundle.consoleReadback
+      },
       producer_ledger: bundle.producerLedger,
       scribe_timelines: Object.fromEntries(
         Object.entries(bundle.scribeLogs).map(([id, entry]) => [
@@ -466,14 +477,16 @@ function summarizeScribes(bundle) {
   if (!ids.length) return [];
   return ids.map((id) => {
     const rows = bundle.scribeLogs[id].rows;
-    const promote = [...rows].reverse().find((row) => row.event_kind === "promote" || row.event_kind === "serving");
+    const available = [...rows].reverse().find((row) =>
+      row.event_kind === "available" || row.event_kind === "recovered" || row.event_kind === "serving"
+    );
     const down = [...rows].reverse().find((row) => row.event_kind === "down" || row.event_kind === "denied");
     const last = rows[rows.length - 1];
     // Process logs are observations, not Serving Authority evidence. Keep the
-    // reported posture for drill-down, but never promote it into the overview's
+    // reported posture for drill-down, but never turn it into the overview's
     // canonical/effective-writer state.
     const reportedPosture = last?.posture
-      ?? (down && (!promote || String(down.at) > String(promote.at)) ? "down" : promote ? "serving" : "unknown");
+      ?? (down && (!available || String(down.at) > String(available.at)) ? "down" : available ? "available" : "unknown");
     return {
       id,
       node: last?.node ?? "fixture",
@@ -544,7 +557,7 @@ function summarizeEvents(bundle) {
   }
   for (const [id, entry] of Object.entries(bundle.scribeLogs)) {
     for (const row of entry.rows) {
-      if (row.event_kind === "promote" || row.event_kind === "down" || row.level === "error") {
+      if (row.event_kind === "recovered" || row.event_kind === "down" || row.level === "error") {
         events.push({
           at: (row.at ?? "").slice(11, 19) || id,
           kind: "observed",
@@ -613,6 +626,14 @@ function buildCrossLinks(bundle) {
     entry.producer = row;
     byDigest.set(row.payload_digest, entry);
   }
+  for (const row of bundle.consoleReadback) {
+    if (!row.digest) continue;
+    const entry = byDigest.get(row.digest) ?? {
+      message: null, producer: null, readback: null, output: null
+    };
+    entry.readback = row;
+    byDigest.set(row.digest, entry);
+  }
   const digests = bundle.parquetSummary?.source_digests;
   if (Array.isArray(digests)) {
     for (const digest of digests) {
@@ -626,6 +647,7 @@ function buildCrossLinks(bundle) {
       digest,
       message: link.message,
       producer: link.producer,
+      readback: link.readback,
       output: link.output,
       complete: Boolean(link.message && link.producer && link.output)
     }));

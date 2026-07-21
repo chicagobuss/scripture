@@ -1,7 +1,7 @@
 const el = (id) => document.getElementById(id);
 const actions = [
   ["produce", "Send batch"], ["pause-producer", "Pause producers"], ["resume-producer", "Resume producers"],
-  ["kill-scribe-a", "Stop Scribe A"], ["restart-scribe-a", "Restart A"], ["promote-scribe-b", "Promote B"],
+  ["kill-scribe-a", "Stop Scribe"], ["restart-scribe-a", "Restart Scribe"],
   ["cut-store-b", "Cut S3 path"], ["restore-store-b", "Restore S3"], ["cleanup", "Reset run"]
 ];
 const verdictLabel = (value) => value.replaceAll("_", " ");
@@ -14,6 +14,15 @@ function empty(label) { return `<div class="empty">${escapeHtml(label)}</div>`; 
 function matches(value, filter) {
   if (!filter) return true;
   return String(value ?? "").toLowerCase().includes(filter.toLowerCase());
+}
+
+function scribeLiveness(scribe) {
+  const reported = String(scribe.reported_posture ?? scribe.posture ?? "").toLowerCase();
+  if (["down", "sealed", "dead"].includes(reported)) return { state: "down", label: "down" };
+  if (!scribe.reachable || ["suspected", "suspected_dead", "unreachable", "unknown"].includes(reported)) {
+    return { state: "suspected", label: "suspected" };
+  }
+  return { state: "online", label: "online" };
 }
 
 let lastState = null;
@@ -42,8 +51,8 @@ function renderMessages(explorer) {
   }
   el("messages").innerHTML = filtered.map((message) => {
     const preview = message.preview
-      ? `<details><summary>lab_nonsecret preview (not a commit claim)</summary><pre>${escapeHtml(JSON.stringify(message.preview, null, 2))}</pre></details>`
-      : `<small>preview off or not marked preview_allowed</small>`;
+      ? `<details><summary>message details</summary><pre>${escapeHtml(JSON.stringify(message.preview, null, 2))}</pre></details>`
+      : `<small>message details not included</small>`;
     return `<div class="row message-row">
       <div>
         <strong>${escapeHtml(message.digest ?? "no-digest")}</strong>
@@ -54,6 +63,31 @@ function renderMessages(explorer) {
       <span class="state ${escapeHtml(message.outcome ?? message.phase ?? "observed")}">${escapeHtml((message.outcome ?? message.phase ?? "observed").replaceAll("_", " "))}</span>
     </div>`;
   }).join("");
+}
+
+function renderConsoleReadback(explorer) {
+  const readback = explorer.console_readback ?? { status: "not_supplied", rows: [] };
+  if (readback.status !== "present") {
+    el("console-readback").innerHTML = empty("Console readback not supplied.");
+    return;
+  }
+  const rows = readback.rows ?? [];
+  if (!rows.length) {
+    el("console-readback").innerHTML = empty("Console consumer observed zero records.");
+    return;
+  }
+  const entries = rows.map((row) => Number(row.entry)).filter(Number.isFinite);
+  const cursor = entries.length ? Math.max(...entries) + 1 : "—";
+  const previewsAllowed = explorer.policy?.payload_previews === "lab_nonsecret";
+  el("console-readback").innerHTML = `
+    <p class="note">${rows.length} record${rows.length === 1 ? "" : "s"} printed · next entry ${escapeHtml(cursor)} · read-only, no checkpoint.</p>
+    ${rows.map((row) => {
+      const payload = previewsAllowed && row.payload != null
+        ? ` · payload=${escapeHtml(row.payload_encoding ?? "text")}:${escapeHtml(row.payload)}`
+        : " · payload not included";
+      return `<div class="row"><div><strong>${escapeHtml(row.digest ?? "no-digest")}</strong><small>${escapeHtml(row.canon ?? "?")}/${escapeHtml(row.verse ?? "?")} · entry ${escapeHtml(row.entry ?? "—")} · record ${escapeHtml(row.record_offset ?? "—")} · ${escapeHtml(row.bytes ?? "?")} bytes${payload}</small></div><span class="state observed">printed</span></div>`;
+    }).join("")}
+  `;
 }
 
 function renderScribeTimeline(explorer) {
@@ -97,8 +131,8 @@ function renderObjects(explorer) {
     byPrefix.set(prefix, (byPrefix.get(prefix) ?? 0) + 1);
   }
   el("object-explorer").innerHTML = `
-    <p class="note">${escapeHtml(objects.note ?? "Inventory observation — not log truth.")}</p>
-    <div class="row"><div><strong>${escapeHtml(objects.provider ?? "unknown")}</strong><small>${total} objects across ${byPrefix.size} prefixes</small></div><span class="state observed">inventory observation</span></div>
+    <p class="note">${escapeHtml(objects.note ?? "Object inventory — not a log.")}</p>
+    <div class="row"><div><strong>${escapeHtml(objects.provider ?? "unknown")}</strong><small>${total} objects across ${byPrefix.size} prefixes</small></div><span class="state observed">inventory</span></div>
     ${[...byPrefix.entries()].map(([prefix, count]) => `<div class="row"><div><strong>${escapeHtml(prefix)}</strong><small>${count} keys</small></div></div>`).join("")}
     ${list.map((item) => `<div class="row"><div><strong>${escapeHtml(item.key)}</strong><small>${escapeHtml(item.size)} B · ${escapeHtml(item.version_or_etag ?? "—")} · ${escapeHtml(item.observed_at ?? "")}${item.note ? ` · ${escapeHtml(item.note)}` : ""}</small></div></div>`).join("")}
   `;
@@ -148,7 +182,7 @@ function renderConsumerOutput(explorer) {
     <h3>Register frontier</h3>${registerHtml}
     <h3>Manifest chain</h3>${manifestsHtml}
     <h3>Parquet summary</h3>${parquetHtml}
-    <h3>Iceberg (verbatim evidence state)</h3>${icebergHtml}
+    <h3>Iceberg status</h3>${icebergHtml}
   `;
 }
 
@@ -158,7 +192,7 @@ function renderMatrix(explorer) {
     ? `<table class="matrix"><thead><tr><th>Claim</th><th>Verdict</th><th>Source</th></tr></thead><tbody>${
       matrix.map((item) => `<tr><td>${escapeHtml(item.claim)}</td><td><span class="verdict ${escapeHtml(item.verdict)}">${escapeHtml(verdictLabel(item.verdict))}</span></td><td><code>${escapeHtml(item.source)}</code></td></tr>`).join("")
     }</tbody></table>`
-    : empty("Evidence matrix empty.");
+    : empty("No run status was collected.");
 
   const links = explorer.cross_links ?? [];
   el("cross-links").innerHTML = links.length
@@ -176,8 +210,9 @@ function renderExplorer(state) {
   }
   section.classList.remove("hidden");
   const layers = state.explorer.layers ?? {};
-  el("explorer-meta").textContent = `${state.explorer.run_id} · previews ${state.explorer.policy?.payload_previews ?? "off"} · oracle ${layers.holylog_oracle ?? "not_supplied"}`;
+  el("explorer-meta").textContent = `${state.explorer.run_id} · ${state.explorer.messages?.length ?? 0} messages · console readback ${layers.console_readback ?? "not supplied"}`;
   renderMessages(state.explorer);
+  renderConsoleReadback(state.explorer);
   renderScribeTimeline(state.explorer);
   renderObjects(state.explorer);
   renderConsumerOutput(state.explorer);
@@ -191,22 +226,23 @@ function render(state) {
   el("mode").textContent = state.mode;
   el("mode").className = `pill ${state.mode}`;
   el("observed").textContent = new Date(state.observedAt).toLocaleTimeString();
-  el("route-note").textContent = state.adapterError ? `adapter stale: ${state.adapterError}` : "route discovery ≠ authority";
+  el("route-note").textContent = state.adapterError ? `adapter stale: ${state.adapterError}` : "current fleet routes";
   const topology = el("topology"); topology.replaceChildren();
-  if (!state.scribes.length) topology.innerHTML = empty("No Scribe topology was supplied by this evidence source.");
+  if (!state.scribes.length) topology.innerHTML = empty("No Scribe information was collected.");
   for (const scribe of state.scribes) {
-    const node = document.createElement("div"); node.className = `scribe ${scribe.posture}`;
-    node.innerHTML = `<div class="scribe-top"><strong>${escapeHtml(scribe.id)}</strong><span class="state ${escapeHtml(scribe.posture)}">${escapeHtml(scribe.posture)}</span></div><small>${escapeHtml(scribe.node)} · ${escapeHtml(scribe.verse)}</small><code>${escapeHtml(scribe.route)}</code><div>reported ${escapeHtml(scribe.reported_posture ?? scribe.posture)} · term ${escapeHtml(scribe.term)} · ${scribe.reachable ? "reachable" : "unreachable"}</div>`;
+    const liveness = scribeLiveness(scribe);
+    const node = document.createElement("div"); node.className = `scribe ${liveness.state}`;
+    node.innerHTML = `<div class="scribe-top"><strong>${escapeHtml(scribe.id)}</strong><span class="state ${liveness.state}">${liveness.label}</span></div><small>${escapeHtml(scribe.node)} · ${escapeHtml(scribe.verse)}</small><code>${escapeHtml(scribe.route)}</code><div>reported ${escapeHtml(scribe.reported_posture ?? scribe.posture)} · term ${escapeHtml(scribe.term)} · ${scribe.reachable ? "reachable" : "unreachable"}</div>`;
     topology.append(node);
   }
   el("evidence-count").textContent = `${state.evidence.length} sources`;
   el("evidence-list").innerHTML = state.evidence.map((item) => `<div class="evidence-row"><span class="verdict ${escapeHtml(item.verdict)}">${escapeHtml(verdictLabel(item.verdict))}</span><div><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(item.source)}</small></div></div>`).join("");
-  const serving = state.scribes.filter((scribe) => scribe.posture === "serving").length;
+  const available = state.scribes.filter((scribe) => scribeLiveness(scribe).state === "online").length;
   const committed = state.producers.filter((producer) => producer.ack === "committed" || String(producer.ack).startsWith("committed:")).length;
-  el("metrics").innerHTML = [["Serving scribes", serving, "effective writer evidence only"], ["Producers", state.producers.length, `${committed} committed profile`], ["Consumers", state.consumers.length, "independent checkpoints"], ["Stores", state.objectStores.length, "prefix-scoped evidence"]].map(([label, value, note]) => `<article class="metric"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
-  el("producers").innerHTML = state.producers.length ? state.producers.map((producer) => row(producer.id, `${producer.kind} · seq ${producer.sequence} · ${producer.ack}`, producer.state)).join("") : empty("No producer observations.");
-  el("consumers").innerHTML = state.consumers.length ? state.consumers.map((consumer) => row(consumer.id, `${consumer.output} · frontier ${consumer.frontier}`, consumer.state)).join("") : empty("No consumer evidence was supplied.");
-  el("stores").innerHTML = state.objectStores.length ? state.objectStores.map((store) => row(store.id, `${store.provider} · ${store.objects} objects`, store.state)).join("") : empty("No object-store evidence was supplied.");
+  el("metrics").innerHTML = [["Available Scribes", available, "fleet members"], ["Producers", state.producers.length, `${committed} committed`], ["Consumers", state.consumers.length, "current progress"], ["Stores", state.objectStores.length, "current run prefix"]].map(([label, value, note]) => `<article class="metric"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
+  el("producers").innerHTML = state.producers.length ? state.producers.map((producer) => row(producer.id, `${producer.kind} · seq ${producer.sequence} · ${producer.ack}`, producer.state)).join("") : empty("No producer activity.");
+  el("consumers").innerHTML = state.consumers.length ? state.consumers.map((consumer) => row(consumer.id, `${consumer.output} · frontier ${consumer.frontier}`, consumer.state)).join("") : empty("No consumer information was collected.");
+  el("stores").innerHTML = state.objectStores.length ? state.objectStores.map((store) => row(store.id, `${store.provider} · ${store.objects} objects`, store.state)).join("") : empty("No object storage information was collected.");
   const capabilities = new Set(state.capabilities);
   el("control-notice").textContent = capabilities.size
     ? "Actions are fixed adapter tokens. The browser cannot run arbitrary commands."

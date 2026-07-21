@@ -6,8 +6,8 @@
   "observedAt": "2026-07-21T05:00:00.000Z",
   "capabilities": [],
   "scribes": [
-    { "id": "scribe-a", "node": "node-a", "verse": "telemetry/host-metrics", "posture": "serving", "reachable": true, "route": "10.0.0.10:9001", "term": 1, "source": "fixture" },
-    { "id": "scribe-b", "node": "node-b", "verse": "telemetry/host-metrics", "posture": "candidate", "reachable": true, "route": "10.0.0.11:9001", "term": 2, "source": "fixture" }
+    { "id": "scribe-a", "node": "node-a", "verse": "telemetry/host-metrics", "posture": "available", "reachable": true, "route": "10.0.0.10:9001", "term": 1, "source": "fixture" },
+    { "id": "scribe-b", "node": "node-b", "verse": "telemetry/host-metrics", "posture": "available", "reachable": true, "route": "10.0.0.11:9001", "term": 2, "source": "fixture" }
   ],
   "producers": [
     { "id": "otel-bridge-a", "kind": "native-wire-outbox", "state": "sending", "sequence": 482, "ack": "committed", "source": "fixture" },

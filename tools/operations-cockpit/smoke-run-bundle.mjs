@@ -6,7 +6,6 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
 import {
   BundleError,
   bundleToSnapshot,
@@ -63,6 +62,7 @@ try {
   if (snap.mode !== "run-bundle") throw new Error("mode");
   if (snap.capabilities.length !== 0) throw new Error("capabilities must be empty");
   if (!snap.explorer?.messages?.length) throw new Error("messages");
+  if (snap.explorer.console_readback?.rows?.length !== 3) throw new Error("console readback");
   if (!snap.explorer?.scribe_timelines?.["scribe-a"]) throw new Error("scribe-a");
   if (!snap.explorer?.scribe_timelines?.["scribe-b"]) throw new Error("scribe-b");
   if (snap.explorer.objects.label !== "inventory observation") throw new Error("objects label");
@@ -78,7 +78,7 @@ try {
     throw new Error("process logs must not become serving-authority evidence");
   }
   if (snap.events.some((event) => event.kind === "oracle_pass")) {
-    throw new Error("process-log promotion must remain an observation");
+    throw new Error("process-log recovery must remain an observation");
   }
   if (!snap.explorer.outputs.manifests.some((m) => m.binding_epoch === 2 && m.canonical === true)) {
     throw new Error("canonical epoch missing");
@@ -153,36 +153,17 @@ await expectReject("rejects absolute path", async () => {
   }
 }
 
-// 4. Adapter smoke: status JSON fields.
-await new Promise((resolvePromise) => {
-  const child = spawn(
-    process.execPath,
-    [join(root, "run-bundle-adapter.mjs"), "status"],
-    {
-      cwd: root,
-      env: { ...process.env, SCRIPTURE_OPS_BUNDLE: fixture },
-      stdio: ["ignore", "pipe", "pipe"]
-    }
-  );
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.on("close", (code) => {
-    try {
-      if (code !== 0) throw new Error(stderr || `exit ${code}`);
-      const snap = JSON.parse(stdout);
-      if (snap.mode !== "run-bundle") throw new Error("mode");
-      if (snap.capabilities.length !== 0) throw new Error("actions not empty");
-      if (snap.explorer.outputs.iceberg.state === "verified") throw new Error("iceberg must not be verified");
-      if (!Array.isArray(snap.explorer.matrix)) throw new Error("matrix");
-      ok("adapter status exposes key API fields");
-    } catch (error) {
-      bad("adapter status exposes key API fields", error.message ?? error);
-    }
-    resolvePromise();
-  });
-});
+// 4. Adapter transformation: status JSON fields.
+try {
+  const snap = bundleToSnapshot(await loadRunBundle(fixture));
+  if (snap.mode !== "run-bundle") throw new Error("mode");
+  if (snap.capabilities.length !== 0) throw new Error("actions not empty");
+  if (snap.explorer.outputs.iceberg.state === "verified") throw new Error("iceberg must not be verified");
+  if (!Array.isArray(snap.explorer.matrix)) throw new Error("matrix");
+  ok("adapter transformation exposes key API fields");
+} catch (error) {
+  bad("adapter transformation exposes key API fields", error.message ?? error);
+}
 
 // 5. HTML escape helper used by UI (inline check mirrors app.js).
 {

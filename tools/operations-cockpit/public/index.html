@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Scripture Operations Cockpit</title>
     <link rel="stylesheet" href="app.css">
-    <style>.state.candidate { color:#342506; background:#ffca68; }</style>
+    <style>.state.available { color:#062216; background:#62e6a7; }</style>
   </head>
   <body>
     <header>
@@ -14,8 +14,8 @@
     </header>
     <main>
       <section class="hero-grid">
-        <article class="topology panel"><div class="panel-heading"><h2>Canonical write path</h2><span id="route-note">route discovery ≠ authority</span></div><div id="topology" class="topology-flow"></div></article>
-        <article class="panel evidence"><div class="panel-heading"><h2>Evidence, not vibes</h2><span id="evidence-count"></span></div><div id="evidence-list"></div></article>
+        <article class="topology panel"><div class="panel-heading"><h2>Scribe fleet</h2><span id="route-note">current fleet routes</span></div><div id="topology" class="topology-flow"></div></article>
+        <article class="panel evidence"><div class="panel-heading"><h2>System status</h2><span id="evidence-count"></span></div><div id="evidence-list"></div></article>
       </section>
       <section class="metrics" id="metrics"></section>
       <section class="grid-three">
@@ -26,8 +26,8 @@
 
       <section id="explorer" class="explorer hidden" aria-live="polite">
         <div class="panel-heading explorer-heading">
-          <h2>Run-bundle evidence explorer</h2>
-          <span id="explorer-meta">source-backed drill-down</span>
+          <h2>Run details</h2>
+          <span id="explorer-meta">messages and system activity</span>
         </div>
         <div class="explorer-filters panel">
           <label>Canon <input id="filter-canon" placeholder="any"></label>
@@ -40,15 +40,19 @@
         </div>
         <div class="grid-explorer">
           <article class="panel">
-            <div class="panel-heading"><h2>Message explorer</h2><span>digest-first · preview ≠ commit</span></div>
+            <div class="panel-heading"><h2>Messages</h2><span>records by digest</span></div>
             <div id="messages"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h2>Console readback</h2><span>read-only · no checkpoint</span></div>
+            <div id="console-readback"></div>
           </article>
           <article class="panel">
             <div class="panel-heading"><h2>Scribe timeline</h2><span>independently sourced A/B</span></div>
             <div id="scribe-timeline"></div>
           </article>
           <article class="panel">
-            <div class="panel-heading"><h2>Object explorer</h2><span>inventory observation</span></div>
+            <div class="panel-heading"><h2>Object explorer</h2><span>current inventory</span></div>
             <div id="object-explorer"></div>
           </article>
           <article class="panel">
@@ -57,7 +61,7 @@
           </article>
         </div>
         <article class="panel">
-          <div class="panel-heading"><h2>Evidence matrix</h2><span>every claim has a source file</span></div>
+          <div class="panel-heading"><h2>Run status</h2><span>what was collected</span></div>
           <div id="evidence-matrix"></div>
           <div id="cross-links" class="cross-links"></div>
         </article>
@@ -65,7 +69,7 @@
 
       <section class="grid-actions">
         <article class="panel controls"><div class="panel-heading"><h2>Controlled operations</h2><span>fixed actions only</span></div><p id="control-notice"></p><div id="controls" class="buttons"></div></article>
-        <article class="panel timeline"><div class="panel-heading"><h2>Event timeline</h2><span>verdict provenance retained</span></div><ol id="events"></ol></article>
+        <article class="panel timeline"><div class="panel-heading"><h2>Event timeline</h2><span>latest activity</span></div><ol id="events"></ol></article>
       </section>
     </main>
     <template id="scribe-template"><div class="scribe"><div class="scribe-top"><strong></strong><span class="state"></span></div><small class="node"></small><code class="route"></code><div class="term"></div></div></template>

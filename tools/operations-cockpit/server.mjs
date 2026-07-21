@@ -26,7 +26,6 @@ const allowedActions = new Set([
   "resume-producer",
   "kill-scribe-a",
   "restart-scribe-a",
-  "promote-scribe-b",
   "cut-store-b",
   "restore-store-b",
   "cleanup"
