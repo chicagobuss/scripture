@@ -1,5 +1,9 @@
 # Scripture
 
+<p align="center">
+  <img src="assets/logo.png" alt="Scripture logo" width="420">
+</p>
+
 **A correctness-first, object-store-native streaming system.** Scripture is
 an early Rust implementation of a Kafka-like durable streaming service that
 does not make the Kafka protocol its foundation. It is built on
