@@ -8,6 +8,7 @@ const verdictLabel = (value) => value.replaceAll("_", " ");
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[c]);
 
 function row(title, detail, state) { return `<div class="row"><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></div><span class="state ${escapeHtml(state)}">${escapeHtml(state.replaceAll("_", " "))}</span></div>`; }
+function empty(label) { return `<div class="empty">${escapeHtml(label)}</div>`; }
 function render(state) {
   el("title").textContent = state.title;
   el("subtitle").textContent = `${state.runId} · ${state.mode === "fixture" ? "read-only fixture — no live claim" : `${state.mode} adapter`}`;
@@ -16,6 +17,7 @@ function render(state) {
   el("observed").textContent = new Date(state.observedAt).toLocaleTimeString();
   el("route-note").textContent = state.adapterError ? `adapter stale: ${state.adapterError}` : "route discovery ≠ authority";
   const topology = el("topology"); topology.replaceChildren();
+  if (!state.scribes.length) topology.innerHTML = empty("No Scribe topology was supplied by this evidence source.");
   for (const scribe of state.scribes) {
     const node = el("div"); node.className = `scribe ${scribe.posture}`;
     node.innerHTML = `<div class="scribe-top"><strong>${escapeHtml(scribe.id)}</strong><span class="state ${escapeHtml(scribe.posture)}">${escapeHtml(scribe.posture)}</span></div><small>${escapeHtml(scribe.node)} · ${escapeHtml(scribe.verse)}</small><code>${escapeHtml(scribe.route)}</code><div>writer term ${escapeHtml(scribe.term)} · ${scribe.reachable ? "reachable" : "unreachable"}</div>`;
@@ -26,9 +28,9 @@ function render(state) {
   const serving = state.scribes.filter((scribe) => scribe.posture === "serving").length;
   const committed = state.producers.filter((producer) => producer.ack === "committed").length;
   el("metrics").innerHTML = [["Serving scribes", serving, "effective writer only"], ["Producers", state.producers.length, `${committed} committed profile`], ["Consumers", state.consumers.length, "independent checkpoints"], ["Stores", state.objectStores.length, "prefix-scoped evidence"]].map(([label, value, note]) => `<article class="metric"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join("");
-  el("producers").innerHTML = state.producers.map((producer) => row(producer.id, `${producer.kind} · seq ${producer.sequence} · ${producer.ack}`, producer.state)).join("");
-  el("consumers").innerHTML = state.consumers.map((consumer) => row(consumer.id, `${consumer.output} · frontier ${consumer.frontier}`, consumer.state)).join("");
-  el("stores").innerHTML = state.objectStores.map((store) => row(store.id, `${store.provider} · ${store.objects} objects`, store.state)).join("");
+  el("producers").innerHTML = state.producers.length ? state.producers.map((producer) => row(producer.id, `${producer.kind} · seq ${producer.sequence} · ${producer.ack}`, producer.state)).join("") : empty("No producer observations.");
+  el("consumers").innerHTML = state.consumers.length ? state.consumers.map((consumer) => row(consumer.id, `${consumer.output} · frontier ${consumer.frontier}`, consumer.state)).join("") : empty("No consumer evidence was supplied.");
+  el("stores").innerHTML = state.objectStores.length ? state.objectStores.map((store) => row(store.id, `${store.provider} · ${store.objects} objects`, store.state)).join("") : empty("No object-store evidence was supplied.");
   const capabilities = new Set(state.capabilities);
   el("control-notice").textContent = capabilities.size ? "Actions are fixed adapter tokens. The browser cannot run arbitrary commands." : "Fixture mode has no mutation authority. Use npm run demo for a safe simulated control loop.";
   el("controls").replaceChildren(...actions.map(([action, label]) => {

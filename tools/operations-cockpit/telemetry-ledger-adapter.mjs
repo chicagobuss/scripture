@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 
 const ledgerPath = process.env.SCRIPTURE_TELEMETRY_LEDGER;
+const topologyPath = process.env.SCRIPTURE_TELEMETRY_TOPOLOGY;
 
 function fail(message) {
   process.stderr.write(`telemetry-ledger-adapter: ${message}\n`);
@@ -42,7 +43,18 @@ function producerKey(row) {
   return `${row.producer_id ?? "unknown-producer"}\u0000${row.verse ?? "unknown-verse"}`;
 }
 
-function snapshot(rows) {
+function emptyTopology() {
+  return { scribes: [], consumers: [], objectStores: [] };
+}
+
+function validTopology(value) {
+  return value && typeof value === "object"
+    && Array.isArray(value.scribes)
+    && Array.isArray(value.consumers ?? [])
+    && Array.isArray(value.objectStores ?? []);
+}
+
+function snapshot(rows, topology, topologySource) {
   const producers = new Map();
   const events = [];
   let committed = 0;
@@ -92,13 +104,17 @@ function snapshot(rows) {
     runId: basename(ledgerPath),
     observedAt: new Date().toISOString(),
     capabilities: [],
-    scribes: [],
+    scribes: topology.scribes.map((scribe) => ({
+      ...scribe,
+      source: scribe.source ?? "declared topology inventory (not authority)"
+    })),
     producers: [...producers.values()].sort((left, right) => left.id.localeCompare(right.id)),
-    consumers: [],
-    objectStores: [],
+    consumers: topology.consumers ?? [],
+    objectStores: topology.objectStores ?? [],
     events,
     evidence: [
       { label: "telemetry send ledger", verdict: "observed", source: resolve(ledgerPath) },
+      ...(topologySource ? [{ label: "declared topology inventory", verdict: "observed", source: topologySource }] : []),
       { label: "producer failover", verdict: failovers ? "observed" : "not_run", source: resolve(ledgerPath) },
       { label: "Scribe authority / Holylog readback", verdict: "not_run", source: "not supplied by a producer-side ledger" },
       { label: "object-store durability", verdict: "not_run", source: "not supplied by a producer-side ledger" }
@@ -111,7 +127,9 @@ if (!ledgerPath) fail("set SCRIPTURE_TELEMETRY_LEDGER to a telemetry producer JS
 
 try {
   const text = await readFile(ledgerPath, "utf8");
-  process.stdout.write(`${JSON.stringify(snapshot(parseLedger(text)))}\n`);
+  const topology = topologyPath ? JSON.parse(await readFile(topologyPath, "utf8")) : emptyTopology();
+  if (!validTopology(topology)) fail("topology must contain a scribes array (and optional consumers/objectStores arrays)");
+  process.stdout.write(`${JSON.stringify(snapshot(parseLedger(text), topology, topologyPath ? resolve(topologyPath) : null))}\n`);
 } catch (error) {
   fail(error.message);
 }

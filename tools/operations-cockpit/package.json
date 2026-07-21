@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "demo": "SCRIPTURE_OPS_ADAPTER=./demo-adapter.mjs node server.mjs"
+    "demo": "SCRIPTURE_OPS_ADAPTER=./demo-adapter.mjs node server.mjs",
+    "demo:telemetry": "SCRIPTURE_TELEMETRY_LEDGER=./telemetry-ledger.fixture.jsonl SCRIPTURE_TELEMETRY_TOPOLOGY=./telemetry-topology.fixture.json SCRIPTURE_OPS_ADAPTER=./telemetry-ledger-adapter.mjs node server.mjs"
   },
   "engines": {
     "node": ">=20"

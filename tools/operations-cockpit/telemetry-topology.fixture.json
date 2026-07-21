@@ -1,0 +1,40 @@
+{
+  "scribes": [
+    {
+      "id": "scribe-a",
+      "node": "node-a",
+      "verse": "telemetry/k8s-node",
+      "posture": "serving",
+      "reachable": true,
+      "route": "scribe-a:9000",
+      "term": 1
+    },
+    {
+      "id": "scribe-b",
+      "node": "node-b",
+      "verse": "telemetry/k8s-node",
+      "posture": "standby",
+      "reachable": true,
+      "route": "scribe-b:9000",
+      "term": 2
+    }
+  ],
+  "consumers": [
+    {
+      "id": "arrow-parquet-transcriber",
+      "state": "declared",
+      "frontier": 0,
+      "output": "not observed in telemetry ledger",
+      "source": "declared topology inventory"
+    }
+  ],
+  "objectStores": [
+    {
+      "id": "telemetry-log-prefix",
+      "provider": "not supplied",
+      "state": "not_observed",
+      "objects": 0,
+      "source": "declared topology inventory"
+    }
+  ]
+}

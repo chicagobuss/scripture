@@ -34,13 +34,17 @@ durability from a producer acknowledgement.
 ```sh
 cd tools/operations-cockpit
 SCRIPTURE_TELEMETRY_LEDGER=/absolute/path/to/send-ledger.jsonl \
+  SCRIPTURE_TELEMETRY_TOPOLOGY=/absolute/path/to/declared-topology.json \
   SCRIPTURE_OPS_ADAPTER="$PWD/telemetry-ledger-adapter.mjs" \
   npm start
 ```
 
 For a safe visual rehearsal with the same adapter, point
-`SCRIPTURE_TELEMETRY_LEDGER` at `telemetry-ledger.fixture.jsonl`. The adapter
-accepts only `status`; cockpit action buttons remain unavailable.
+`SCRIPTURE_TELEMETRY_LEDGER` at `telemetry-ledger.fixture.jsonl` and
+`SCRIPTURE_TELEMETRY_TOPOLOGY` at `telemetry-topology.fixture.json`. The
+topology file is an operator inventory, not evidence that either Scribe has
+authority. The adapter accepts only `status`; cockpit action buttons remain
+unavailable.
 
 ## Live adapter contract
 
