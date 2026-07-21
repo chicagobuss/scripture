@@ -1,0 +1,6 @@
+{
+  "state": "absent",
+  "detail": "No Iceberg metadata/snapshot commit was performed for this fixture run. Parquet manifest evidence does not prove Iceberg.",
+  "table_ident": null,
+  "snapshot_id": null
+}

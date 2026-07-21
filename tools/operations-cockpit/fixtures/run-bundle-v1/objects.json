@@ -1,0 +1,61 @@
+{
+  "provider": "R2",
+  "label": "inventory observation",
+  "observed_at": "2026-07-21T05:29:40.000Z",
+  "prefixes": [
+    "lab/fixture-cutover-evidence-001/log/",
+    "lab/fixture-cutover-evidence-001/out/"
+  ],
+  "objects": [
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/log/",
+      "key": "segments/gen-1/chunk-0001.bin",
+      "size": 4096,
+      "version_or_etag": "etag-log-1",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/log/",
+      "key": "segments/gen-2/chunk-0001.bin",
+      "size": 5120,
+      "version_or_etag": "etag-log-2",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/out/",
+      "key": "binding-epoch-1/part-000.parquet",
+      "size": 8192,
+      "version_or_etag": "etag-out-stale",
+      "observed_at": "2026-07-21T05:29:40.000Z",
+      "note": "stale epoch object; must not become canonical"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/out/",
+      "key": "binding-epoch-1/manifest.json",
+      "size": 420,
+      "version_or_etag": "etag-man-stale",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/out/",
+      "key": "binding-epoch-2/part-000.parquet",
+      "size": 9024,
+      "version_or_etag": "etag-out-canon",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/out/",
+      "key": "binding-epoch-2/manifest.json",
+      "size": 448,
+      "version_or_etag": "etag-man-canon",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    },
+    {
+      "prefix": "lab/fixture-cutover-evidence-001/out/",
+      "key": "progress-register",
+      "size": 96,
+      "version_or_etag": "etag-register-2",
+      "observed_at": "2026-07-21T05:29:40.000Z"
+    }
+  ]
+}

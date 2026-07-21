@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-cutover-evidence-001",
+  "collected_at": "2026-07-21T05:30:00.000Z",
+  "revisions": {
+    "scripture": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "holylog": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "scope": {
+    "namespace": "scripture-lab-fixture",
+    "object_prefixes": [
+      "lab/fixture-cutover-evidence-001/log/",
+      "lab/fixture-cutover-evidence-001/out/"
+    ]
+  },
+  "policy": {
+    "payload_previews": "lab_nonsecret"
+  },
+  "inputs": {
+    "producer_ledger": "producer-ledger.jsonl",
+    "messages": "messages.jsonl",
+    "scribe_logs": [
+      "scribes/scribe-a.jsonl",
+      "scribes/scribe-b.jsonl"
+    ],
+    "object_inventory": "objects.json",
+    "outputs_register": "outputs/register.json",
+    "outputs_manifests": [
+      "outputs/manifests/epoch-2-canonical.json",
+      "outputs/manifests/epoch-1-stale.json"
+    ],
+    "parquet_summary": "outputs/parquet-summary.json",
+    "iceberg": "outputs/iceberg.json"
+  },
+  "verdicts": [
+    {
+      "label": "producer ledger observations",
+      "verdict": "observed",
+      "source": "producer-ledger.jsonl"
+    },
+    {
+      "label": "message index (digest-first)",
+      "verdict": "observed",
+      "source": "messages.jsonl"
+    },
+    {
+      "label": "Scribe A structured log",
+      "verdict": "observed",
+      "source": "scribes/scribe-a.jsonl"
+    },
+    {
+      "label": "Scribe B structured log",
+      "verdict": "observed",
+      "source": "scribes/scribe-b.jsonl"
+    },
+    {
+      "label": "object inventory observation",
+      "verdict": "observed",
+      "source": "objects.json"
+    },
+    {
+      "label": "consumer register frontier",
+      "verdict": "observed",
+      "source": "outputs/register.json"
+    },
+    {
+      "label": "canonical Parquet manifest (epoch 2)",
+      "verdict": "observed",
+      "source": "outputs/manifests/epoch-2-canonical.json"
+    },
+    {
+      "label": "stale epoch-1 output remains noncanonical",
+      "verdict": "observed",
+      "source": "outputs/manifests/epoch-1-stale.json"
+    },
+    {
+      "label": "Parquet independent summary",
+      "verdict": "observed",
+      "source": "outputs/parquet-summary.json"
+    },
+    {
+      "label": "Iceberg table",
+      "verdict": "observed",
+      "source": "outputs/iceberg.json"
+    },
+    {
+      "label": "Holylog oracle",
+      "verdict": "not_run",
+      "source": "not supplied"
+    },
+    {
+      "label": "authority observation",
+      "verdict": "not_run",
+      "source": "not supplied"
+    }
+  ]
+}

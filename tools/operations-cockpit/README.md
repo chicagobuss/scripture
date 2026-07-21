@@ -24,6 +24,70 @@ For a static, read-only visual fixture:
 npm start
 ```
 
+## Run-bundle evidence explorer (`run-bundle-v1`)
+
+Turn one isolated campaign into a **drill-down evidence viewer**. The UI reads
+only an immutable local directory; it never receives cloud credentials and never
+runs kubectl/aws/rclone/shell.
+
+```sh
+cd tools/operations-cockpit
+npm run bundle          # fixture run-bundle-v1
+npm run test:bundle     # fail-closed schema + fixture smoke
+```
+
+Point at a collected bundle:
+
+```sh
+SCRIPTURE_OPS_BUNDLE=/absolute/path/to/run-bundle \
+  SCRIPTURE_OPS_ADAPTER="$PWD/run-bundle-adapter.mjs" \
+  npm start
+```
+
+### Bundle contract
+
+Root `manifest.json`:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "...",
+  "collected_at": "RFC3339",
+  "revisions": {"scripture": "git SHA", "holylog": "git SHA"},
+  "scope": {"namespace": "...", "object_prefixes": ["..."]},
+  "policy": {"payload_previews": "off|lab_nonsecret"},
+  "inputs": {
+    "producer_ledger": "producer-ledger.jsonl",
+    "messages": "messages.jsonl",
+    "scribe_logs": ["scribes/scribe-a.jsonl"],
+    "object_inventory": "objects.json",
+    "outputs_register": "outputs/register.json",
+    "outputs_manifests": ["outputs/manifests/*.json"],
+    "parquet_summary": "outputs/parquet-summary.json",
+    "iceberg": "outputs/iceberg.json"
+  },
+  "verdicts": [{"label": "...", "verdict": "pass|fail|inconclusive|not_run|observed", "source": "relative/path"}]
+}
+```
+
+Rules enforced by `lib/run-bundle.mjs`:
+
+- relative paths only; traversal and absolute paths rejected;
+- unknown `schema_version`, oversized files, malformed JSONL fail closed;
+- every verdict needs a source; `pass` cannot point at a missing file;
+- payload previews stay off unless `policy.payload_previews=lab_nonsecret` and
+  the message row sets `preview_allowed: true`;
+- Iceberg is shown verbatim as `verified|configured_not_verified|absent|not_run`;
+- missing layers render as `not_supplied` / `not_run`, never healthy;
+- run-bundle mode advertises an empty action capability list.
+
+Optional local collector stub (copy/validate only — no live scrape):
+
+```sh
+node bundle-collect.mjs --out /tmp/new-bundle --manifest ./fixtures/run-bundle-v1/manifest.json \
+  --file producer-ledger.jsonl=./fixtures/run-bundle-v1/producer-ledger.jsonl
+```
+
 ## Show a real telemetry-producer run
 
 `scripture-telemetry-producer` writes an append-only JSONL send ledger. The
@@ -70,4 +134,6 @@ enforce its own isolated namespace/prefix and explicit live-run approval.
 
 The UI deliberately distinguishes observed status, oracle verdicts, checker
 verdicts, `not_run`, and `incomplete`. It may visualize a campaign, but it may
-never turn a dashboard color into an HA or durability claim.
+never turn a dashboard color into an HA or durability claim. A run bundle does
+not itself establish HA or durability; object inventory is not committed
+history; Parquet manifests do not prove Iceberg.

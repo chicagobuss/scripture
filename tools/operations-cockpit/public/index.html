@@ -22,6 +22,46 @@
         <article class="panel"><div class="panel-heading"><h2>Consumers</h2><span>independent progress</span></div><div id="consumers"></div></article>
         <article class="panel"><div class="panel-heading"><h2>Object storage</h2><span>current prefix only</span></div><div id="stores"></div></article>
       </section>
+
+      <section id="explorer" class="explorer hidden" aria-live="polite">
+        <div class="panel-heading explorer-heading">
+          <h2>Run-bundle evidence explorer</h2>
+          <span id="explorer-meta">source-backed drill-down</span>
+        </div>
+        <div class="explorer-filters panel">
+          <label>Canon <input id="filter-canon" placeholder="any"></label>
+          <label>Verse <input id="filter-verse" placeholder="any"></label>
+          <label>Producer <input id="filter-producer" placeholder="any"></label>
+          <label>Outcome <input id="filter-outcome" placeholder="any"></label>
+          <label>Digest <input id="filter-digest" placeholder="any"></label>
+          <label>Scribe <input id="filter-scribe" placeholder="any"></label>
+          <label>Level <input id="filter-level" placeholder="any"></label>
+        </div>
+        <div class="grid-explorer">
+          <article class="panel">
+            <div class="panel-heading"><h2>Message explorer</h2><span>digest-first · preview ≠ commit</span></div>
+            <div id="messages"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h2>Scribe timeline</h2><span>independently sourced A/B</span></div>
+            <div id="scribe-timeline"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h2>Object explorer</h2><span>inventory observation</span></div>
+            <div id="object-explorer"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h2>Consumer output</h2><span>register · manifests · parquet · iceberg</span></div>
+            <div id="consumer-output"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-heading"><h2>Evidence matrix</h2><span>every claim has a source file</span></div>
+          <div id="evidence-matrix"></div>
+          <div id="cross-links" class="cross-links"></div>
+        </article>
+      </section>
+
       <section class="grid-actions">
         <article class="panel controls"><div class="panel-heading"><h2>Controlled operations</h2><span>fixed actions only</span></div><p id="control-notice"></p><div id="controls" class="buttons"></div></article>
         <article class="panel timeline"><div class="panel-heading"><h2>Event timeline</h2><span>verdict provenance retained</span></div><ol id="events"></ol></article>

@@ -1,0 +1,19 @@
+{
+  "binding_epoch": 1,
+  "canonical": false,
+  "stale": true,
+  "manifest_digest": "manifest-digest-epoch-1-stale",
+  "schema": {
+    "fields": [
+      {"name": "metric", "type": "utf8"},
+      {"name": "value", "type": "float64"},
+      {"name": "source_digest", "type": "utf8"}
+    ]
+  },
+  "source_range": {"first_offset": 0, "next_offset": 1},
+  "data_objects": [
+    "lab/fixture-cutover-evidence-001/out/binding-epoch-1/part-000.parquet"
+  ],
+  "row_count": 1,
+  "note": "Late/stale epoch-1 output may exist on the prefix but must never overwrite or become canonical."
+}

@@ -1,0 +1,17 @@
+{
+  "binding_epoch": 2,
+  "canonical": true,
+  "manifest_digest": "manifest-digest-epoch-2",
+  "schema": {
+    "fields": [
+      {"name": "metric", "type": "utf8"},
+      {"name": "value", "type": "float64"},
+      {"name": "source_digest", "type": "utf8"}
+    ]
+  },
+  "source_range": {"first_offset": 0, "next_offset": 3},
+  "data_objects": [
+    "lab/fixture-cutover-evidence-001/out/binding-epoch-2/part-000.parquet"
+  ],
+  "row_count": 3
+}

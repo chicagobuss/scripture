@@ -1,0 +1,4 @@
+{"at":"2026-07-21T05:27:50.000Z","level":"info","event_kind":"standby","posture":"standby","node":"node-b","verse":"telemetry/host-metrics","route":"10.0.0.11:9001","term":1,"message":"Scribe B standby candidate for telemetry/host-metrics"}
+{"at":"2026-07-21T05:28:13.400Z","level":"info","event_kind":"promote","posture":"serving","node":"node-b","verse":"telemetry/host-metrics","route":"10.0.0.11:9001","term":2,"message":"Scribe B promoted; writer term 2"}
+{"at":"2026-07-21T05:28:14.000Z","level":"info","event_kind":"serving","posture":"serving","node":"node-b","verse":"telemetry/host-metrics","route":"10.0.0.11:9001","term":2,"message":"Admission open on B after promotion"}
+{"at":"2026-07-21T05:28:20.100Z","level":"info","event_kind":"commit","posture":"serving","node":"node-b","verse":"telemetry/host-metrics","route":"10.0.0.11:9001","term":2,"message":"Committed post-failover producer sequence 2"}

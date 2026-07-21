@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node server.mjs",
     "demo": "SCRIPTURE_OPS_ADAPTER=./demo-adapter.mjs node server.mjs",
-    "demo:telemetry": "SCRIPTURE_TELEMETRY_LEDGER=./telemetry-ledger.fixture.jsonl SCRIPTURE_TELEMETRY_TOPOLOGY=./telemetry-topology.fixture.json SCRIPTURE_OPS_ADAPTER=./telemetry-ledger-adapter.mjs node server.mjs"
+    "demo:telemetry": "SCRIPTURE_TELEMETRY_LEDGER=./telemetry-ledger.fixture.jsonl SCRIPTURE_TELEMETRY_TOPOLOGY=./telemetry-topology.fixture.json SCRIPTURE_OPS_ADAPTER=./telemetry-ledger-adapter.mjs node server.mjs",
+    "bundle": "SCRIPTURE_OPS_ADAPTER=./run-bundle-adapter.mjs SCRIPTURE_OPS_BUNDLE=./fixtures/run-bundle-v1 node server.mjs",
+    "test:bundle": "node smoke-run-bundle.mjs"
   },
   "engines": {
     "node": ">=20"

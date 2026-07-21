@@ -1,0 +1,8 @@
+{
+  "workload_id": "arrow-parquet-transcriber",
+  "binding_token": "fixture-binding-token",
+  "binding_epoch": 2,
+  "frontier": 3,
+  "last_commit_ref": "outputs/manifests/epoch-2-canonical.json",
+  "note": "Register frontier selects canonical output; LIST is not an index."
+}

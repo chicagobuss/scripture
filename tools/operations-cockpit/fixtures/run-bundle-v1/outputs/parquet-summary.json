@@ -1,0 +1,17 @@
+{
+  "status": "present",
+  "generated_by": "fixture independent parquet reader",
+  "canonical_manifest": "outputs/manifests/epoch-2-canonical.json",
+  "binding_epoch": 2,
+  "row_count": 3,
+  "schema_fields": ["metric", "value", "source_digest"],
+  "source_digests": [
+    "digest-pre-failover-aaaa",
+    "digest-denied-bbbb",
+    "digest-post-failover-cccc"
+  ],
+  "data_objects": [
+    "lab/fixture-cutover-evidence-001/out/binding-epoch-2/part-000.parquet"
+  ],
+  "note": "Summary reads canonical Parquet selected by register/manifest chain — not by prefix LIST."
+}

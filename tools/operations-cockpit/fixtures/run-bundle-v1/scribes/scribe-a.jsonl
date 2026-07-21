@@ -1,0 +1,4 @@
+{"at":"2026-07-21T05:27:50.000Z","level":"info","event_kind":"serving","posture":"serving","node":"node-a","verse":"telemetry/host-metrics","route":"10.0.0.10:9001","term":1,"message":"Scribe A serving telemetry/host-metrics at term 1"}
+{"at":"2026-07-21T05:28:11.800Z","level":"warn","event_kind":"denied","posture":"serving","node":"node-a","verse":"telemetry/host-metrics","route":"10.0.0.10:9001","term":1,"message":"Denied producer submit during fence window; client should advance connect chain"}
+{"at":"2026-07-21T05:28:13.200Z","level":"error","event_kind":"down","posture":"down","node":"node-a","verse":"telemetry/host-metrics","route":"10.0.0.10:9001","term":1,"message":"Scribe A process stopped (campaign fault inject)"}
+{"at":"2026-07-21T05:28:18.000Z","level":"info","event_kind":"sealed","posture":"sealed","node":"node-a","verse":"telemetry/host-metrics","route":"10.0.0.10:9001","term":1,"message":"Former writer sealed; no further admission"}
