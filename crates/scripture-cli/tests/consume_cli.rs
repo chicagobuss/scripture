@@ -85,3 +85,26 @@ fn unknown_command_mentions_consume() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("consume"));
 }
+
+#[test]
+fn help_lists_scribe_run() {
+    let output = scripture().arg("help").output().expect("help");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("scribe run"));
+    assert!(
+        stderr.contains("Prefer `scribe run`") || stderr.contains("prefer `scripture scribe run`")
+    );
+}
+
+#[test]
+fn scribe_run_help_exits_zero() {
+    let output = scripture()
+        .args(["scribe", "run", "--help"])
+        .output()
+        .expect("scribe run help");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("peer-grace"));
+    assert!(stderr.contains("no promote/standby") || stderr.contains("lawful successor"));
+}

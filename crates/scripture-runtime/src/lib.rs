@@ -24,6 +24,7 @@ mod producer_routing;
 mod producer_wire;
 mod raw_lines;
 mod scribe;
+mod scribe_lifecycle;
 pub mod shared_blob_sink;
 mod status;
 
@@ -85,6 +86,11 @@ pub use scribe::{
     AssignmentDisposition, AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime,
     IngressBudgets, NodeResourceBudget, NodeResourceSnapshot, ScribeError, ScribeResourceLimits,
     ScribeSupervisor,
+};
+pub use scribe_lifecycle::{
+    HealthyMember, InjectedPeerProbe, PeerProbe, ScribeLifecycle, ScribeLifecycleError,
+    ScribeRunOptions, ScribeRunOutcome, TcpAdvertiseProbe, advertise_socket_addr,
+    observe_expected_generation, route_hint_from_advertise,
 };
 pub use shared_blob_sink::{SharedBlobSink, SharedBlobSinkConfig, SharedBlobSinkMetrics};
 pub use status::{disposition_label, is_ready_to_serve, status_body};

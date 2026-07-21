@@ -20,6 +20,29 @@ no directory, cross-process writer fencing/restart, filtering, consumer-group,
 queue, or physical-reclamation claim. Those remain later decisions rather
 than implicit behavior.
 
+## How this project was built
+
+Scripture and its [holylog](../holylog) kernel were built during a focused
+build week with Josh directing the work through Codex powered by GPT-5.6. That
+was not a one-shot code-generation exercise: Codex was used as a working
+partner to shape designs, implement Rust, run and interpret tests, inspect
+real local services, and review or repair work produced in parallel sessions.
+
+Josh used a lightweight document and task system called Tracker to keep the
+work legible: design notes, work packages for other coding agents, reviews,
+implementation notes, and follow-up fixes live there. The practical loop was
+to state a concrete outcome, give an agent a bounded package, require it to
+build and test the result, then have Codex review the actual branch and drive
+the next correction. That made it possible to parallelize exploration without
+losing the thread of the safety model.
+
+The models were especially useful for moving between levels of the project:
+formal and simulation-based checks around recovery/fencing, Rust workspace
+tests, hermetic integration fixtures, and hands-on runs against local RustFS
+and real object stores such as R2 and S3. The result is intentionally still a
+work in progress, but its claims are tied to executable checks rather than a
+dashboard or an architectural sketch.
+
 ## Protoscripture
 
 `crates/protoscripture` is a **disposable spike** that
@@ -79,16 +102,16 @@ Against a local multi-assignment Scribe (for example RustFS-backed YAML under
 
 ```sh
 # terminal 1
-cargo run -p scripture-cli -- serve --config /path/to/scripture.yaml
+cargo run -p scripture-cli --bin scripture -- serve --config /path/to/scripture.yaml
 
 # terminal 2
-cargo run -p scripture-cli -- produce-lab \
+cargo run -p scripture-cli --bin scripture -- produce-lab \
   --config /path/to/scripture.yaml \
   --canon demo --verse events \
   --workers 1 --per-worker 5
 
 # terminal 3
-cargo run -p scripture-cli -- consume \
+cargo run -p scripture-cli --bin scripture -- consume \
   --config /path/to/scripture.yaml \
   --canon demo --verse events \
   --from 0 --until-records 5 --no-follow
@@ -106,13 +129,34 @@ Use `--format jsonl` for one JSON object per record on stdout (summaries stay on
 stderr). Hermetic coverage lives in `cargo test -p scripture-cli --locked`
 (in-memory ObjectStore + VirtualLog; no cloud credentials).
 
+### Automatic same-Verse fleet lifecycle
+
+Prefer `scripture scribe run` for Serving-Authority fleets. Every member starts
+with the same command (distinct `node.owner_id` / advertise / bind; shared Verse
+store root). The process observes the durable root, bootstraps when empty, joins
+as a healthy non-writer when another owner Serves, and attempts a lawful
+successor CAS only after the peer advertise endpoint looks unreachable for
+`--peer-grace-ms`. Liveness arms recovery; it never grants write authority.
+
+```sh
+cargo run -p scripture-cli --bin scripture -- scribe run --config member-a.yaml
+cargo run -p scripture-cli --bin scripture -- scribe run --config member-b.yaml
+```
+
+`bootstrap` / `promote` remain compatibility wrappers and print a notice pointing
+at `scribe run`. Hermetic coverage:
+
+```sh
+cargo test -p scripture-runtime --test scribe_rejoin --locked
+```
+
 Non-secret settings live in a versioned YAML file (`deny_unknown_fields`).
 Credentials come only from the process environment (`RUSTFS_*`/`AWS_*` or
 `R2_*`) or a Secret-mounted env — never YAML, argv, ConfigMap, or logs.
 Generic Kubernetes examples and the image build live under
 [`deploy/kubernetes`](deploy/kubernetes). Probes: `/livez`, `/readyz`
-(Serving only), `/status`. This surface does not claim automatic failover,
-restart fencing, a public producer protocol, or Decision 0012 recovery.
+(Serving only), `/status`. This surface does not claim unbounded distributed
+liveness, a public producer protocol, or Decision 0012 recovery.
 
 ## Development
 

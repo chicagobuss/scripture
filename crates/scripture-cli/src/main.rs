@@ -23,6 +23,7 @@ mod produce_lab;
 mod promote;
 mod replace;
 mod scribe;
+mod scribe_run;
 mod serve;
 
 use std::error::Error;
@@ -104,7 +105,7 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         "bootstrap" => {
             let (config_path, loglet_id, initial_term) = parse_bootstrap_args(&mut arguments)?;
             let config = ScriptureConfig::load(&config_path)?;
-            bootstrap::bootstrap(config, loglet_id, initial_term).await
+            scribe_run::bootstrap_compat(config, loglet_id, initial_term).await
         }
         "replace" => {
             let (config_path, successor) = parse_replace_args(&mut arguments)?;
@@ -114,7 +115,25 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
         "promote" => {
             let (config_path, term, assignment_id) = parse_promote_args(&mut arguments)?;
             let config = ScriptureConfig::load(&config_path)?;
-            promote::promote(config, term, assignment_id.as_deref()).await
+            scribe_run::promote_compat(config, term, assignment_id.as_deref()).await
+        }
+        "scribe" => {
+            let Some(subcommand) = arguments.next() else {
+                return Err("scribe requires a subcommand (run)".into());
+            };
+            match subcommand.as_str() {
+                "run" => {
+                    let (config_path, peer_grace_ms, initial_term) =
+                        parse_scribe_run_args(&mut arguments)?;
+                    let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+                    scribe_run::scribe_run(config, peer_grace_ms, initial_term).await
+                }
+                "--help" | "-h" | "help" => {
+                    print_scribe_run_help();
+                    Ok(())
+                }
+                other => Err(format!("unknown scribe subcommand {other:?} (expected run)").into()),
+            }
         }
         "directory" => {
             let (config_path, canon, verse) = parse_directory_args(&mut arguments)?;
@@ -146,10 +165,72 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?} (expected validate|bootstrap|replace|promote|serve|directory|doctor|consume|produce-lab|consume-lab)"
+            "unknown command {other:?} (expected validate|bootstrap|replace|promote|scribe|serve|directory|doctor|consume|produce-lab|consume-lab)"
         )
         .into()),
     }
+}
+
+/// Parses `scribe run --config PATH [--peer-grace-ms N] [--initial-term N]`.
+fn parse_scribe_run_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, u64, u64), Box<dyn Error>> {
+    let mut config_path = None;
+    let mut peer_grace_ms = 2_000_u64;
+    let mut initial_term = 1_u64;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => config_path = Some(arguments.next().ok_or("--config requires a path")?),
+            "--peer-grace-ms" => {
+                peer_grace_ms = arguments
+                    .next()
+                    .ok_or("--peer-grace-ms requires N")?
+                    .parse()
+                    .map_err(|error| format!("--peer-grace-ms must be an integer: {error}"))?;
+                if peer_grace_ms == 0 {
+                    return Err("--peer-grace-ms must be non-zero".into());
+                }
+            }
+            "--initial-term" => {
+                initial_term = arguments
+                    .next()
+                    .ok_or("--initial-term requires N")?
+                    .parse()
+                    .map_err(|error| format!("--initial-term must be an integer: {error}"))?;
+                if initial_term == 0 {
+                    return Err("--initial-term must be non-zero".into());
+                }
+            }
+            "--help" | "-h" => {
+                print_scribe_run_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("scribe run: unexpected argument {other}").into()),
+        }
+    }
+    Ok((
+        config_path.ok_or("scribe run requires --config")?,
+        peer_grace_ms,
+        initial_term,
+    ))
+}
+
+fn print_scribe_run_help() {
+    eprintln!(
+        "\
+scripture scribe run — normal same-Verse fleet lifecycle (no promote/standby)
+
+Usage:
+  scripture scribe run --config PATH [--peer-grace-ms N] [--initial-term N]
+
+Every fleet member starts with the same command. The process observes the durable
+VirtualLog root, bootstraps when empty, joins as a healthy non-writer when another
+owner lawfully Serves, and attempts a lawful successor CAS only after the peer
+advertise endpoint looks unreachable for --peer-grace-ms.
+
+Liveness arms recovery; the conditional root remains the authority boundary.
+Prefer this over `bootstrap` / `promote` for Serving-Authority fleets."
+    );
 }
 
 /// Parses `produce-lab --config <p> --canon <c> --verse <v> [--workers N]
@@ -538,10 +619,11 @@ Scripture — durable journal process (ha_claim=false)
 
 Usage:
   scripture validate --config /path/to/scripture.yaml
+  scripture scribe run --config /path/to/scripture.yaml [--peer-grace-ms N]
   scripture bootstrap --config /path/to/scripture.yaml --loglet-id <ID>
-  scripture bootstrap --config /path/to/scripture.yaml [--initial-term N]   # HA mode
+  scripture bootstrap --config /path/to/scripture.yaml [--initial-term N]   # compat
   scripture replace --config /path/to/scripture.yaml --successor-loglet-id <ID>
-  scripture promote --config /path/to/scripture.yaml --candidate-term <N>
+  scripture promote --config /path/to/scripture.yaml --candidate-term <N>   # compat
   scripture promote --config multi.yaml --assignment <ID> --candidate-term <N>
   scripture serve --config /path/to/scripture.yaml
   scripture directory --config /path/to/scripture.yaml [--canon ID --verse ID]
@@ -551,17 +633,15 @@ Usage:
   scripture produce-lab --config PATH --canon ID --verse ID [lab options]
   scripture consume-lab --config PATH --canon ID --verse ID [lab options]
 validate:  load + validate non-secret YAML; no network; no ownership.
-bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
-           long-lived bootstrap-and-serve (one-record VirtualLog root fence).
-           With scribe.assignments: multi-assignment Scribe supervisor (one
-           independent authority root / listener per assignment).
+scribe run: normal fleet lifecycle for one Canon/Verse. Same command on every
+           member. Observes the durable root; bootstraps if empty; joins as a
+           healthy non-writer when another owner Serves; recovers via root CAS
+           only after peer unreachability (liveness arms, never grants).
+bootstrap: compatibility Empty→Serving / legacy one-shot. Prefer `scribe run`.
 replace:   legacy empty open-generation activation; exits; never opens ingress.
-promote:   long-lived promote-and-serve under ha.mode: serving-authority.
-           Single-assignment: --candidate-term only (unchanged).
-           Multi-assignment: --assignment ID --candidate-term N (targeted Verse
-           promote only; siblings keep posture — standby is a dormant candidate).
+promote:   compatibility Expected→Serving. Prefer `scribe run` for fleets.
 serve:     long-running legacy Canon path; refused under Serving-Authority mode
-           (writables cannot cross process exit — use bootstrap/promote).
+           (writables cannot cross process exit — use scribe run).
 directory: list fleet-directory records (decision 0014); optional (canon, verse)
            ranking. Discovery only — never authority.
 doctor:    durability/availability capability report for the four failure
@@ -577,6 +657,8 @@ produce-lab / consume-lab:
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority
+Fleet members share the Verse store root and differ by node.owner_id / advertise /
+listener.bind. Start each with: scripture scribe run --config member.yaml
 Multi-assignment YAML (requires Serving Authority; omits top-level listener/verse):
   scribe:
     assignments:
@@ -585,13 +667,12 @@ Multi-assignment YAML (requires Serving Authority; omits top-level listener/vers
         verse: \"................\"
         cohort_id: \"................\"
         writer_id: \"................\"
-        posture: bootstrap-if-empty   # or standby (dormant candidate)
+        posture: bootstrap-if-empty   # compatibility; prefer scribe run per Verse
         advertise: \"tcp://10.0.0.1:9000\"
         ingress:
           bind: \"10.0.0.1:9000\"
 Authority is membership + Scripture fence on the Holylog VirtualLog root only.
 There is no separate ServingAuthorityStore / CRD backend.
-No live SSH/ZeroTier drill until deterministic multi-assignment HA tests are green.
 
 Non-secret settings come from the YAML file. Object-store credentials come from
 the process environment only:
@@ -605,7 +686,7 @@ Probes (when metrics.status_bind is set):
   /readyz  HTTP 200 only when Serving
   /status  disposition report
 
-This command does not claim automatic failover, restart fencing, a public
-producer protocol, or Decision 0012 recovery.",
+This command does not claim unbounded distributed liveness, a public producer
+protocol, or Decision 0012 recovery. Peer-grace recovery is a bounded arm.",
     );
 }

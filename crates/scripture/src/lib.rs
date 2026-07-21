@@ -86,7 +86,8 @@ pub use serving_authority::{
     WriterTerm,
 };
 pub use spool::{
-    FileSpoolStorage, FrameClassification, FrameKind, InMemorySpoolStorage, ProgressIdentity,
+    ContinuityError, ContinuityId, ContinuityOutbox, ContinuitySnapshot, FileSpoolStorage,
+    FrameClassification, FrameKind, InMemorySpoolStorage, PendingEntry, ProgressIdentity,
     RecoveryClassification, RecoveryReport, ScanTail, SpoolCell, SpoolCellHandle, SpoolCellState,
     SpoolConfig, SpoolError, SpoolFrame, SpoolFrameError, SpoolPoisonCause, SpoolReceiptFuture,
     SpoolStorage, SpoolStorageFaults, ValidFrame, classify_frames, encoded_frame_bytes,
