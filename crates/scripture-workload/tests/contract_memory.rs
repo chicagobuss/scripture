@@ -150,7 +150,7 @@ fn crash_after_output_before_checkpoint_replays_without_duplicate() {
     let writer_fence = acquire(&host, &writer_token);
     assert_eq!(writer_fence.binding.binding_epoch, 1);
     let commit = workload
-        .apply(&batch, &writer_fence)
+        .apply(&batch, &writer_fence, None)
         .expect("apply durable output");
     assert!(commit.output_identity.contains("parquet:"));
     assert_eq!(commit.binding_epoch, 1);
@@ -196,7 +196,9 @@ fn manifest_with_wrong_owner_token_is_not_adopted() {
     let token = BindingToken::new("worker-a").expect("token");
     let fence = acquire(&host, &token);
 
-    workload.apply(&batch, &fence).expect("publish output");
+    workload
+        .apply(&batch, &fence, None)
+        .expect("publish output");
     let manifest_path = fs::read_dir(dir.path())
         .expect("list output")
         .filter_map(Result::ok)
@@ -367,9 +369,10 @@ impl Workload for CountingWorkload {
         &self,
         range: &SourceRange,
         fence: &scripture_workload::AcquiredBinding,
+        _previous_commit_ref: Option<&str>,
     ) -> Result<OutputCommit, WorkloadError> {
         self.applies.fetch_add(1, Ordering::SeqCst);
-        self.inner.apply(range, fence)
+        self.inner.apply(range, fence, None)
     }
 }
 
@@ -437,6 +440,7 @@ impl Workload for LyingWorkload {
         &self,
         _range: &SourceRange,
         _fence: &scripture_workload::AcquiredBinding,
+        _previous_commit_ref: Option<&str>,
     ) -> Result<OutputCommit, WorkloadError> {
         Err(WorkloadError::Config(
             "apply must not run when AlreadyCommitted is returned".into(),
@@ -508,7 +512,9 @@ fn malformed_json_fails_batch() {
     let host = WorkloadHost::new(store);
     let token = BindingToken::new("t").expect("token");
     let fence = acquire(&host, &token);
-    let err = workload.apply(&batch, &fence).expect_err("malformed");
+    let err = workload
+        .apply(&batch, &fence, None)
+        .expect_err("malformed");
     assert!(matches!(err, WorkloadError::MalformedRecord { .. }));
 }
 
@@ -521,7 +527,7 @@ fn schema_mismatch_fails_batch() {
     let host = WorkloadHost::new(store);
     let token = BindingToken::new("t").expect("token");
     let fence = acquire(&host, &token);
-    let err = workload.apply(&batch, &fence).expect_err("type");
+    let err = workload.apply(&batch, &fence, None).expect_err("type");
     assert!(matches!(err, WorkloadError::MalformedRecord { .. }));
 }
 
@@ -634,7 +640,7 @@ fn zombie_schedule(a_resumes_before_b_advance: bool) {
 
     // A produces output, then pauses before register advance (manifest publish done).
     let commit_a = workload
-        .apply(&batch, &fence_a)
+        .apply(&batch, &fence_a, None)
         .expect("A publishes under epoch 1");
     assert_eq!(commit_a.binding_epoch, 1);
 

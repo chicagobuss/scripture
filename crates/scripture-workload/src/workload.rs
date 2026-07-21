@@ -64,10 +64,14 @@ pub trait Workload: Send + Sync {
     ) -> Result<ReconcileOutcome, WorkloadError>;
 
     /// Durably commit output for `range`, embedding workload id, fence, and exact range.
+    ///
+    /// `previous_commit_ref` is the register's observed `last_commit_ref` before this
+    /// apply (if any). It is recorded in the manifest chain — never recovered by LIST.
     fn apply(
         &self,
         range: &SourceRange,
         fence: &AcquiredBinding,
+        previous_commit_ref: Option<&str>,
     ) -> Result<OutputCommit, WorkloadError>;
 }
 

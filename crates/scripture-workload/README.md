@@ -29,11 +29,28 @@ Internal `JournalId` remains a substrate elsewhere; this crate speaks Canon.
 adjacent `.commit.json` manifest (workload id, binding epoch, owner token,
 schema ref, digest, exact range). Object names are blake3-derived and
 workload-scoped so raw Canon/Verse strings cannot escape the output directory.
+When the schema declares `source_digest`, the materializer fills it from the
+raw payload blake3 for producer→Canon→Parquet verification.
+
+## Read-only Canon source
+
+`MemoryCanonSource` / `CanonHistorySource` prove the committed-history adapter
+rules deterministically: continuity, seal-and-replace, unmapped exclusion,
+trim-gap, and cohort offset-chain checks. No register CAS or repair path is
+exposed. A Holylog-backed reader can implement the same trait later.
+
+## Evidence vertical
+
+Local proofs emit `run-bundle-v1` and verify producer ≡ Canon ≡ Parquet over the
+register frontier (`summarize_canonical_parquet` never uses prefix LIST). Live
+drill preflight: `tools/telemetry-evidence-vertical/` (default render only;
+`--execute` refused without explicit approval).
 
 ## Iceberg
 
 See [`ICEBERG_FEASIBILITY.md`](./ICEBERG_FEASIBILITY.md). No Iceberg adapter is
 shipped until metadata commit + provenance + crash reconciliation are proven.
+Evidence state for this vertical is `absent` / `not_run`.
 
 ## Config
 

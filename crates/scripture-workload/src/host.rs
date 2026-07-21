@@ -107,7 +107,7 @@ impl<S: ConsumerProgressStore> WorkloadHost<S> {
         let reconcile = workload.reconcile(range, fence)?;
         let (commit, replayed) = match reconcile {
             ReconcileOutcome::Absent => {
-                let commit = workload.apply(range, fence)?;
+                let commit = workload.apply(range, fence, register.last_commit_ref.as_deref())?;
                 validate_output_commit(&commit, range, fence, &metadata.workload_id)
                     .map_err(|error| HostError::OutputMismatch(error.to_string()))?;
                 (commit, false)

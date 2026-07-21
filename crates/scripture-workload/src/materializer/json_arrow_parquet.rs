@@ -41,6 +41,9 @@ pub struct ParquetCommitManifest {
     pub parquet_file: String,
     /// BLAKE3 digest of the Parquet file bytes (`blake3:<hex>`).
     pub parquet_digest: String,
+    /// Prior manifest/commit ref in the canonical chain (register-selected, not LIST).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_commit_ref: Option<String>,
 }
 
 /// JSON→Arrow→Parquet materializer.
@@ -135,8 +138,8 @@ impl JsonArrowParquetMaterializer {
                     };
                 }
             };
-            let object = match value.as_object() {
-                Some(object) => object,
+            let mut object = match value.as_object() {
+                Some(object) => object.clone(),
                 None => {
                     return Err(WorkloadError::MalformedRecord {
                         offset: record.offset.get(),
@@ -144,8 +147,20 @@ impl JsonArrowParquetMaterializer {
                     });
                 }
             };
+            // Join key for producer → Canon → Parquet verification. When the
+            // declared schema includes `source_digest`, fill it from the raw
+            // payload blake3 unless the JSON already supplied one.
+            if self
+                .field_specs
+                .iter()
+                .any(|(name, _, _)| name == "source_digest")
+            {
+                object.entry("source_digest".to_owned()).or_insert_with(|| {
+                    serde_json::Value::String(format!("{}", blake3::hash(&record.payload).to_hex()))
+                });
+            }
             for builder in &mut builders {
-                builder.append_from_object(object, record.offset)?;
+                builder.append_from_object(&object, record.offset)?;
             }
         }
 
@@ -212,6 +227,7 @@ impl JsonArrowParquetMaterializer {
         fence: &AcquiredBinding,
         parquet_file: &str,
         digest: &str,
+        previous_commit_ref: Option<&str>,
     ) -> Result<(), WorkloadError> {
         let manifest = ParquetCommitManifest {
             workload_id: self.metadata.workload_id.as_str().to_owned(),
@@ -224,6 +240,7 @@ impl JsonArrowParquetMaterializer {
             next_offset: range.next_offset.get(),
             parquet_file: parquet_file.to_owned(),
             parquet_digest: digest.to_owned(),
+            previous_commit_ref: previous_commit_ref.map(str::to_owned),
         };
         let path = self.manifest_path(range, fence.binding.binding_epoch);
         if path.exists() {
@@ -407,6 +424,7 @@ impl Workload for JsonArrowParquetMaterializer {
         &self,
         range: &SourceRange,
         fence: &AcquiredBinding,
+        previous_commit_ref: Option<&str>,
     ) -> Result<OutputCommit, WorkloadError> {
         match self.reconcile(range, fence)? {
             ReconcileOutcome::Absent => {}
@@ -421,13 +439,75 @@ impl Workload for JsonArrowParquetMaterializer {
         }
         let batch = self.decode_batch(range)?;
         let (file_name, digest) = self.write_parquet_publish(range, fence, &batch)?;
-        self.write_manifest_publish(range, fence, &file_name, &digest)?;
+        self.write_manifest_publish(
+            range,
+            fence,
+            &file_name,
+            &digest,
+            previous_commit_ref,
+        )?;
         Ok(OutputCommit {
             workload_id: self.metadata.workload_id.clone(),
             binding_epoch: fence.binding.binding_epoch,
             owner_token: fence.owner_token.as_str().to_owned(),
             source_range: range.clone(),
             output_identity: format!("parquet:{file_name}#{digest}"),
+        })
+    }
+}
+
+impl JsonArrowParquetMaterializer {
+    /// Adversarial/test seam: publish Parquet only (no commit manifest yet).
+    ///
+    /// Leaves the key in an indeterminate state until [`Self::publish_manifest_stage`]
+    /// or a competing epoch wins. Used for pre-manifest zombie schedules.
+    pub fn publish_parquet_stage(
+        &self,
+        range: &SourceRange,
+        fence: &AcquiredBinding,
+    ) -> Result<String, WorkloadError> {
+        match self.reconcile(range, fence)? {
+            ReconcileOutcome::Absent => {}
+            ReconcileOutcome::AlreadyCommitted(_) => {
+                return Err(WorkloadError::Config(
+                    "publish_parquet_stage after AlreadyCommitted".into(),
+                ));
+            }
+            ReconcileOutcome::Indeterminate { detail } => {
+                return Err(WorkloadError::Indeterminate(detail));
+            }
+        }
+        let batch = self.decode_batch(range)?;
+        let (file_name, _digest) = self.write_parquet_publish(range, fence, &batch)?;
+        Ok(file_name)
+    }
+
+    /// Adversarial/test seam: publish the commit manifest after Parquet exists.
+    pub fn publish_manifest_stage(
+        &self,
+        range: &SourceRange,
+        fence: &AcquiredBinding,
+        parquet_file: &str,
+        previous_commit_ref: Option<&str>,
+    ) -> Result<OutputCommit, WorkloadError> {
+        let parquet_path = self.output_dir.join(parquet_file);
+        let bytes = fs::read(&parquet_path).map_err(|error| {
+            WorkloadError::OutputIo(format!("read parquet for late manifest: {error}"))
+        })?;
+        let digest = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        self.write_manifest_publish(
+            range,
+            fence,
+            parquet_file,
+            &digest,
+            previous_commit_ref,
+        )?;
+        Ok(OutputCommit {
+            workload_id: self.metadata.workload_id.clone(),
+            binding_epoch: fence.binding.binding_epoch,
+            owner_token: fence.owner_token.as_str().to_owned(),
+            source_range: range.clone(),
+            output_identity: format!("parquet:{parquet_file}#{digest}"),
         })
     }
 }
