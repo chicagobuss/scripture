@@ -106,6 +106,29 @@ All three accept a stable producer id, epoch, and sequence. On a lost reply,
 retry the exact same tuple and bytes. A timeout is **ambiguous**, never a
 license to advance the sequence.
 
+### Durable producer outbox
+
+The Rust reference client can make that exact replay survive its own process
+crashing:
+
+```sh
+cargo run -p scripture-cli --bin scripture-producer-wire-client -- \
+  127.0.0.1 9001 'hello Scripture' producer-rust-01 1 0 \
+  --outbox /var/lib/my-producer/scripture-host-metrics \
+  --target canon/telemetry/verse/host-metrics
+```
+
+`--outbox` fsyncs the complete encoded Submit before TCP send and retains it
+until a matching Wire ACK. Restarting the client with the same identity,
+sequence, outbox path, and logical target replays the exact durable bytes. A
+changed payload at that sequence fails locally with `IdentityConflict` before a
+network write.
+
+The target is a durable Canon/Verse label, **not** a host:port. A Scribe route
+may change after failover; reusing one outbox for a different logical Verse is
+refused. This outbox is client-side continuity only: it issues no Scripture
+receipt and is distinct from a Scribe's optional pre-commit spool.
+
 ## Compatibility mapping
 
 | Source | v1 status | Important semantic difference |
