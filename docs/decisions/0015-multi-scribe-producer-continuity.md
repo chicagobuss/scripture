@@ -1,6 +1,6 @@
 # Decision: multi-scribe continuity via producer-edge outbox
 
-- Status: accepted (lab proof + automatic rejoin)
+- Status: accepted (lab proof + automatic rejoin + active-active release proof)
 - Date: 2026-07-20 (updated 2026-07-21)
 - Layer: write path | operations
 - Obligation basis: foundation producer continuity across a Scribe fleet
@@ -27,12 +27,18 @@ Ship a **different** continuity design alongside the legacy path:
    remains the only write-authority grant.
 5. Success means every locally durable identity eventually receives a committed
    receipt — zero drop of outbox-admitted work.
+6. **Active-active** (same Canon, disjoint Verses on concurrent Scribes) is a
+   producer-visible property proven hermetically: multi-bootstrap route refresh
+   through a Verse promotion under traffic, no stale committed receipt, sibling
+   Verse isolation, and contiguous consumer history.
 
 Implemented as:
 
 - `scripture::ContinuityOutbox` (`spool/continuity.rs`)
 - `scripture_runtime::ScribeLifecycle` / `scripture scribe run`
-- Hermetic proof: `cargo test -p scripture-runtime --test scribe_rejoin`
+- Hermetic same-Verse rejoin: `cargo test -p scripture-runtime --test scribe_rejoin`
+- Hermetic active-active release proof:
+  `cargo test -p scripture-runtime --test active_active_release`
 
 ## Correctness
 
@@ -40,9 +46,12 @@ Implemented as:
 - Outbox never grants writes; retries are at-least-once by stable event identity.
 - Returning former writers rejoin as healthy non-writers until the root authorizes
   them again.
+- A bootstrap / directory route is never a write grant.
 
 ## Non-claims
 
 - Does not prove unbounded distributed liveness from a bounded peer-grace arm.
 - Does not yet prove multi-process / multi-pod placement beyond hermetic tests.
 - Local-disk outbox survival is under that producer's disk assumptions only.
+- Hermetic active-active is authoritative for release; a real k0s drill remains
+  optional follow-on capacity evidence, not a substitute for this gate.
