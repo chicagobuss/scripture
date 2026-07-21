@@ -1,5 +1,3 @@
-# Scripture
-
 <p align="center">
   <img src="assets/logo.png" alt="Scripture logo" width="420">
 </p>
