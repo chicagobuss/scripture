@@ -136,6 +136,29 @@ cargo test -p scripture --features r2-smoke --test r2 \
   scripture_v0_runs_against_r2 --locked -- --ignored --exact
 ```
 
+## How this project was built
+
+Scripture and its [holylog](../holylog) kernel were built during a focused
+build week with Josh directing the work through Codex powered by GPT-5.6. That
+was not a one-shot code-generation exercise: Codex was used as a working
+partner to shape designs, implement Rust, run and interpret tests, inspect
+real local services, and review or repair work produced in parallel sessions.
+
+Josh used a lightweight document and task system called Tracker to keep the
+work legible: design notes, work packages for other coding agents, reviews,
+implementation notes, and follow-up fixes live there. The practical loop was
+to state a concrete outcome, give an agent a bounded package, require it to
+build and test the result, then have Codex review the actual branch and drive
+the next correction. That made it possible to parallelize exploration without
+losing the thread of the safety model.
+
+The models were especially useful for moving between levels of the project:
+formal and simulation-based checks around recovery/fencing, Rust workspace
+tests, hermetic integration fixtures, and hands-on runs against local RustFS
+and real object stores such as R2 and S3. The result is intentionally still a
+work in progress, but its claims are tied to executable checks rather than a
+dashboard or an architectural sketch.
+
 ## License
 
 MIT
