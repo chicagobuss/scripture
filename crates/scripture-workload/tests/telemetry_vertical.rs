@@ -58,11 +58,7 @@ fn binding_key() -> BindingKey {
     )
 }
 
-fn test_register(
-    frontier: u64,
-    epoch: u64,
-    last_commit_ref: Option<&str>,
-) -> ProgressRegister {
+fn test_register(frontier: u64, epoch: u64, last_commit_ref: Option<&str>) -> ProgressRegister {
     ProgressRegister {
         binding: ConsumerBinding {
             workload_id: WorkloadId::new("wl-telemetry").expect("id"),
@@ -273,7 +269,8 @@ fn chain_rejects_cycle() {
 fn chain_rejects_escaped_commit_ref() {
     let dir = tempdir().expect("temp");
     let register = test_register(1, 1, Some("../evil.commit.json"));
-    let err = walk_manifest_chain(dir.path(), "../evil.commit.json", &register).expect_err("escape");
+    let err =
+        walk_manifest_chain(dir.path(), "../evil.commit.json", &register).expect_err("escape");
     assert!(matches!(err, SummaryError::Manifest(_)));
 }
 
@@ -371,7 +368,8 @@ fn summary_rejects_stale_epoch() {
     };
     write_manifest(&out.join("future.commit.json"), &manifest);
     let register = test_register(1, 2, Some("parquet:future.parquet#future"));
-    let err = walk_manifest_chain(&out, "parquet:future.parquet#future", &register).expect_err("epoch");
+    let err =
+        walk_manifest_chain(&out, "parquet:future.parquet#future", &register).expect_err("epoch");
     assert!(matches!(err, SummaryError::Chain(_)));
     assert!(err.to_string().contains("stale register snapshot"));
 }

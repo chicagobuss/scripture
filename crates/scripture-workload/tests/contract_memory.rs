@@ -512,9 +512,7 @@ fn malformed_json_fails_batch() {
     let host = WorkloadHost::new(store);
     let token = BindingToken::new("t").expect("token");
     let fence = acquire(&host, &token);
-    let err = workload
-        .apply(&batch, &fence, None)
-        .expect_err("malformed");
+    let err = workload.apply(&batch, &fence, None).expect_err("malformed");
     assert!(matches!(err, WorkloadError::MalformedRecord { .. }));
 }
 

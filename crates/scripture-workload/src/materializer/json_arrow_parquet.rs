@@ -439,13 +439,7 @@ impl Workload for JsonArrowParquetMaterializer {
         }
         let batch = self.decode_batch(range)?;
         let (file_name, digest) = self.write_parquet_publish(range, fence, &batch)?;
-        self.write_manifest_publish(
-            range,
-            fence,
-            &file_name,
-            &digest,
-            previous_commit_ref,
-        )?;
+        self.write_manifest_publish(range, fence, &file_name, &digest, previous_commit_ref)?;
         Ok(OutputCommit {
             workload_id: self.metadata.workload_id.clone(),
             binding_epoch: fence.binding.binding_epoch,
@@ -495,13 +489,7 @@ impl JsonArrowParquetMaterializer {
             WorkloadError::OutputIo(format!("read parquet for late manifest: {error}"))
         })?;
         let digest = format!("blake3:{}", blake3::hash(&bytes).to_hex());
-        self.write_manifest_publish(
-            range,
-            fence,
-            parquet_file,
-            &digest,
-            previous_commit_ref,
-        )?;
+        self.write_manifest_publish(range, fence, parquet_file, &digest, previous_commit_ref)?;
         Ok(OutputCommit {
             workload_id: self.metadata.workload_id.clone(),
             binding_epoch: fence.binding.binding_epoch,

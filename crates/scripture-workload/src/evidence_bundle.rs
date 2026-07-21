@@ -113,7 +113,10 @@ pub fn emit_run_bundle_v1(
                     "iceberg verified requires table_ident and snapshot_id evidence".into(),
                 )
             })?;
-            (Some(evidence.table_ident.clone()), Some(evidence.snapshot_id.clone()))
+            (
+                Some(evidence.table_ident.clone()),
+                Some(evidence.snapshot_id.clone()),
+            )
         }
         _ => (None, None),
     };
@@ -167,7 +170,11 @@ pub fn emit_run_bundle_v1(
             "observed",
             "outputs/parquet-summary.json",
         ),
-        verdict("Iceberg table", iceberg_verdict(emit.iceberg), "outputs/iceberg.json"),
+        verdict(
+            "Iceberg table",
+            iceberg_verdict(emit.iceberg),
+            "outputs/iceberg.json",
+        ),
     ];
     for path in &scribe_paths {
         verdicts.push(verdict("Scribe structured log", "observed", path));
@@ -237,7 +244,9 @@ fn validate_emit(emit: &RunBundleEmit) -> Result<(), BundleEmitError> {
 
 fn validate_path_component(component: &str, label: &str) -> Result<(), BundleEmitError> {
     if component.is_empty() {
-        return Err(BundleEmitError::Validation(format!("{label} must not be empty")));
+        return Err(BundleEmitError::Validation(format!(
+            "{label} must not be empty"
+        )));
     }
     if component.contains('\0') {
         return Err(BundleEmitError::Validation(format!("{label} contains NUL")));

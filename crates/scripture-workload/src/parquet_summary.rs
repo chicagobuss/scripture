@@ -180,7 +180,9 @@ pub fn walk_manifest_chain(
             return Err(SummaryError::Chain("chain exceeds max length".into()));
         }
         if !visited.insert(commit_ref.clone()) {
-            return Err(SummaryError::Chain("cycle detected in manifest chain".into()));
+            return Err(SummaryError::Chain(
+                "cycle detected in manifest chain".into(),
+            ));
         }
         let (path, manifest) = resolve_manifest_for_commit_ref(&output_dir, &commit_ref)?;
         ensure_path_inside(&output_dir, &path)?;
@@ -237,7 +239,9 @@ pub fn walk_manifest_chain(
 
 fn validate_parquet_file_name(name: &str) -> Result<(), SummaryError> {
     if name.is_empty() {
-        return Err(SummaryError::Manifest("parquet_file must not be empty".into()));
+        return Err(SummaryError::Manifest(
+            "parquet_file must not be empty".into(),
+        ));
     }
     if name.contains('\0') {
         return Err(SummaryError::Manifest("parquet_file contains NUL".into()));
@@ -256,9 +260,9 @@ fn validate_parquet_file_name(name: &str) -> Result<(), SummaryError> {
 }
 
 fn ensure_path_inside(root: &Path, path: &Path) -> Result<(), SummaryError> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| SummaryError::Manifest(format!("canonicalize {}: {error}", path.display())))?;
+    let canonical = path.canonicalize().map_err(|error| {
+        SummaryError::Manifest(format!("canonicalize {}: {error}", path.display()))
+    })?;
     if !canonical.starts_with(root) {
         return Err(SummaryError::Chain(format!(
             "manifest path escapes output dir: {}",
@@ -281,7 +285,9 @@ fn resolve_manifest_for_commit_ref(
             .next()
             .ok_or_else(|| SummaryError::Manifest("empty parquet commit ref".into()))?;
         if file.contains('/') || file.contains('\\') || file.contains("..") {
-            return Err(SummaryError::Manifest("escaped parquet file in commit ref".into()));
+            return Err(SummaryError::Manifest(
+                "escaped parquet file in commit ref".into(),
+            ));
         }
         let stem = file
             .strip_suffix(".parquet")
@@ -316,10 +322,7 @@ fn read_manifest(path: &Path) -> Result<ParquetCommitManifest, SummaryError> {
         .map_err(|error| SummaryError::Manifest(format!("decode {}: {error}", path.display())))
 }
 
-fn read_parquet_stats(
-    path: &Path,
-    base_offset: u64,
-) -> Result<ParquetReadStats, SummaryError> {
+fn read_parquet_stats(path: &Path, base_offset: u64) -> Result<ParquetReadStats, SummaryError> {
     let file = fs::File::open(path)
         .map_err(|error| SummaryError::Parquet(format!("open {}: {error}", path.display())))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
