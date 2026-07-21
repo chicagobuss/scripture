@@ -1,4 +1,4 @@
-//! Object-store durable Loglet parts for Scripture (RustFS / R2).
+//! Object-store durable Loglet parts for Scripture (RustFS / R2 / Amazon S3).
 
 use std::sync::Arc;
 

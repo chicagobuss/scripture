@@ -179,7 +179,7 @@ pub struct VerseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfig {
-    /// Durable-store profile: `rustfs` or `r2`.
+    /// Durable-store profile: `rustfs`, `r2`, or attested Amazon `s3`.
     pub backend: String,
     pub endpoint: String,
     pub bucket: String,
