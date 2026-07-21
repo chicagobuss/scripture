@@ -2,14 +2,15 @@
 """Experimental Scripture Producer Wire v1 reference codec.
 
 Run `python3 producer_wire_v1.py --self-test` to verify the shared golden
-vectors. This is transport-ready but no Scribe Wire listener exists yet; it is
-not a production SDK or a replacement for the current raw-lines harness.
+vectors, or give `--host`, `--port`, and `--payload` to contact an experimental
+direct Scribe Producer Wire endpoint. It is not a production SDK.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import socket
 import struct
 from pathlib import Path
 from typing import Iterable
@@ -66,6 +67,56 @@ def decode(frame: bytes) -> tuple[int, bytes]:
     return kind, frame[9:]
 
 
+def _read_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("Scribe closed before a complete frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_frame(sock: socket.socket) -> bytes:
+    prefix = _read_exact(sock, 4)
+    (length,) = struct.unpack(">I", prefix)
+    if length > MAX_FRAME_BYTES:
+        raise ValueError("peer declared oversized frame")
+    return prefix + _read_exact(sock, length)
+
+
+def send_once(host: str, port: int, producer_id: bytes, epoch: int, sequence: int, payload: bytes) -> None:
+    """Submit one record and print only the received durable outcome.
+
+    A timeout or connection loss is deliberately raised as ambiguous. A caller
+    may reconnect and retry this exact `(producer_id, epoch, sequence, payload)`
+    tuple; it must never advance the sequence merely because a reply was lost.
+    """
+    with socket.create_connection((host, port), timeout=10) as sock:
+        sock.sendall(hello(producer_id, epoch) + submit(sequence, [payload]))
+        kind, body = decode(_read_frame(sock))
+    if kind == ACK:
+        ack_epoch, ack_sequence, first, next_offset = struct.unpack(">IQQQ", body)
+        if ack_epoch != epoch or ack_sequence != sequence:
+            raise ValueError("Scribe ACK does not match submitted identity")
+        print(json.dumps({"verdict": "ack", "epoch": ack_epoch, "sequence": ack_sequence,
+                          "first_offset": first, "next_offset": next_offset}))
+        return
+    if kind == ERROR:
+        if len(body) < 17:
+            raise ValueError("truncated Error")
+        error_epoch, error_sequence = struct.unpack(">IQ", body[:12])
+        code = body[12]
+        (size,) = struct.unpack(">I", body[13:17])
+        if len(body) != 17 + size:
+            raise ValueError("invalid Error length")
+        message = body[17:].decode("utf-8")
+        raise RuntimeError(f"Scribe error epoch={error_epoch} sequence={error_sequence} code={code}: {message}")
+    raise ValueError(f"expected Ack or Error, got frame type {kind}")
+
+
 def self_test() -> None:
     vectors = json.loads(Path(__file__).parents[1].joinpath("producer-wire-v1-vectors.json").read_text())
     h = vectors["hello"]
@@ -81,7 +132,18 @@ def self_test() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--payload")
+    parser.add_argument("--producer-id", default="producer-py-demo")
+    parser.add_argument("--epoch", type=int, default=1)
+    parser.add_argument("--sequence", type=int, default=1)
     args = parser.parse_args()
-    if not args.self_test:
-        parser.error("only --self-test is available until the Scribe Wire listener lands")
-    self_test()
+    if args.self_test:
+        self_test()
+    elif args.host and args.port and args.payload is not None:
+        producer_id = args.producer_id.encode("ascii")
+        send_once(args.host, args.port, producer_id, args.epoch, args.sequence,
+                  args.payload.encode("utf-8"))
+    else:
+        parser.error("use --self-test or --host HOST --port PORT --payload TEXT")

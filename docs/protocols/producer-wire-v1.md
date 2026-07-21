@@ -83,14 +83,29 @@ Error codes: 1 NotServing; 2 Backpressure; 3 IdentityConflict; 4 Unsupported;
 ## Golden vectors
 
 See `examples/clients/producer-wire-v1-vectors.json`. Python and Node reference
-codecs run `--self-test` against it. The Rust codec has the same Hello vector
+clients run `--self-test` against it. The Rust codec has the same Hello vector
 as a unit test.
+
+Direct experimental client examples:
+
+```sh
+python3 examples/clients/python/producer_wire_v1.py \
+  --host 127.0.0.1 --port 9001 --payload 'hello Scripture'
+node examples/clients/node/producer_wire_v1.mjs \
+  --host 127.0.0.1 --port 9001 --payload 'hello Scripture'
+cargo run -p scripture-cli --bin scripture-producer-wire-client -- \
+  127.0.0.1 9001 'hello Scripture'
+```
+
+All three accept a stable producer id, epoch, and sequence. On a lost reply,
+retry the exact same tuple and bytes. A timeout is **ambiguous**, never a
+license to advance the sequence.
 
 ## Compatibility mapping
 
 | Source | v1 status | Important semantic difference |
 |---|---|---|
-| Native Rust/Python/Node client | planned client transport | retains producer identity/epoch/sequence |
+| Native Rust/Python/Node client | experimental direct endpoint | retains producer identity/epoch/sequence |
 | raw-lines | existing lab ingress | connection-scoped identity; reconnect retry is ambiguous |
 | rsyslog TCP | future bridge | TCP delivery is not a source ACK protocol |
 | OTel Collector | future bridge | no claim of OTLP compatibility until a concrete protocol is implemented |

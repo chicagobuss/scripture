@@ -13,13 +13,18 @@ path = "src/main.rs"
 # Avoid cargo-doc path collision with the `scripture` library crate.
 doc = false
 
+[[bin]]
+name = "scripture-producer-wire-client"
+path = "src/bin/producer_wire_client.rs"
+doc = false
+
 [features]
 default = []
 # Test-only Holylog fault/trace bridge for correctness-campaign actor images.
-campaign-faults = ["dep:holylog-correctness", "dep:bytes", "scripture-service/virtuallog-test-support"]
+campaign-faults = ["dep:holylog-correctness", "scripture-service/virtuallog-test-support"]
 
 [dependencies]
-bytes = { workspace = true, optional = true }
+bytes.workspace = true
 holylog.workspace = true
 holylog-correctness = { workspace = true, optional = true }
 holylog-object-store = { workspace = true, features = ["s3"] }
