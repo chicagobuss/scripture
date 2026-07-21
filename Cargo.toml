@@ -16,13 +16,14 @@ resolver = "3"
 bytes = "1.12"
 futures = "0.3"
 # Versions must match crates inside git tag v0.2.2 (holylog-correctness is 0.1.0).
-# `registry = "fleet"` keeps cargo package off crates.io; local resolve still uses
-# the git tag until Kellnr hosts the packages (see .cargo/config.toml.example).
-holylog = { version = "0.2.2", registry = "fleet", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
-holylog-correctness = { version = "0.1.0", registry = "fleet", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
-holylog-remote-sequencer-http = { version = "0.2.2", registry = "fleet", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
-holylog-object-store = { version = "0.2.2", registry = "fleet", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
-holylog-object-store-register = { version = "0.2.2", registry = "fleet", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
+# A source checkout resolves Holylog directly from that pinned tag. Private-registry
+# endpoints and tokens are deployment/publishing concerns and must not be needed to
+# load this workspace's manifest on another machine.
+holylog = { version = "0.2.2", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
+holylog-correctness = { version = "0.1.0", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
+holylog-remote-sequencer-http = { version = "0.2.2", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
+holylog-object-store = { version = "0.2.2", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
+holylog-object-store-register = { version = "0.2.2", git = "ssh://git@github.com/chicagobuss/holylog.git", tag = "v0.2.2" }
 object_store = { version = "0.14", default-features = false }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 crc32c = "0.6"
