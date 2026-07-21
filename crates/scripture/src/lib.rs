@@ -16,6 +16,7 @@ pub mod dataref;
 pub mod driver;
 pub mod journal;
 pub mod model;
+pub mod producer_wire;
 pub mod receipt;
 pub mod sequencer_key;
 pub mod serving_authority;
@@ -62,6 +63,11 @@ pub use journal::{
 };
 pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
+};
+pub use producer_wire::{
+    MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_BYTES, MAX_RECORDS_PER_SUBMIT, ProducerWireError,
+    ProducerWireErrorCode, ProducerWireFrame, decode_producer_wire_frame,
+    encode_producer_wire_frame,
 };
 pub use receipt::{
     AchievedProfile, AdmitPlan, CommittedReceipt, ProducerReceipt, ReceiptPolicyError,
