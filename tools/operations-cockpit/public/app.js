@@ -19,7 +19,7 @@ function render(state) {
   const topology = el("topology"); topology.replaceChildren();
   if (!state.scribes.length) topology.innerHTML = empty("No Scribe topology was supplied by this evidence source.");
   for (const scribe of state.scribes) {
-    const node = el("div"); node.className = `scribe ${scribe.posture}`;
+    const node = document.createElement("div"); node.className = `scribe ${scribe.posture}`;
     node.innerHTML = `<div class="scribe-top"><strong>${escapeHtml(scribe.id)}</strong><span class="state ${escapeHtml(scribe.posture)}">${escapeHtml(scribe.posture)}</span></div><small>${escapeHtml(scribe.node)} · ${escapeHtml(scribe.verse)}</small><code>${escapeHtml(scribe.route)}</code><div>writer term ${escapeHtml(scribe.term)} · ${scribe.reachable ? "reachable" : "unreachable"}</div>`;
     topology.append(node);
   }
