@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "mode": "fixture",
+  "title": "Two-scribe telemetry Canon",
+  "runId": "demo-cutover-001",
+  "observedAt": "2026-07-21T05:00:00.000Z",
+  "capabilities": [],
+  "scribes": [
+    { "id": "scribe-a", "node": "node-a", "verse": "telemetry/host-metrics", "posture": "serving", "reachable": true, "route": "10.0.0.10:9001", "term": 1, "source": "fixture" },
+    { "id": "scribe-b", "node": "node-b", "verse": "telemetry/host-metrics", "posture": "standby", "reachable": true, "route": "10.0.0.11:9001", "term": 2, "source": "fixture" }
+  ],
+  "producers": [
+    { "id": "otel-bridge-a", "kind": "native-wire-outbox", "state": "sending", "sequence": 482, "ack": "committed", "source": "fixture" },
+    { "id": "metrics-generator", "kind": "native-wire", "state": "sending", "sequence": 229, "ack": "committed", "source": "fixture" }
+  ],
+  "consumers": [
+    { "id": "arrow-parquet-transcriber", "state": "caught_up", "frontier": 711, "output": "parquet manifest", "source": "fixture" }
+  ],
+  "objectStores": [
+    { "id": "r2-isolated-prefix", "provider": "R2", "state": "healthy", "objects": 34, "source": "fixture" },
+    { "id": "s3-isolated-prefix", "provider": "S3", "state": "healthy", "objects": 34, "source": "fixture" }
+  ],
+  "events": [
+    { "at": "05:00:00", "kind": "observed", "text": "Fixture topology loaded; no live authority claim." },
+    { "at": "05:00:03", "kind": "oracle_pass", "text": "Canonical active Scribe is A at term 1." },
+    { "at": "05:00:04", "kind": "checker_inconclusive", "text": "No trace bundle is attached to fixture mode." }
+  ],
+  "evidence": [
+    { "label": "fixture topology", "verdict": "observed", "source": "tools/operations-cockpit/fixture-state.json" },
+    { "label": "Holylog oracle", "verdict": "not_run", "source": "fixture mode" }
+  ]
+}

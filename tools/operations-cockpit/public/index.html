@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Scripture Operations Cockpit</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <header>
+      <div><p class="eyebrow">SCRIPTURE / OPERATIONS COCKPIT</p><h1 id="title">Loading topology…</h1><p id="subtitle">Connecting to local adapter</p></div>
+      <div class="header-right"><span id="mode" class="pill">loading</span><time id="observed"></time></div>
+    </header>
+    <main>
+      <section class="hero-grid">
+        <article class="topology panel"><div class="panel-heading"><h2>Canonical write path</h2><span id="route-note">route discovery ≠ authority</span></div><div id="topology" class="topology-flow"></div></article>
+        <article class="panel evidence"><div class="panel-heading"><h2>Evidence, not vibes</h2><span id="evidence-count"></span></div><div id="evidence-list"></div></article>
+      </section>
+      <section class="metrics" id="metrics"></section>
+      <section class="grid-three">
+        <article class="panel"><div class="panel-heading"><h2>Producers</h2><span>exact identity / receipt</span></div><div id="producers"></div></article>
+        <article class="panel"><div class="panel-heading"><h2>Consumers</h2><span>independent progress</span></div><div id="consumers"></div></article>
+        <article class="panel"><div class="panel-heading"><h2>Object storage</h2><span>current prefix only</span></div><div id="stores"></div></article>
+      </section>
+      <section class="grid-actions">
+        <article class="panel controls"><div class="panel-heading"><h2>Controlled operations</h2><span>fixed actions only</span></div><p id="control-notice"></p><div id="controls" class="buttons"></div></article>
+        <article class="panel timeline"><div class="panel-heading"><h2>Event timeline</h2><span>verdict provenance retained</span></div><ol id="events"></ol></article>
+      </section>
+    </main>
+    <template id="scribe-template"><div class="scribe"><div class="scribe-top"><strong></strong><span class="state"></span></div><small class="node"></small><code class="route"></code><div class="term"></div></div></template>
+    <script src="app.js"></script>
+  </body>
+</html>

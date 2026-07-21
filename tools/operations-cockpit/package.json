@@ -1,0 +1,14 @@
+{
+  "name": "scripture-operations-cockpit",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Local-only operations UI for Scripture demos and correctness campaigns",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "demo": "SCRIPTURE_OPS_ADAPTER=./demo-adapter.mjs node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
