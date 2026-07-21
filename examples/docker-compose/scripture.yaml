@@ -1,0 +1,27 @@
+# Compose demo configuration: one Scribe, one Canon, one Verse, and a local
+# named-volume backend. It is intentionally a single-host demonstration, not
+# an HA or cloud-durability configuration.
+version: 1
+
+node:
+  owner_id: "scripture-own-a!"
+  advertise: "tcp://scripture:9000"
+
+listener:
+  bind: "0.0.0.0:9000"
+
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+
+store:
+  backend: file
+  path: "/var/lib/scripture"
+  prefix: "compose-demo"
+
+paths: {}
+
+metrics:
+  status_bind: "0.0.0.0:9100"

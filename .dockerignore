@@ -3,7 +3,9 @@
 .git
 target
 **/target
+.tmp
 config/local
+.scripture-local-data
 deploy/fleet-exercise/bin
 deploy/fleet-exercise/results
 Cargo.lock.bak
