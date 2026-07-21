@@ -18,7 +18,7 @@ use scripture::{
 };
 use scripture_runtime::{BackendProfile, assignment_durable_root};
 use scripture_service::VerseRuntimeConfig;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Supported configuration schema version.
@@ -47,6 +47,9 @@ pub struct ScriptureConfig {
     /// Multi-assignment Scribe supervisor configuration.
     #[serde(default)]
     pub scribe: Option<ScribeConfig>,
+    /// Optional durability/availability policy (`safety.require`).
+    #[serde(default)]
+    pub safety: Option<SafetyConfig>,
 }
 
 /// Static multi-assignment Scribe layout for this process.
@@ -150,6 +153,225 @@ pub enum HaMode {
     Legacy,
     /// Require one-record VirtualLog root Serving fence before committed ACKs.
     ServingAuthority,
+}
+
+/// Operator durability/availability policy. Omitted preserves prior behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SafetyConfig {
+    /// Required guarantees. Unknown / retired keys are rejected with specific messages.
+    #[serde(default)]
+    pub require: SafetyRequire,
+    /// Action when a required guarantee is unsatisfied. Default: fail_start.
+    #[serde(default)]
+    pub on_degraded: OnDegraded,
+    /// Optional candidates for static scoring of `scribe_recovery: automatic`.
+    /// Without these, automatic recovery cannot be verified in `validate`.
+    #[serde(default)]
+    pub declared_eligible_candidates: Vec<DeclaredEligibleCandidate>,
+}
+
+/// Declared recovery candidate for hermetic / static preflight scoring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredEligibleCandidate {
+    /// Exact Canon this candidate targets.
+    pub canon: String,
+    /// Exact Verse this candidate targets.
+    pub verse: String,
+    /// Owner id of the candidate.
+    pub owner_id: String,
+    /// Serving-capable role (admits committed ACKs / active serving).
+    pub serving_capable: bool,
+    /// Fresh within the configured staleness bound.
+    pub fresh: bool,
+}
+
+/// Required capability guarantees (canonical receipt vocabulary only).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SafetyRequire {
+    /// Canon history durability: only `committed` is accepted.
+    pub canon_history: Option<CanonHistoryRequire>,
+    /// Producer continuity: only `spooled` is accepted.
+    pub producer_continuity: Option<ProducerContinuityRequire>,
+    /// Scribe recovery: only `automatic` is accepted.
+    pub scribe_recovery: Option<ScribeRecoveryRequire>,
+    /// Minimum independent storage failure domains (>= 1).
+    pub min_storage_failure_domains: Option<u32>,
+}
+
+/// Canon history requirement value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonHistoryRequire {
+    /// Lawfully committed into the Canon backend.
+    Committed,
+}
+
+/// Producer continuity requirement value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerContinuityRequire {
+    /// Durable producer/edge spool (`spooled` receipt capability).
+    Spooled,
+}
+
+/// Scribe recovery requirement value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScribeRecoveryRequire {
+    /// Automatic Verse recovery via eligible candidates.
+    Automatic,
+}
+
+/// Action when a required guarantee cannot be satisfied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDegraded {
+    /// Refuse to start / fail `validate` (default).
+    #[default]
+    FailStart,
+    /// Emit stable capability warnings and continue.
+    Warn,
+}
+
+impl<'de> Deserialize<'de> for OnDegraded {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "fail_start" => Ok(Self::FailStart),
+            "warn" => Ok(Self::Warn),
+            other => Err(D::Error::custom(format!(
+                "safety.on_degraded: invalid value {other:?} (expected fail_start or warn)"
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SafetyRequire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+        use std::collections::BTreeMap;
+
+        let map: BTreeMap<String, serde_yaml::Value> = BTreeMap::deserialize(deserializer)?;
+        let mut require = SafetyRequire::default();
+        for (key, value) in map {
+            match key.as_str() {
+                "canon_history" => {
+                    let raw = scalar_string(&value).map_err(D::Error::custom)?;
+                    match raw.as_str() {
+                        "committed" => {
+                            require.canon_history = Some(CanonHistoryRequire::Committed);
+                        }
+                        "canon_committed" => {
+                            return Err(D::Error::custom(
+                                "safety.require.canon_history: retired vocabulary 'canon_committed'; use 'committed'",
+                            ));
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "safety.require.canon_history: invalid value {other:?} (expected committed)"
+                            )));
+                        }
+                    }
+                }
+                "producer_continuity" => {
+                    let raw = scalar_string(&value).map_err(D::Error::custom)?;
+                    match raw.as_str() {
+                        "spooled" => {
+                            require.producer_continuity = Some(ProducerContinuityRequire::Spooled);
+                        }
+                        "local_durable" => {
+                            return Err(D::Error::custom(
+                                "safety.require.producer_continuity: retired vocabulary 'local_durable'; use 'spooled'",
+                            ));
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "safety.require.producer_continuity: invalid value {other:?} (expected spooled)"
+                            )));
+                        }
+                    }
+                }
+                "scribe_recovery" => {
+                    let raw = scalar_string(&value).map_err(D::Error::custom)?;
+                    match raw.as_str() {
+                        "automatic" => {
+                            require.scribe_recovery = Some(ScribeRecoveryRequire::Automatic);
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!(
+                                "safety.require.scribe_recovery: invalid value {other:?} (expected automatic)"
+                            )));
+                        }
+                    }
+                }
+                "min_storage_failure_domains" => {
+                    let n = match value {
+                        serde_yaml::Value::Number(number) => {
+                            if let Some(u) = number.as_u64() {
+                                u
+                            } else if let Some(i) = number.as_i64() {
+                                if i < 0 {
+                                    return Err(D::Error::custom(
+                                        "safety.require.min_storage_failure_domains must be an integer >= 1",
+                                    ));
+                                }
+                                i as u64
+                            } else {
+                                return Err(D::Error::custom(
+                                    "safety.require.min_storage_failure_domains must be an integer >= 1",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(D::Error::custom(
+                                "safety.require.min_storage_failure_domains must be an integer >= 1",
+                            ));
+                        }
+                    };
+                    if n < 1 || n > u64::from(u32::MAX) {
+                        return Err(D::Error::custom(
+                            "safety.require.min_storage_failure_domains must be an integer >= 1",
+                        ));
+                    }
+                    require.min_storage_failure_domains = Some(n as u32);
+                }
+                "canon_committed" => {
+                    return Err(D::Error::custom(
+                        "unknown safety.require key 'canon_committed' (retired; use canon_history: committed)",
+                    ));
+                }
+                "local_durable" => {
+                    return Err(D::Error::custom(
+                        "unknown safety.require key 'local_durable' (retired; use producer_continuity: spooled)",
+                    ));
+                }
+                other => {
+                    return Err(D::Error::custom(format!(
+                        "unknown safety.require key '{other}'"
+                    )));
+                }
+            }
+        }
+        Ok(require)
+    }
+}
+
+fn scalar_string(value: &serde_yaml::Value) -> Result<String, String> {
+    match value {
+        serde_yaml::Value::String(s) => Ok(s.clone()),
+        serde_yaml::Value::Bool(b) => Ok(b.to_string()),
+        serde_yaml::Value::Number(n) => Ok(n.to_string()),
+        _ => Err("expected a scalar string".to_owned()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +495,25 @@ impl ScriptureConfig {
             self.validate_multi_assignment()?;
         } else {
             self.validate_single_assignment()?;
+        }
+        if let Some(safety) = &self.safety {
+            Self::validate_safety(safety)?;
+        }
+        Ok(())
+    }
+
+    fn validate_safety(safety: &SafetyConfig) -> Result<(), ConfigError> {
+        for (index, candidate) in safety.declared_eligible_candidates.iter().enumerate() {
+            if candidate.canon.trim().is_empty() || candidate.verse.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "safety.declared_eligible_candidates[{index}]: canon and verse are required"
+                )));
+            }
+            if candidate.owner_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "safety.declared_eligible_candidates[{index}]: owner_id is required"
+                )));
+            }
         }
         Ok(())
     }

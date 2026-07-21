@@ -10,6 +10,7 @@ mod authority_gate;
 pub mod blob_reader;
 pub mod blob_rewrite;
 pub mod blob_writer;
+pub mod capability;
 pub mod chunk_blob_store;
 pub mod counting_store;
 mod credentials;
@@ -46,6 +47,12 @@ pub use blob_writer::{
     BlobCutReason, BlobEnvelope, BlobEnvelopeSource, BlobWriter, BlobWriterConfig, BlobWriterError,
     CutPlan, DEFAULT_MAX_LINGER, DEFAULT_TARGET_BLOB_BYTES, DataRefAppendTarget,
     PlacementCommitOutcome, VerseSealer, commit_cut_plan,
+};
+pub use capability::{
+    CapabilityCode, CapabilityFinding, CapabilityInputs, CapabilityReport, CapabilityScope,
+    RecoveryCandidateEvidence, RequiredGuarantee, Satisfaction, SatisfactionKind,
+    ServingNowEvidence, VerseCapabilityInputs, VerseRecoverySatisfaction,
+    collect_requirement_findings, evaluate, is_eligible_recovery_candidate,
 };
 pub use chunk_blob_store::ObjectStoreChunkBlobStore;
 pub use credentials::{CredentialError, StoreCredentials, resolve_credentials};

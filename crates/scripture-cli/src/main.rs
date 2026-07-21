@@ -19,12 +19,16 @@ mod consume_lab;
 mod directory_cmd;
 mod doctor;
 mod ha_activate;
+mod preflight;
 mod produce_lab;
 mod promote;
 mod replace;
 mod scribe;
 mod scribe_run;
 mod serve;
+
+#[cfg(test)]
+mod safety_accept;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -75,26 +79,13 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
                     let _ = config.assignment_advertise(assignment)?;
                     let _ = config.assignment_store_root(assignment)?;
                 }
-                eprintln!(
-                    "scripture: validate ok version={} owner={} advertise={} backend={} prefix={} assignments={}",
-                    config.version,
-                    config.node.owner_id,
-                    config.node.advertise,
-                    config.store.backend,
-                    config.store.prefix.trim_end_matches('/'),
-                    scribe.assignments.len(),
-                );
             } else {
                 let _ = config.verse_runtime_config()?;
-                eprintln!(
-                    "scripture: validate ok version={} owner={} advertise={} backend={} prefix={}",
-                    config.version,
-                    config.node.owner_id,
-                    config.node.advertise,
-                    config.store.backend,
-                    config.store.prefix.trim_end_matches('/'),
-                );
             }
+            // Static safety.require gate (config-only; hermetic). Omitted safety
+            // preserves exact prior validate behavior after this point.
+            preflight::run_static_preflight(&config)?;
+            eprintln!("{}", preflight::format_validate_ok(&config));
             Ok(())
         }
         "serve" => {

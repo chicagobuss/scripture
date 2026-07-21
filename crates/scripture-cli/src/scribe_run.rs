@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 
 use crate::assemble;
 use crate::config::{HaMode, ScriptureConfig};
+use crate::preflight;
 
 /// Runs the automatic Scribe lifecycle until this process is the lawful writer,
 /// then serves HA ingress on the pre-bound listener.
@@ -32,6 +33,9 @@ pub async fn scribe_run(
     peer_grace_ms: u64,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
+    // Static safety.require gate before listener bind / lifecycle assembly.
+    preflight::run_static_preflight(&config)?;
+
     if config.is_multi_assignment() {
         return Err(
             "scribe run currently targets one Canon/Verse per process; use a single-assignment Serving-Authority config (shared store root across fleet members)"

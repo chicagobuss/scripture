@@ -38,3 +38,19 @@ metrics:
 # Omit bootstrap YAML — greenfield uses:
 #   scripture bootstrap --config … --loglet-id <ID>
 # then ordinary: scripture serve --config …
+#
+# Optional durability/availability policy (canonical receipt vocabulary):
+# safety:
+#   require:
+#     canon_history: committed          # not canon_committed
+#     producer_continuity: spooled      # not local_durable
+#     scribe_recovery: automatic
+#     min_storage_failure_domains: 1
+#   on_degraded: fail_start             # or: warn
+#   # Optional static scoring for scribe_recovery (else validate requires live preflight):
+#   # declared_eligible_candidates:
+#   #   - canon: "scripture-jrnl!!"
+#   #     verse: "scripture-verse!"
+#   #     owner_id: "node-a!!!!!!!!!!"
+#   #     serving_capable: true
+#   #     fresh: true

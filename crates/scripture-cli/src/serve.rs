@@ -23,8 +23,12 @@ use tokio::net::TcpListener;
 
 use crate::assemble;
 use crate::config::{HaMode, ScriptureConfig};
+use crate::preflight;
 
 pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
+    // Static safety.require gate before any assemble / listen / lifecycle.
+    preflight::run_static_preflight(&config)?;
+
     if config.is_multi_assignment() {
         return Err(
             "refusing plain `scripture serve` for scribe.assignments — use \

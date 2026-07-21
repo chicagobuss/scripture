@@ -3,6 +3,10 @@
 //! Reports four failure boundaries separately. Capabilities are derived from
 //! evidence (config + fleet directory + authority root), never from a replica
 //! count or a Kubernetes label (foundation loudness rule 5).
+//!
+//! The typed satisfaction source is the shared pure
+//! [`scripture_runtime::evaluate`]; this module builds live [`CapabilityInputs`]
+//! and renders the existing human/JSON disclosure shape.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -13,7 +17,11 @@ use object_store::path::Path;
 use scripture::OwnerId;
 use scripture::serving_authority::{AuthorityState, ServingAuthorityRecord};
 use scripture_runtime::ProcessLogletResolver;
-use scripture_runtime::directory::{self, DirectoryRecord, RankedCandidate};
+use scripture_runtime::directory::{self, DirectoryRecord};
+use scripture_runtime::{
+    CapabilityInputs, CapabilityReport as TypedCapabilityReport, RecoveryCandidateEvidence,
+    ServingNowEvidence, VerseCapabilityInputs, VerseRecoverySatisfaction, evaluate,
+};
 use serde::Serialize;
 
 use crate::assemble::{self, SharedStore};
@@ -47,124 +55,205 @@ pub async fn doctor(config: ScriptureConfig, format: DoctorFormat) -> Result<(),
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CapabilityReport {
-    canon_history: CanonHistoryReport,
-    producer_continuity: ProducerContinuityReport,
-    scribe_availability: Vec<ScribeAvailabilityReport>,
-    failure_domain_durability: FailureDomainReport,
+pub struct CapabilityReport {
+    pub canon_history: CanonHistoryReport,
+    pub producer_continuity: ProducerContinuityReport,
+    pub scribe_availability: Vec<ScribeAvailabilityReport>,
+    pub failure_domain_durability: FailureDomainReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CanonHistoryReport {
-    backend: String,
-    storage_targets: u32,
-    summary: String,
-    evidence: String,
-    result: String,
+pub struct CanonHistoryReport {
+    pub backend: String,
+    pub storage_targets: u32,
+    pub summary: String,
+    pub evidence: String,
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ProducerContinuityReport {
-    durable_local_outbox: String,
+pub struct ProducerContinuityReport {
+    pub durable_local_outbox: String,
     /// Receipt profiles this node can offer (`committed` always; `spooled` only
     /// with a constructed capability that publishes a loss budget).
-    receipt_profiles: String,
+    pub receipt_profiles: String,
     /// Loss budget text when `spooled` is available; empty when not offered.
-    spooled_loss_budget: String,
-    evidence: String,
-    result: String,
+    pub spooled_loss_budget: String,
+    pub evidence: String,
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct FailureDomainReport {
-    independent_storage_targets: u32,
-    evidence: String,
-    result: String,
+pub struct FailureDomainReport {
+    pub independent_storage_targets: u32,
+    pub evidence: String,
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ScribeAvailabilityReport {
-    canon: String,
-    verse: String,
+pub struct ScribeAvailabilityReport {
+    pub canon: String,
+    pub verse: String,
     /// Fresh heartbeats only — never a guaranteed cluster size.
-    candidates_observed_heartbeating: u32,
-    candidates: Vec<CandidateLine>,
+    pub candidates_observed_heartbeating: u32,
+    pub candidates: Vec<CandidateLine>,
     /// Owner named by the authority root, when Serving.
-    serving_now: Option<ServingNow>,
+    pub serving_now: Option<ServingNow>,
     /// Why the candidate count is soft evidence.
-    evidence: String,
+    pub evidence: String,
     /// Empty vs expired vs fresh — mutually distinct text.
-    observation: String,
-    result: String,
+    pub observation: String,
+    /// Recovery verdict from the shared evaluator's Satisfaction consequence.
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CandidateLine {
-    owner_id: String,
-    posture: String,
-    disposition: String,
-    age_ms: u64,
-    age_display: String,
+pub struct CandidateLine {
+    pub owner_id: String,
+    pub posture: String,
+    pub disposition: String,
+    pub age_ms: u64,
+    pub age_display: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ServingNow {
-    owner_id: String,
-    effective_writer: bool,
-    state: String,
+pub struct ServingNow {
+    pub owner_id: String,
+    pub effective_writer: bool,
+    pub state: String,
+}
+
+/// Doctor disclosure from injected [`CapabilityInputs`] (no I/O).
+///
+/// Runs the shared pure evaluator, then renders via the same path as live
+/// `scripture doctor`. Acceptance tests use this to assert doctor recovery
+/// status derives from evaluator `scribe_recovery` Satisfaction (no drift).
+#[cfg(test)]
+pub fn disclose_from_inputs(inputs: &CapabilityInputs) -> CapabilityReport {
+    let typed = evaluate(inputs);
+    render_disclosure(inputs, &typed)
 }
 
 async fn build_report(
     config: &ScriptureConfig,
     shared: &SharedStore,
 ) -> Result<CapabilityReport, Box<dyn Error>> {
+    let inputs = build_live_capability_inputs(config, shared).await?;
+    let typed = evaluate(&inputs);
+    Ok(render_disclosure(&inputs, &typed))
+}
+
+/// Assemble live capability evidence (I/O). Pure evaluation is separate.
+async fn build_live_capability_inputs(
+    config: &ScriptureConfig,
+    shared: &SharedStore,
+) -> Result<CapabilityInputs, Box<dyn Error>> {
     let backend = config.backend()?;
     let records = directory::list_all(&shared.store, &config.store.prefix).await?;
     let now = directory::now_ms();
-
     let scopes = verse_scopes(config)?;
-    let mut scribe_availability = Vec::with_capacity(scopes.len());
+    let mut verses = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let serving = observe_serving_owner(config, shared, &scope).await?;
-        scribe_availability.push(scribe_availability_for(
-            &records,
-            &scope.canon,
-            &scope.verse,
-            now,
-            serving,
-        ));
+        let candidates = candidates_from_directory(&records, &scope.canon, &scope.verse, now);
+        verses.push(VerseCapabilityInputs {
+            canon: scope.canon,
+            verse: scope.verse,
+            candidates,
+            serving_now: serving.map(|s| ServingNowEvidence {
+                owner_id: s.owner_id,
+                effective_writer: s.effective_writer,
+                state: s.state,
+            }),
+            // Live path always has observed evidence (even if empty directory).
+            candidates_declared_for_static: true,
+            fleet_directory_nonempty: !records.is_empty(),
+        });
     }
+    Ok(CapabilityInputs {
+        backend_label: backend.label().to_owned(),
+        independent_storage_targets: 1,
+        committed_capable_target: true,
+        // Honest: no producer-outbox config exists yet.
+        durable_producer_spool_configured: false,
+        verses,
+    })
+}
 
-    Ok(CapabilityReport {
+fn candidates_from_directory(
+    records: &[DirectoryRecord],
+    canon: &str,
+    verse: &str,
+    now_ms: u64,
+) -> Vec<RecoveryCandidateEvidence> {
+    let mut out = Vec::new();
+    for record in records {
+        for assignment in &record.assignments {
+            if assignment.canon != canon || assignment.verse != verse {
+                continue;
+            }
+            out.push(RecoveryCandidateEvidence {
+                owner_id: record.owner_id.clone(),
+                canon: assignment.canon.clone(),
+                verse: assignment.verse.clone(),
+                serving_capable: assignment.admits_committed_acks,
+                fresh: record.is_fresh_at(now_ms),
+                age_ms: record.age_ms_at(now_ms),
+                posture: assignment.posture.clone(),
+                disposition: assignment.disposition.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn render_disclosure(inputs: &CapabilityInputs, typed: &TypedCapabilityReport) -> CapabilityReport {
+    debug_assert_eq!(inputs.verses.len(), typed.scribe_recovery.len());
+    let scribe_availability = inputs
+        .verses
+        .iter()
+        .zip(typed.scribe_recovery.iter())
+        .map(|(verse, recovery)| scribe_availability_for(verse, recovery))
+        .collect();
+
+    CapabilityReport {
         canon_history: CanonHistoryReport {
-            backend: backend.label().to_owned(),
-            storage_targets: 1,
+            backend: inputs.backend_label.clone(),
+            storage_targets: inputs.independent_storage_targets,
             summary: format!(
                 "Canon-committed records: durable on configured object-store target (backend={})",
-                backend.label()
+                inputs.backend_label
             ),
             evidence: "store.backend + single configured target in YAML".to_owned(),
-            result: "history survives Scribe process restart after a Canon-committed ACK"
-                .to_owned(),
+            result: if inputs.committed_capable_target {
+                "history survives Scribe process restart after a Canon-committed ACK"
+                    .to_owned()
+            } else {
+                typed.canon_history.consequence.clone()
+            },
         },
         producer_continuity: ProducerContinuityReport {
-            // Honest: no edge outbox exists yet. Do not invent a substrate.
-            durable_local_outbox: "NOT CONFIGURED".to_owned(),
-            // Pre-commit spool WAL exists in-library; serve-path wiring is not
-            // on by default. A `spooled` profile without a published loss budget
-            // cannot construct (`ScribeSpoolCapability::validate`).
+            durable_local_outbox: if inputs.durable_producer_spool_configured {
+                "CONFIGURED".to_owned()
+            } else {
+                "NOT CONFIGURED".to_owned()
+            },
             receipt_profiles: "committed (default); spooled available only when a ScribeSpoolCapability with a published loss_budget is constructed".to_owned(),
             spooled_loss_budget: String::new(),
             evidence: "receipt vocabulary in scripture::receipt; PreCommitSpool in scripture-runtime; serve path still committed-only unless spool capability is mounted".to_owned(),
-            result: "an ordinary Scribe restart stalls producers for committed-only paths. If spooled were enabled, up to loss_budget of acknowledged data could be lost if this Scribe is destroyed before upload — durability is not availability.".to_owned(),
+            result: if inputs.durable_producer_spool_configured {
+                typed.producer_continuity.consequence.clone()
+            } else {
+                "an ordinary Scribe restart stalls producers for committed-only paths. If spooled were enabled, up to loss_budget of acknowledged data could be lost if this Scribe is destroyed before upload — durability is not availability.".to_owned()
+            },
         },
         scribe_availability,
         failure_domain_durability: FailureDomainReport {
-            independent_storage_targets: 1,
+            independent_storage_targets: inputs.independent_storage_targets,
             evidence: "store configuration names one backend endpoint/bucket".to_owned(),
-            result: "acknowledged data and authority share one storage failure domain".to_owned(),
+            result: typed.failure_domains.consequence.clone(),
         },
-    })
+    }
 }
 
 struct VerseScope {
@@ -265,99 +354,74 @@ fn owner_display(owner: OwnerId) -> String {
     String::from_utf8_lossy(&owner.as_bytes()).into_owned()
 }
 
-/// Pure scribe-availability section so tests can assert empty / stale / fresh
-/// without talking to object storage.
+/// Scribe-availability section: observation from directory evidence; recovery
+/// **result** from the shared evaluator's [`VerseRecoverySatisfaction`] only.
+///
+/// Fresh heartbeats remain soft display evidence. Eligibility (fresh ∧
+/// serving_capable) is decided solely by the evaluator — never recomputed here.
 fn scribe_availability_for(
-    records: &[DirectoryRecord],
-    canon: &str,
-    verse: &str,
-    now_ms: u64,
-    serving: Option<ServingNow>,
+    verse_inputs: &VerseCapabilityInputs,
+    recovery: &VerseRecoverySatisfaction,
 ) -> ScribeAvailabilityReport {
-    let ranked = directory::rank_candidates(records, canon, verse, now_ms);
-    let fresh: Vec<&RankedCandidate> = ranked.iter().filter(|c| c.fresh).collect();
-    let stale_for_verse = ranked.iter().any(|c| !c.fresh);
+    let canon = verse_inputs.canon.as_str();
+    let verse = verse_inputs.verse.as_str();
+    let fresh: Vec<&RecoveryCandidateEvidence> = verse_inputs
+        .candidates
+        .iter()
+        .filter(|c| c.canon == canon && c.verse == verse && c.fresh)
+        .collect();
+    let stale_for_verse = verse_inputs
+        .candidates
+        .iter()
+        .any(|c| c.canon == canon && c.verse == verse && !c.fresh);
     let ttl_secs = DIRECTORY_TTL_MS / 1000;
 
-    let (observation, result) = if records.is_empty() {
-        (
-            "no node has ever published to the fleet directory".to_owned(),
-            "no automatic Verse recovery after this Scribe fails; recovery evidence is absent"
-                .to_owned(),
-        )
-    } else if fresh.is_empty() && stale_for_verse {
-        (
-            "every directory record naming this Verse has expired".to_owned(),
-            "no automatic Verse recovery while evidence is stale; a dead Scribe can still appear for up to one TTL, and a partitioned healthy Scribe is invisible".to_owned(),
-        )
-    } else if fresh.is_empty() {
-        (
-            "no directory record names this Verse".to_owned(),
-            "no automatic Verse recovery after this Scribe fails".to_owned(),
-        )
-    } else if fresh.len() == 1 {
-        (
-            format!("candidates observed heartbeating for {canon}/{verse}: 1"),
-            "one candidate can recover this Verse. Post-failure redundancy would be exhausted."
-                .to_owned(),
-        )
-    } else {
-        (
+    let observation =
+        if !verse_inputs.fleet_directory_nonempty && verse_inputs.candidates.is_empty() {
+            "no node has ever published to the fleet directory".to_owned()
+        } else if fresh.is_empty() && stale_for_verse {
+            "every directory record naming this Verse has expired".to_owned()
+        } else if fresh.is_empty() {
+            "no directory record names this Verse".to_owned()
+        } else {
             format!(
                 "candidates observed heartbeating for {canon}/{verse}: {}",
                 fresh.len()
-            ),
-            format!(
-                "{} candidates observed heartbeating; one Scribe failure can still leave a recovery path",
-                fresh.len()
-            ),
-        )
-    };
+            )
+        };
+
+    // Recovery verdict: evaluator Satisfaction only (no second computation).
+    let result = recovery.satisfaction.consequence.clone();
 
     let candidates = fresh
         .iter()
-        .map(|candidate| {
-            let posture = posture_for(records, &candidate.owner_id, canon, verse)
-                .unwrap_or_else(|| candidate.disposition.clone());
-            CandidateLine {
-                owner_id: candidate.owner_id.clone(),
-                posture,
-                disposition: candidate.disposition.clone(),
-                age_ms: candidate.age_ms,
-                age_display: format_age(candidate.age_ms),
-            }
+        .map(|candidate| CandidateLine {
+            owner_id: candidate.owner_id.clone(),
+            posture: candidate.posture.clone(),
+            disposition: candidate.disposition.clone(),
+            age_ms: candidate.age_ms,
+            age_display: format_age(candidate.age_ms),
         })
         .collect();
+
+    let serving_now = verse_inputs.serving_now.as_ref().map(|s| ServingNow {
+        owner_id: s.owner_id.clone(),
+        effective_writer: s.effective_writer,
+        state: s.state.clone(),
+    });
 
     ScribeAvailabilityReport {
         canon: canon.to_owned(),
         verse: verse.to_owned(),
-        candidates_observed_heartbeating: u32::try_from(fresh.len()).unwrap_or(u32::MAX),
+        candidates_observed_heartbeating: recovery.candidates_observed_heartbeating,
         candidates,
-        serving_now: serving,
+        serving_now,
         evidence: format!(
-            "fleet directory, {ttl_secs}s TTL. A partitioned but healthy Scribe does not appear here, and a dead Scribe can appear for up to one TTL."
+            "fleet directory, {ttl_secs}s TTL. A partitioned but healthy Scribe does not appear here, and a dead Scribe can appear for up to one TTL. Recovery eligibility requires fresh ∧ serving_capable (shared evaluator)."
         ),
         observation,
         result,
     }
-}
-
-fn posture_for(
-    records: &[DirectoryRecord],
-    owner_id: &str,
-    canon: &str,
-    verse: &str,
-) -> Option<String> {
-    records
-        .iter()
-        .find(|r| r.owner_id == owner_id)
-        .and_then(|r| {
-            r.assignments
-                .iter()
-                .find(|a| a.canon == canon && a.verse == verse)
-                .map(|a| a.posture.clone())
-        })
 }
 
 fn format_age(age_ms: u64) -> String {
@@ -449,48 +513,104 @@ fn format_human(report: &CapabilityReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scripture_runtime::directory::DirectoryAssignment;
+    use scripture_runtime::SatisfactionKind;
 
-    fn record(owner: &str, published_at_ms: u64, posture: &str) -> DirectoryRecord {
-        DirectoryRecord {
-            format_version: 1,
-            owner_id: owner.to_owned(),
-            node_advertise: format!("tcp://{owner}:9000"),
-            published_at_ms,
-            valid_for_ms: DIRECTORY_TTL_MS,
-            assignments: vec![DirectoryAssignment {
-                canon: "telemetry-cnon!!".to_owned(),
-                verse: "telemetry-host-a".to_owned(),
-                advertise: format!("tcp://{owner}:9001"),
-                posture: posture.to_owned(),
-                disposition: "Standby".to_owned(),
-                admits_committed_acks: false,
-            }],
+    fn verse_inputs(
+        candidates: Vec<RecoveryCandidateEvidence>,
+        serving: Option<ServingNowEvidence>,
+    ) -> VerseCapabilityInputs {
+        let fleet_directory_nonempty = !candidates.is_empty();
+        VerseCapabilityInputs {
+            canon: "telemetry-cnon!!".to_owned(),
+            verse: "telemetry-host-a".to_owned(),
+            candidates,
+            serving_now: serving,
+            candidates_declared_for_static: true,
+            fleet_directory_nonempty,
         }
+    }
+
+    fn record_candidate(
+        owner: &str,
+        age_ms: u64,
+        fresh: bool,
+        posture: &str,
+        serving_capable: bool,
+    ) -> RecoveryCandidateEvidence {
+        RecoveryCandidateEvidence {
+            owner_id: owner.to_owned(),
+            canon: "telemetry-cnon!!".to_owned(),
+            verse: "telemetry-host-a".to_owned(),
+            serving_capable,
+            fresh,
+            age_ms,
+            posture: posture.to_owned(),
+            disposition: if serving_capable {
+                "Serving".to_owned()
+            } else {
+                "Standby".to_owned()
+            },
+        }
+    }
+
+    fn availability_for(inputs: VerseCapabilityInputs) -> ScribeAvailabilityReport {
+        let package = CapabilityInputs {
+            backend_label: "rustfs".to_owned(),
+            independent_storage_targets: 1,
+            committed_capable_target: true,
+            durable_producer_spool_configured: false,
+            verses: vec![inputs],
+        };
+        disclose_from_inputs(&package)
+            .scribe_availability
+            .into_iter()
+            .next()
+            .expect("one verse")
     }
 
     #[test]
     fn empty_directory_differs_from_stale_and_from_fresh() {
-        let now = 100_000u64;
-        let empty = scribe_availability_for(&[], "telemetry-cnon!!", "telemetry-host-a", now, None);
-        let stale = scribe_availability_for(
-            &[record("scripture-own-b!", 1_000, "standby")],
-            "telemetry-cnon!!",
-            "telemetry-host-a",
-            now,
+        let empty = availability_for(verse_inputs(vec![], None));
+        let stale = availability_for(verse_inputs(
+            vec![record_candidate(
+                "scripture-own-b!",
+                99_000,
+                false,
+                "standby",
+                false,
+            )],
             None,
-        );
-        let fresh = scribe_availability_for(
-            &[record("scripture-own-b!", now - 2_400, "standby")],
-            "telemetry-cnon!!",
-            "telemetry-host-a",
-            now,
-            Some(ServingNow {
+        ));
+        // Fresh but NOT serving-capable (standby): heartbeats visible, not recoverable.
+        let fresh_standby = availability_for(verse_inputs(
+            vec![record_candidate(
+                "scripture-own-b!",
+                2_400,
+                true,
+                "standby",
+                false,
+            )],
+            Some(ServingNowEvidence {
                 owner_id: "scripture-own-a!".to_owned(),
                 effective_writer: true,
                 state: "Serving".to_owned(),
             }),
-        );
+        ));
+        // Fresh ∧ serving-capable: recoverable via shared evaluator.
+        let fresh_serving = availability_for(verse_inputs(
+            vec![record_candidate(
+                "scripture-own-b!",
+                2_400,
+                true,
+                "bootstrap-if-empty",
+                true,
+            )],
+            Some(ServingNowEvidence {
+                owner_id: "scripture-own-a!".to_owned(),
+                effective_writer: true,
+                state: "Serving".to_owned(),
+            }),
+        ));
 
         let empty_text = format_human(&CapabilityReport {
             canon_history: dummy_canon(),
@@ -504,39 +624,93 @@ mod tests {
             scribe_availability: vec![stale.clone()],
             failure_domain_durability: dummy_failure(),
         });
-        let fresh_text = format_human(&CapabilityReport {
+        let fresh_standby_text = format_human(&CapabilityReport {
             canon_history: dummy_canon(),
             producer_continuity: dummy_producer(),
-            scribe_availability: vec![fresh.clone()],
+            scribe_availability: vec![fresh_standby.clone()],
+            failure_domain_durability: dummy_failure(),
+        });
+        let fresh_serving_text = format_human(&CapabilityReport {
+            canon_history: dummy_canon(),
+            producer_continuity: dummy_producer(),
+            scribe_availability: vec![fresh_serving.clone()],
             failure_domain_durability: dummy_failure(),
         });
 
-        // Materially different text — not the same number restated three ways.
         assert!(empty_text.contains("no node has ever published"));
         assert!(!empty_text.contains("has expired"));
         assert!(!empty_text.contains("candidates observed heartbeating"));
+        assert!(empty.result.contains("no automatic Verse recovery"));
 
         assert!(stale_text.contains("every directory record naming this Verse has expired"));
         assert!(!stale_text.contains("no node has ever published"));
         assert!(!stale_text.contains("candidates observed heartbeating"));
+        assert!(stale.result.contains("no automatic Verse recovery"));
 
         assert!(
-            fresh_text.contains(
+            fresh_standby_text.contains(
                 "candidates observed heartbeating for telemetry-cnon!!/telemetry-host-a: 1"
             )
         );
-        assert!(fresh_text.contains("scripture-own-b!  standby  last heartbeat"));
-        assert!(fresh_text.contains("serving now: scripture-own-a! (effective_writer=true)"));
-        assert!(fresh_text.contains("Post-failure redundancy would be exhausted"));
-        assert!(!fresh_text.contains("no node has ever published"));
-        assert!(!fresh_text.contains("has expired"));
+        assert!(fresh_standby_text.contains("scripture-own-b!  standby  last heartbeat"));
+        assert!(
+            fresh_standby_text.contains("serving now: scripture-own-a! (effective_writer=true)")
+        );
+        // Drift guard: fresh-but-standby must NOT be reported as recoverable.
+        assert!(fresh_standby.result.contains("no automatic Verse recovery"));
+        assert!(!fresh_standby.result.contains("can recover"));
+        assert!(!fresh_standby_text.contains("Post-failure redundancy would be exhausted"));
+
+        assert!(
+            fresh_serving_text.contains(
+                "candidates observed heartbeating for telemetry-cnon!!/telemetry-host-a: 1"
+            )
+        );
+        assert!(
+            fresh_serving
+                .result
+                .contains("eligible candidate can recover")
+        );
+        assert!(
+            fresh_serving
+                .result
+                .contains("post-failure redundancy would be exhausted")
+        );
 
         assert_ne!(empty.observation, stale.observation);
-        assert_ne!(stale.observation, fresh.observation);
-        assert_ne!(empty.observation, fresh.observation);
+        assert_ne!(stale.observation, fresh_standby.observation);
+        assert_ne!(empty.observation, fresh_standby.observation);
         assert_eq!(empty.candidates_observed_heartbeating, 0);
         assert_eq!(stale.candidates_observed_heartbeating, 0);
-        assert_eq!(fresh.candidates_observed_heartbeating, 1);
+        assert_eq!(fresh_standby.candidates_observed_heartbeating, 1);
+        assert_eq!(fresh_serving.candidates_observed_heartbeating, 1);
+
+        // Doctor result bytes equal evaluator consequence (shared source).
+        let package = CapabilityInputs {
+            backend_label: "rustfs".to_owned(),
+            independent_storage_targets: 1,
+            committed_capable_target: true,
+            durable_producer_spool_configured: false,
+            verses: vec![verse_inputs(
+                vec![record_candidate(
+                    "scripture-own-b!",
+                    2_400,
+                    true,
+                    "standby",
+                    false,
+                )],
+                None,
+            )],
+        };
+        let typed = evaluate(&package);
+        assert_eq!(
+            typed.scribe_recovery[0].satisfaction.kind,
+            SatisfactionKind::Unsatisfied
+        );
+        assert_eq!(
+            fresh_standby.result,
+            typed.scribe_recovery[0].satisfaction.consequence
+        );
     }
 
     #[test]
