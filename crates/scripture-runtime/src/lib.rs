@@ -21,6 +21,7 @@ mod node;
 mod object_store;
 pub mod pre_commit_spool;
 mod producer_routing;
+mod producer_wire;
 mod raw_lines;
 mod scribe;
 pub mod shared_blob_sink;
@@ -58,8 +59,8 @@ pub use holylog_foundation::{
 };
 pub use ingress::{
     serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,
-    serve_canon_raw_lines_connection_with_spool, serve_ha_raw_lines_connection,
-    serve_ha_raw_lines_connection_with_budgets,
+    serve_canon_raw_lines_connection_with_spool, serve_ha_producer_wire_connection,
+    serve_ha_raw_lines_connection, serve_ha_raw_lines_connection_with_budgets,
 };
 pub use node::{
     DurableLogletParts, InMemoryPartsFactory, NodeIdentity, PartsFactory, PartsFactoryError,

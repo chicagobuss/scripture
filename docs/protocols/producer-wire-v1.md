@@ -2,13 +2,35 @@
 
 ## Status
 
-This is an experimental native producer framing contract. The Rust codec and
-cross-language reference codecs exist; a configured Scribe Wire listener does
-not yet exist. Do not point production traffic at it or call it a stable SDK.
+This is an experimental native producer framing contract. The Rust codec,
+cross-language reference codecs, and a dedicated Scribe listener exist. The
+listener is a direct endpoint only; fleet-directory routing and production SDKs
+do not exist yet. Do not point production traffic at it or call it a stable
+SDK.
 
 The current newline raw-lines listener is a separate compatibility/lab ingress.
 It assigns identity per TCP connection and therefore cannot prove deduplicated
 retry after a reconnect.
+
+## Scribe configuration
+
+Keep raw-lines and Producer Wire on distinct sockets. Protocol selection is
+never inferred from the first bytes of an arbitrary raw producer connection.
+
+```yaml
+scribe:
+  assignments:
+    - id: telemetry-host-a
+      # Canon / Verse / authority fields omitted
+      ingress:
+        bind: "0.0.0.0:9000"                 # legacy raw-lines
+        producer_wire_bind: "0.0.0.0:9001"   # experimental SPW1
+```
+
+The configured writer `advertise` route remains the raw-lines route in this
+first slice. Producer Wire clients must be given their direct endpoint. A
+later versioned directory record will carry protocol-specific endpoints rather
+than pretending the two sockets are interchangeable.
 
 ## Purpose
 
@@ -72,4 +94,3 @@ as a unit test.
 | raw-lines | existing lab ingress | connection-scoped identity; reconnect retry is ambiguous |
 | rsyslog TCP | future bridge | TCP delivery is not a source ACK protocol |
 | OTel Collector | future bridge | no claim of OTLP compatibility until a concrete protocol is implemented |
-

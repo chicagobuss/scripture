@@ -13,6 +13,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ha_session::HaServingSession;
+use crate::producer_wire::serve_producer_wire_connection;
 use crate::raw_lines::{
     RawLinesConfig, RawLinesConnectionMetrics, RawLinesSink, serve_raw_lines_pipeline,
 };
@@ -138,6 +139,21 @@ pub async fn serve_ha_raw_lines_connection_with_budgets(
         budgets,
     )
     .await
+}
+
+/// Serving-Authority-gated experimental Producer Wire v1 admission.
+///
+/// Producer Wire retains the producer identity, epoch, and sequence supplied
+/// by the client. Unlike the legacy raw-lines listener, it can therefore make
+/// an exact retry after a connection loss without inventing a new producer
+/// identity. The caller must expose it on a distinct listener: protocol
+/// selection is deliberately not inferred from arbitrary producer bytes.
+pub async fn serve_ha_producer_wire_connection(
+    stream: TcpStream,
+    session: Arc<HaServingSession>,
+) -> io::Result<()> {
+    let (reader, writer) = stream.into_split();
+    serve_producer_wire_connection(reader, writer, HaAuthoritySink { session }).await
 }
 
 /// Canon-gated raw-lines admission over a started [`VerseRuntime`].

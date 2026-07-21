@@ -21,8 +21,8 @@ use scripture_runtime::{
     AssignmentResourceBudget, AssignmentResourceLimits, AssignmentRuntime, BlobWriterConfig,
     HaServingSession, HolylogJournalFoundation, IngressBudgets, NodeIdentity, NodeResourceBudget,
     RawLinesConfig, ScribeResourceLimits, ScribeSupervisor, SharedBlobSink, SharedBlobSinkConfig,
-    bootstrap_and_serve, promote_and_serve, serve_ha_raw_lines_connection_with_budgets,
-    system_clocks,
+    bootstrap_and_serve, promote_and_serve, serve_ha_producer_wire_connection,
+    serve_ha_raw_lines_connection_with_budgets, system_clocks,
 };
 use scripture_service::{
     AuthorityCoordinator, JournalFoundationTransition, SecureTransitionIdGenerator,
@@ -114,11 +114,17 @@ async fn observe_expected_generation(
 /// Must run before any root CAS for those assignments. A candidate that cannot
 /// open ingress must not depose a Scribe that can — bind failure exits without
 /// touching the root, so the predecessor keeps authority.
+struct PreboundIngress {
+    raw_lines: HashMap<String, TcpListener>,
+    producer_wire: HashMap<String, TcpListener>,
+}
+
 async fn bind_ingress_before_authority(
     assignments: &[AssignmentConfig],
     will_attempt_serve: impl Fn(&AssignmentConfig) -> bool,
-) -> Result<HashMap<String, TcpListener>, Box<dyn Error>> {
-    let mut listeners = HashMap::new();
+) -> Result<PreboundIngress, Box<dyn Error>> {
+    let mut raw_lines = HashMap::new();
+    let mut producer_wire = HashMap::new();
     for assignment in assignments {
         if !will_attempt_serve(assignment) {
             continue;
@@ -131,9 +137,21 @@ async fn bind_ingress_before_authority(
                     assignment.id, assignment.ingress.bind
                 )
             })?;
-        listeners.insert(assignment.id.clone(), listener);
+        raw_lines.insert(assignment.id.clone(), listener);
+        if let Some(bind) = &assignment.ingress.producer_wire_bind {
+            let listener = TcpListener::bind(bind).await.map_err(|error| {
+                format!(
+                    "assignment id={} cannot bind producer-wire ingress {}: {error}",
+                    assignment.id, bind
+                )
+            })?;
+            producer_wire.insert(assignment.id.clone(), listener);
+        }
     }
-    Ok(listeners)
+    Ok(PreboundIngress {
+        raw_lines,
+        producer_wire,
+    })
 }
 
 async fn activate_one(
@@ -577,7 +595,7 @@ async fn run_multi_ingress(
     metrics: Arc<holylog_object_store::ObjectStoreMetrics>,
     authority: Arc<scripture_runtime::counting_store::RequestCounters>,
     blobs: Arc<scripture_runtime::counting_store::RequestCounters>,
-    mut prebound: HashMap<String, TcpListener>,
+    mut prebound: PreboundIngress,
 ) -> Result<(), Box<dyn Error>> {
     let supervisor = Arc::new(supervisor);
     let alive = Arc::new(AtomicBool::new(true));
@@ -611,7 +629,8 @@ async fn run_multi_ingress(
             .ok_or_else(|| format!("missing activated assignment {}", assignment.id))?;
         if !runtime.admits_committed_acks() {
             // FailClosed / Standby: drop any listener held before a failed CAS.
-            let _ = prebound.remove(&assignment.id);
+            let _ = prebound.raw_lines.remove(&assignment.id);
+            let _ = prebound.producer_wire.remove(&assignment.id);
             eprintln!(
                 "scripture: assignment id={} skips producer ingress disposition={} standby_kind={}",
                 assignment.id,
@@ -635,7 +654,7 @@ async fn run_multi_ingress(
         let ingress_budgets = runtime.ingress_budgets(Arc::clone(&node_budget));
         let raw_config = raw_lines_config_from_budget(&runtime.budget);
         // Serve on the listener bound before the root CAS — never bind here.
-        let listener = prebound.remove(&assignment.id).ok_or_else(|| {
+        let listener = prebound.raw_lines.remove(&assignment.id).ok_or_else(|| {
             format!(
                 "serving assignment {} missing pre-bound ingress (bind must precede authority CAS)",
                 assignment.id
@@ -650,18 +669,33 @@ async fn run_multi_ingress(
             assignment.advertise,
         );
         let assignment_id = assignment.id.clone();
-        let node_budget = Arc::clone(&node_budget);
+        let raw_node_budget = Arc::clone(&node_budget);
+        let raw_session = Arc::clone(&session);
         tokio::spawn(async move {
             serve_assignment_ingress(
                 listener,
-                session,
-                node_budget,
+                raw_session,
+                raw_node_budget,
                 ingress_budgets,
                 raw_config,
                 assignment_id,
             )
             .await;
         });
+        if let Some(listener) = prebound.producer_wire.remove(&assignment.id) {
+            eprintln!(
+                "scripture: assignment id={} experimental producer-wire-v1 listening on {} (direct endpoint only)",
+                assignment.id,
+                listener.local_addr()?,
+            );
+            let assignment_id = assignment.id.clone();
+            let node_budget = Arc::clone(&node_budget);
+            let wire_session = Arc::clone(&session);
+            tokio::spawn(async move {
+                serve_assignment_producer_wire(listener, wire_session, node_budget, assignment_id)
+                    .await;
+            });
+        }
     }
 
     spawn_directory_heartbeat(&config, Arc::clone(&supervisor), Arc::clone(&store));
@@ -677,6 +711,37 @@ async fn run_multi_ingress(
         eprintln!("scripture: directory withdraw failed (expiry remains fallback): {error}");
     }
     Ok(())
+}
+
+async fn serve_assignment_producer_wire(
+    listener: TcpListener,
+    session: Arc<HaServingSession>,
+    node_budget: Arc<NodeResourceBudget>,
+    assignment_id: String,
+) {
+    loop {
+        let Ok((stream, peer)) = listener.accept().await else {
+            continue;
+        };
+        if !node_budget.try_acquire_task() {
+            eprintln!(
+                "scripture: assignment id={assignment_id} rejecting producer-wire connection from {peer}: node task budget exhausted"
+            );
+            continue;
+        }
+        let session = Arc::clone(&session);
+        let node_budget = Arc::clone(&node_budget);
+        let assignment_id = assignment_id.clone();
+        tokio::spawn(async move {
+            let result = serve_ha_producer_wire_connection(stream, session).await;
+            node_budget.release_task();
+            if let Err(error) = result {
+                eprintln!(
+                    "scripture: assignment id={assignment_id} producer-wire connection from {peer} closed: {error}"
+                );
+            }
+        });
+    }
 }
 
 /// SIGINT / SIGTERM. Kept local so the multi-assignment path can withdraw
@@ -1002,7 +1067,10 @@ mod tests {
             cohort_id: "bind-ord-cohort!".into(),
             writer_id: "bind-ord-wrtr-b!".into(),
             posture: AssignmentPosture::Standby,
-            ingress: ListenerConfig { bind: bind.clone() },
+            ingress: ListenerConfig {
+                bind: bind.clone(),
+                producer_wire_bind: None,
+            },
             advertise: "tcp://owner-b:9000".into(),
         };
 

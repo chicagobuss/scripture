@@ -164,7 +164,16 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
+    /// Legacy newline-delimited raw bytes ingress.
     pub bind: String,
+    /// Optional dedicated listener for experimental native Producer Wire v1.
+    ///
+    /// It must not share a socket with `bind`; the protocols are never guessed
+    /// from producer bytes. This first version is a direct-endpoint transport;
+    /// fleet-directory protocol routes remain raw-lines until a versioned route
+    /// record is introduced.
+    #[serde(default)]
+    pub producer_wire_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +376,20 @@ impl ScriptureConfig {
                     "duplicate ingress.bind {:?} (one listener per assignment)",
                     assignment.ingress.bind
                 )));
+            }
+            if let Some(wire_bind) = &assignment.ingress.producer_wire_bind {
+                if wire_bind.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "assignment {:?} ingress.producer_wire_bind must not be empty when present",
+                        assignment.id
+                    )));
+                }
+                if !binds.insert(wire_bind.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate ingress producer-wire bind {:?} (every listener socket must be unique)",
+                        wire_bind
+                    )));
+                }
             }
             OwnerEndpoint::new(&assignment.advertise).map_err(|error| {
                 ConfigError::Invalid(format!("assignment[{}].advertise: {error}", assignment.id))
@@ -742,6 +765,23 @@ ha:
         let bad = multi_yaml().replace("bind: \"127.0.0.1:9002\"", "bind: \"127.0.0.1:9001\"");
         let config: ScriptureConfig = serde_yaml::from_str(&bad).expect("parse");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_distinct_producer_wire_listener_and_rejects_socket_collision() {
+        let valid = multi_yaml().replace(
+            "bind: \"127.0.0.1:9001\"",
+            "bind: \"127.0.0.1:9001\"\n        producer_wire_bind: \"127.0.0.1:9101\"",
+        );
+        let config: ScriptureConfig = serde_yaml::from_str(&valid).expect("parse");
+        config
+            .validate()
+            .expect("distinct producer-wire socket valid");
+
+        let collision = valid.replace("127.0.0.1:9101", "127.0.0.1:9001");
+        let config: ScriptureConfig = serde_yaml::from_str(&collision).expect("parse");
+        let error = config.validate().expect_err("wire/raw socket collision");
+        assert!(error.to_string().contains("listener socket must be unique"));
     }
 
     #[test]
