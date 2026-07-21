@@ -1,9 +1,16 @@
-//! Static safety.require preflight gate.
+//! Static and live safety.require preflight gates.
 //!
-//! Builds config-derived [`CapabilityInputs`], runs the shared pure
-//! [`scripture_runtime::evaluate`], and enforces `safety.require` before any
-//! listener bind / lifecycle assembly. Live-observed enforcement is a
-//! named follow-up.
+//! Both paths call the shared pure [`scripture_runtime::evaluate`]. They differ
+//! only in how [`CapabilityInputs`] are built:
+//! - **static** (`validate`): config-derived; hermetic; live-only requirements
+//!   without declared candidates yield [`SatisfactionKind::RequiresLivePreflight`].
+//! - **live** (`preflight --live`, `serve` / `scribe run`): directory +
+//!   authority-root observation; live-only boundaries become real
+//!   Satisfied / Unsatisfied verdicts.
+//!
+//! Startup (`serve` / `scribe run`) runs static with live findings deferred,
+//! then live enforcement after the shared store is connected — before listener
+//! bind / lifecycle assembly where possible.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -13,14 +20,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use scripture_runtime::{
     CapabilityCode, CapabilityFinding, CapabilityInputs, CapabilityReport,
-    RecoveryCandidateEvidence, RequiredGuarantee, VerseCapabilityInputs,
+    RecoveryCandidateEvidence, RequiredGuarantee, SatisfactionKind, VerseCapabilityInputs,
     collect_requirement_findings, evaluate,
 };
 
+use crate::assemble::SharedStore;
 use crate::config::{
     CanonHistoryRequire, OnDegraded, ProducerContinuityRequire, SafetyConfig, SafetyRequire,
     ScribeRecoveryRequire, ScriptureConfig,
 };
+use crate::doctor;
 
 /// Process-local warn-mode emission counts keyed by capability code.
 ///
@@ -182,10 +191,19 @@ pub fn format_validate_ok(config: &ScriptureConfig) -> String {
     }
 }
 
+/// Exact live-preflight ok stderr line.
+#[must_use]
+pub fn format_live_preflight_ok(config: &ScriptureConfig) -> String {
+    format!(
+        "scripture: live preflight ok version={} owner={} backend={}",
+        config.version, config.node.owner_id, config.store.backend,
+    )
+}
+
 /// Run the shared evaluator and enforce `safety.require` when present.
 ///
 /// When `safety` is omitted, this is a no-op (exact prior behavior).
-/// Warn-mode lines go to stderr.
+/// Warn-mode lines go to stderr. Live-only findings fail closed (validate path).
 pub fn run_static_preflight(config: &ScriptureConfig) -> Result<CapabilityReport, Box<dyn Error>> {
     run_static_preflight_to(config, &mut std::io::stderr())
 }
@@ -197,17 +215,47 @@ pub fn run_static_preflight_to(
     config: &ScriptureConfig,
     sink: &mut dyn Write,
 ) -> Result<CapabilityReport, Box<dyn Error>> {
+    run_static_preflight_to_with_options(config, sink, StaticPreflightOptions { defer_live: false })
+}
+
+/// Startup static gate: config-only checks, but defer
+/// [`SatisfactionKind::RequiresLivePreflight`] so the live gate can score them.
+pub fn run_static_preflight_deferring_live(
+    config: &ScriptureConfig,
+) -> Result<CapabilityReport, Box<dyn Error>> {
+    run_static_preflight_to_with_options(
+        config,
+        &mut std::io::stderr(),
+        StaticPreflightOptions { defer_live: true },
+    )
+}
+
+/// Options for the hermetic static gate.
+#[derive(Debug, Clone, Copy)]
+pub struct StaticPreflightOptions {
+    /// When true, drop findings whose kind is [`SatisfactionKind::RequiresLivePreflight`]
+    /// so `serve` / `scribe run` can observe the cluster and enforce live.
+    pub defer_live: bool,
+}
+
+/// Static gate with explicit options (tests + startup).
+pub fn run_static_preflight_to_with_options(
+    config: &ScriptureConfig,
+    sink: &mut dyn Write,
+    options: StaticPreflightOptions,
+) -> Result<CapabilityReport, Box<dyn Error>> {
     let inputs = static_capability_inputs(config);
     let report = evaluate(&inputs);
     let Some(safety) = &config.safety else {
         return Ok(report);
     };
-    enforce_safety_policy(&report, &inputs, safety, sink)
+    enforce_safety_policy_with_options(&report, &inputs, safety, sink, options.defer_live)
 }
 
 /// Enforce a safety policy against an already-evaluated report.
 ///
 /// Warn-mode findings are written to `sink` (stderr in production).
+/// Does not defer live findings (fail-closed for validate).
 #[allow(dead_code)] // Used by acceptance tests; production uses run_static_preflight.
 pub fn enforce_safety_policy(
     report: &CapabilityReport,
@@ -215,11 +263,25 @@ pub fn enforce_safety_policy(
     safety: &SafetyConfig,
     sink: &mut dyn Write,
 ) -> Result<CapabilityReport, Box<dyn Error>> {
+    enforce_safety_policy_with_options(report, inputs, safety, sink, false)
+}
+
+/// Enforce policy; optionally defer RequiresLivePreflight findings.
+pub fn enforce_safety_policy_with_options(
+    report: &CapabilityReport,
+    inputs: &CapabilityInputs,
+    safety: &SafetyConfig,
+    sink: &mut dyn Write,
+    defer_live: bool,
+) -> Result<CapabilityReport, Box<dyn Error>> {
     let requirements = requirements_from_safety(&safety.require);
     if requirements.is_empty() {
         return Ok(report.clone());
     }
-    let findings = collect_requirement_findings(report, inputs, &requirements);
+    let mut findings = collect_requirement_findings(report, inputs, &requirements);
+    if defer_live {
+        findings.retain(|f| f.kind != SatisfactionKind::RequiresLivePreflight);
+    }
     if findings.is_empty() {
         return Ok(report.clone());
     }
@@ -260,4 +322,63 @@ pub fn evaluate_policy(
     let requirements = requirements_from_safety(&safety.require);
     let findings = collect_requirement_findings(&report, inputs, &requirements);
     (report, findings)
+}
+
+/// Live preflight from already-built [`CapabilityInputs`] (hermetic tests).
+///
+/// Performs no authority/register writes — pure evaluate + policy check only.
+pub fn run_live_preflight_with_inputs(
+    config: &ScriptureConfig,
+    inputs: &CapabilityInputs,
+    sink: &mut dyn Write,
+) -> Result<CapabilityReport, Box<dyn Error>> {
+    let report = evaluate(inputs);
+    let Some(safety) = &config.safety else {
+        return Ok(report);
+    };
+    // Live path never defers: RequiresLivePreflight should not appear when
+    // candidates_declared_for_static is true (doctor/live builder sets that).
+    enforce_safety_policy_with_options(&report, inputs, safety, sink, false)
+}
+
+/// Observe the cluster and enforce `safety.require` against live evidence.
+///
+/// When `safety` is omitted this is a no-op (doctor may still report separately).
+/// Builds inputs via the same mapping as `scripture doctor` (one evidence path).
+pub async fn run_live_preflight(
+    config: &ScriptureConfig,
+    shared: &SharedStore,
+) -> Result<CapabilityReport, Box<dyn Error>> {
+    run_live_preflight_to(config, shared, &mut std::io::stderr()).await
+}
+
+/// Like [`run_live_preflight`], writing warn-mode lines to `sink`.
+pub async fn run_live_preflight_to(
+    config: &ScriptureConfig,
+    shared: &SharedStore,
+    sink: &mut dyn Write,
+) -> Result<CapabilityReport, Box<dyn Error>> {
+    if config.safety.is_none() {
+        // No policy to enforce; skip observation I/O.
+        return Ok(evaluate(&static_capability_inputs(config)));
+    }
+    let inputs = doctor::build_live_capability_inputs(config, shared).await?;
+    run_live_preflight_with_inputs(config, &inputs, sink)
+}
+
+/// CLI: `scripture preflight --config PATH [--live]`.
+///
+/// Without `--live`, runs the hermetic static gate (same as `validate`'s safety
+/// check). With `--live`, connects the store and enforces against observed
+/// directory/authority evidence.
+pub async fn preflight_command(config: ScriptureConfig, live: bool) -> Result<(), Box<dyn Error>> {
+    if live {
+        let shared = crate::assemble::connect_shared_store(&config)?;
+        run_live_preflight(&config, &shared).await?;
+        eprintln!("{}", format_live_preflight_ok(&config));
+    } else {
+        run_static_preflight(&config)?;
+        eprintln!("{}", format_validate_ok(&config));
+    }
+    Ok(())
 }

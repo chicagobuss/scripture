@@ -26,8 +26,9 @@ use crate::config::{HaMode, ScriptureConfig};
 use crate::preflight;
 
 pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
-    // Static safety.require gate before any assemble / listen / lifecycle.
-    preflight::run_static_preflight(&config)?;
+    // Static safety.require gate (config-only). Defer RequiresLivePreflight so
+    // the live gate below can score recovery against directory/authority.
+    preflight::run_static_preflight_deferring_live(&config)?;
 
     if config.is_multi_assignment() {
         return Err(
@@ -49,6 +50,8 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
     }
 
     let shared = assemble::connect_shared_store(&config)?;
+    // Live safety.require gate before listen / lifecycle (same evaluator as doctor).
+    preflight::run_live_preflight(&config, &shared).await?;
     let store_root = config.store.prefix.trim_end_matches('/').to_owned();
     let verse_config = config.verse_runtime_config()?;
     let assembled = assemble::assemble_assignment_seams(

@@ -144,7 +144,10 @@ async fn build_report(
 }
 
 /// Assemble live capability evidence (I/O). Pure evaluation is separate.
-async fn build_live_capability_inputs(
+///
+/// Shared by `scripture doctor` and live preflight so evidence mapping cannot
+/// drift between disclosure and enforcement.
+pub async fn build_live_capability_inputs(
     config: &ScriptureConfig,
     shared: &SharedStore,
 ) -> Result<CapabilityInputs, Box<dyn Error>> {

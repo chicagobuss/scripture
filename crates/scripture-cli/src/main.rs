@@ -28,6 +28,8 @@ mod scribe_run;
 mod serve;
 
 #[cfg(test)]
+mod live_accept;
+#[cfg(test)]
 mod safety_accept;
 
 use std::error::Error;
@@ -136,6 +138,11 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
             doctor::doctor(config, format).await
         }
+        "preflight" => {
+            let (config_path, live) = parse_preflight_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            preflight::preflight_command(config, live).await
+        }
         "produce-lab" => {
             let (config_path, options) = parse_produce_lab_args(&mut arguments)?;
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
@@ -156,7 +163,7 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?} (expected validate|bootstrap|replace|promote|scribe|serve|directory|doctor|consume|produce-lab|consume-lab)"
+            "unknown command {other:?} (expected validate|bootstrap|replace|promote|scribe|serve|directory|doctor|preflight|consume|produce-lab|consume-lab)"
         )
         .into()),
     }
@@ -452,6 +459,31 @@ fn parse_doctor_args(
     Ok((config_path, format))
 }
 
+/// Parses `preflight --config <path> [--live]`.
+fn parse_preflight_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, bool), Box<dyn Error>> {
+    let mut config_path = None;
+    let mut live = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => {
+                config_path = Some(arguments.next().ok_or("--config requires a path")?);
+            }
+            "--live" => {
+                live = true;
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("preflight: unexpected argument {other}").into()),
+        }
+    }
+    let config_path = config_path.ok_or("preflight requires --config")?;
+    Ok((config_path, live))
+}
+
 fn parse_config_only_args(
     arguments: &mut std::iter::Peekable<impl Iterator<Item = String>>,
     command: &str,
@@ -619,6 +651,7 @@ Usage:
   scripture serve --config /path/to/scripture.yaml
   scripture directory --config /path/to/scripture.yaml [--canon ID --verse ID]
   scripture doctor --config /path/to/scripture.yaml [--format human|json]
+  scripture preflight --config /path/to/scripture.yaml [--live]
   scripture consume --config /path/to/scripture.yaml --canon ID --verse ID \\
       [--from N] [--until-records N] [--seconds N] [--format text|jsonl] [--no-follow]
   scripture produce-lab --config PATH --canon ID --verse ID [lab options]
@@ -639,6 +672,10 @@ doctor:    durability/availability capability report for the four failure
            boundaries (Canon history, producer continuity, Scribe availability,
            failure-domain durability). Availability is observed heartbeats from
            the fleet directory, not a replica count.
+preflight: enforce safety.require. Default is config-only (hermetic, same gate
+           as validate). With --live, observe directory/authority and enforce
+           live boundaries (esp. scribe_recovery: automatic) via the shared
+           pure capability evaluator — no register/CAS writes.
 consume:   read-only debug/demo consumer. Prints logical Scripture records from
            a configured Canon/Verse to stdout. Owns no checkpoint; not a durable
            consumer product. Membership is re-observed while following.

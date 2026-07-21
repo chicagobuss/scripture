@@ -2,7 +2,7 @@
 //!
 //! Pure: [`evaluate`] takes [`CapabilityInputs`] and returns a [`CapabilityReport`].
 //! No I/O, no authority/register mutation. Callers (static preflight, live
-//! doctor, future live gate) differ only in how they build inputs.
+//! doctor, live preflight gate) differ only in how they build inputs.
 
 use std::fmt;
 
@@ -340,10 +340,10 @@ fn evaluate_verse_recovery(verse: &VerseCapabilityInputs) -> VerseRecoverySatisf
                 "no declared eligible recovery candidates for {}/{} (static path)",
                 verse.canon, verse.verse
             ),
-            consequence: "cannot verify automatic Scribe recovery statically — require live preflight (scripture doctor / live gate, follow-up)"
+            consequence: "cannot verify automatic Scribe recovery statically — require live preflight (`scripture preflight --live` / scripture doctor)"
                 .to_owned(),
             remediation: Some(
-                "run scripture doctor against a live cluster, or declare eligible candidates for static scoring"
+                "run `scripture preflight --live` (or scripture doctor) against a live cluster, or declare eligible candidates for static scoring"
                     .to_owned(),
             ),
         }
@@ -392,6 +392,8 @@ pub enum RequiredGuarantee {
 pub struct CapabilityFinding {
     /// Stable code.
     pub code: CapabilityCode,
+    /// Satisfaction kind that produced this finding.
+    pub kind: SatisfactionKind,
     /// Affected scope.
     pub scope: CapabilityScope,
     /// Observed fact.
@@ -459,6 +461,7 @@ pub fn collect_requirement_findings(
                 if inputs.independent_storage_targets < *min {
                     findings.push(CapabilityFinding {
                         code: CapabilityCode::StorageFailureDomains,
+                        kind: SatisfactionKind::Unsatisfied,
                         scope: CapabilityScope::deployment(),
                         observed: format!(
                             "independent storage targets: {} (required >= {min})",
@@ -493,6 +496,7 @@ pub fn collect_requirement_findings(
 fn finding_from_satisfaction(satisfaction: &Satisfaction) -> CapabilityFinding {
     CapabilityFinding {
         code: satisfaction.code.unwrap_or(CapabilityCode::ScribeRecovery),
+        kind: satisfaction.kind,
         scope: satisfaction.scope.clone(),
         observed: satisfaction.observed.clone(),
         consequence: satisfaction.consequence.clone(),

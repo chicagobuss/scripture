@@ -33,8 +33,9 @@ pub async fn scribe_run(
     peer_grace_ms: u64,
     initial_term: u64,
 ) -> Result<(), Box<dyn Error>> {
-    // Static safety.require gate before listener bind / lifecycle assembly.
-    preflight::run_static_preflight(&config)?;
+    // Static safety.require gate (config-only). Defer RequiresLivePreflight so
+    // live observation below can enforce scribe_recovery: automatic.
+    preflight::run_static_preflight_deferring_live(&config)?;
 
     if config.is_multi_assignment() {
         return Err(
@@ -45,6 +46,11 @@ pub async fn scribe_run(
     if config.ha.mode != HaMode::ServingAuthority {
         return Err("scribe run requires ha.mode: serving-authority".into());
     }
+
+    // Connect store and enforce live safety.require before listener bind /
+    // lifecycle assembly (no CAS yet — observation only).
+    let shared = assemble::connect_shared_store(&config)?;
+    preflight::run_live_preflight(&config, &shared).await?;
 
     // Bind ingress before any root CAS so a candidate that cannot open the
     // socket never deposes a reachable writer.
