@@ -129,6 +129,25 @@ may change after failover; reusing one outbox for a different logical Verse is
 refused. This outbox is client-side continuity only: it issues no Scripture
 receipt and is distinct from a Scribe's optional pre-commit spool.
 
+The Python and Node reference clients expose the same opt-in shape:
+
+```sh
+python3 examples/clients/python/producer_wire_v1.py \
+  --host 127.0.0.1 --port 9001 --payload 'hello Scripture' \
+  --outbox /var/lib/my-producer/py-host-metrics \
+  --target canon/telemetry/verse/host-metrics
+node examples/clients/node/producer_wire_v1.mjs \
+  --host 127.0.0.1 --port 9001 --payload 'hello Scripture' \
+  --outbox /var/lib/my-producer/node-host-metrics \
+  --target canon/telemetry/verse/host-metrics
+```
+
+They are deliberately dependency-light **reference** outboxes, not yet
+supported SDKs. Each persists its own local state format; the portable
+interoperability contract is the exact SPW1 Wire frame, identity, sequence,
+and receipt behavior—not an undocumented exchange of local spool files across
+languages.
+
 ## Compatibility mapping
 
 | Source | v1 status | Important semantic difference |
