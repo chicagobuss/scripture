@@ -5,6 +5,7 @@
 //! - `scripture bootstrap --config PATH --loglet-id ID`
 //! - `scripture replace --config PATH --successor-loglet-id ID`
 //! - `scripture serve --config PATH`
+//! - `scripture consume --config PATH --canon ID --verse ID`
 
 #![allow(unreachable_pub)]
 
@@ -13,6 +14,7 @@ mod bootstrap;
 #[cfg(feature = "campaign-faults")]
 mod campaign_faults;
 mod config;
+mod consume;
 mod consume_lab;
 mod directory_cmd;
 mod doctor;
@@ -129,6 +131,11 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
             produce_lab::produce_lab(config, options).await
         }
+        "consume" => {
+            let (config_path, options) = parse_consume_args(&mut arguments)?;
+            let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
+            consume::consume(config, options).await
+        }
         "consume-lab" => {
             let (config_path, options) = parse_consume_lab_args(&mut arguments)?;
             let config = ScriptureConfig::load(std::path::Path::new(&config_path))?;
@@ -139,7 +146,7 @@ async fn try_main() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?} (expected validate|bootstrap|replace|promote|serve|directory|doctor)"
+            "unknown command {other:?} (expected validate|bootstrap|replace|promote|serve|directory|doctor|consume|produce-lab|consume-lab)"
         )
         .into()),
     }
@@ -191,6 +198,76 @@ fn parse_produce_lab_args(
             per_worker,
             payload_bytes,
             records_per_submission,
+        },
+    ))
+}
+
+/// Parses `consume --config <p> --canon <c> --verse <v> [options]`.
+fn parse_consume_args(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(String, consume::ConsumeOptions), Box<dyn Error>> {
+    let mut config_path = None;
+    let (mut canon, mut verse) = (None, None);
+    let mut from = 0_u64;
+    let mut until_records = None;
+    let mut seconds = consume::ConsumeOptions::default_seconds();
+    let mut format = consume::OutputFormat::Text;
+    let mut no_follow = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--config" => config_path = Some(arguments.next().ok_or("--config requires a path")?),
+            "--canon" => canon = Some(arguments.next().ok_or("--canon requires an id")?),
+            "--verse" => verse = Some(arguments.next().ok_or("--verse requires an id")?),
+            "--from" => {
+                from = arguments
+                    .next()
+                    .ok_or("--from requires OFFSET")?
+                    .parse()
+                    .map_err(|error| format!("--from must be an integer: {error}"))?;
+            }
+            "--until-records" => {
+                let value: u64 = arguments
+                    .next()
+                    .ok_or("--until-records requires N")?
+                    .parse()
+                    .map_err(|error| format!("--until-records must be an integer: {error}"))?;
+                until_records = Some(value);
+            }
+            "--seconds" => {
+                seconds = arguments
+                    .next()
+                    .ok_or("--seconds requires N")?
+                    .parse()
+                    .map_err(|error| format!("--seconds must be an integer: {error}"))?;
+            }
+            "--format" => {
+                format = consume::OutputFormat::parse(
+                    &arguments.next().ok_or("--format requires text|jsonl")?,
+                )?;
+            }
+            "--no-follow" => no_follow = true,
+            "--help" | "-h" => {
+                consume::print_help();
+                std::process::exit(0);
+            }
+            other => return Err(format!("consume: unexpected argument {other}").into()),
+        }
+    }
+    if !no_follow && seconds == 0 {
+        return Err(
+            "consume: --seconds 0 is rejected (use --no-follow for a bounded one-shot)".into(),
+        );
+    }
+    Ok((
+        config_path.ok_or("consume requires --config")?,
+        consume::ConsumeOptions {
+            canon: canon.ok_or("consume requires --canon")?,
+            verse: verse.ok_or("consume requires --verse")?,
+            from,
+            until_records,
+            seconds,
+            format,
+            no_follow,
         },
     ))
 }
@@ -469,6 +546,10 @@ Usage:
   scripture serve --config /path/to/scripture.yaml
   scripture directory --config /path/to/scripture.yaml [--canon ID --verse ID]
   scripture doctor --config /path/to/scripture.yaml [--format human|json]
+  scripture consume --config /path/to/scripture.yaml --canon ID --verse ID \\
+      [--from N] [--until-records N] [--seconds N] [--format text|jsonl] [--no-follow]
+  scripture produce-lab --config PATH --canon ID --verse ID [lab options]
+  scripture consume-lab --config PATH --canon ID --verse ID [lab options]
 validate:  load + validate non-secret YAML; no network; no ownership.
 bootstrap: legacy one-shot Canon publication, or (ha.mode: serving-authority)
            long-lived bootstrap-and-serve (one-record VirtualLog root fence).
@@ -487,6 +568,12 @@ doctor:    durability/availability capability report for the four failure
            boundaries (Canon history, producer continuity, Scribe availability,
            failure-domain durability). Availability is observed heartbeats from
            the fleet directory, not a replica count.
+consume:   read-only debug/demo consumer. Prints logical Scripture records from
+           a configured Canon/Verse to stdout. Owns no checkpoint; not a durable
+           consumer product. Membership is re-observed while following.
+           `consume-lab` remains a throughput/stall lab instrument.
+produce-lab / consume-lab:
+           lab load and continuity instruments (not product subscription APIs).
 HA YAML (portable; no secrets):
   ha:
     mode: serving-authority

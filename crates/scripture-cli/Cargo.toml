@@ -46,7 +46,11 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
+bytes.workspace = true
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+scripture-service = { path = "../scripture-service", features = ["virtuallog-test-support"] }
+holylog-object-store = { workspace = true, features = ["s3"] }
 
 [lints]
 workspace = true

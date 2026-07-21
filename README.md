@@ -68,6 +68,44 @@ scripture bootstrap --config /path/to/scripture.yaml --loglet-id <ID>
 scripture serve --config /path/to/scripture.yaml
 ```
 
+### Local console consumer
+
+`scripture consume` is a **read-only debug/demo consumer**: it prints logical
+Scripture records from a configured Canon/Verse to stdout. It owns no consumer
+register or checkpoint and does not claim durable subscription semantics.
+
+Against a local multi-assignment Scribe (for example RustFS-backed YAML under
+`crates/scripture-cli/examples/`):
+
+```sh
+# terminal 1
+cargo run -p scripture-cli -- serve --config /path/to/scripture.yaml
+
+# terminal 2
+cargo run -p scripture-cli -- produce-lab \
+  --config /path/to/scripture.yaml \
+  --canon demo --verse events \
+  --workers 1 --per-worker 5
+
+# terminal 3
+cargo run -p scripture-cli -- consume \
+  --config /path/to/scripture.yaml \
+  --canon demo --verse events \
+  --from 0 --until-records 5 --no-follow
+```
+
+Representative text output:
+
+```text
+canon=demo verse=events entry=0 record=0 bytes=64 digest=… payload=text:…
+canon=demo verse=events entry=1 record=1 bytes=64 digest=… payload=text:…
+scripture consume: entries_scanned=5 records_printed=5 final_cursor=5 elapsed_ms=12 membership_change=no
+```
+
+Use `--format jsonl` for one JSON object per record on stdout (summaries stay on
+stderr). Hermetic coverage lives in `cargo test -p scripture-cli --locked`
+(in-memory ObjectStore + VirtualLog; no cloud credentials).
+
 Non-secret settings live in a versioned YAML file (`deny_unknown_fields`).
 Credentials come only from the process environment (`RUSTFS_*`/`AWS_*` or
 `R2_*`) or a Secret-mounted env — never YAML, argv, ConfigMap, or logs.

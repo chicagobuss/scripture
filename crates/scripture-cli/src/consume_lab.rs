@@ -1,33 +1,24 @@
 //! `scripture consume-lab` — a tailing reader for measuring throughput out.
 //!
-//! A lab instrument, paired with `produce-lab`. The point is continuity during
-//! a rolling restart: a Verse moving between Scribes must not stall reads, and
-//! the only way to know is to read while it moves.
+//! Compatibility / lab instrument, paired with `produce-lab`. Prefer
+//! `scripture consume` for the debug/demo record console. The point of this
+//! command is continuity during a rolling restart: a Verse moving between
+//! Scribes must not stall reads, and the only way to know is to read while it
+//! moves.
 //!
-//! Re-observes membership each pass, because a handoff adds a generation and a
-//! reader holding the old chain would simply stop at the old tail and look
-//! healthy while falling behind.
+//! Re-observes membership each pass via the shared [`crate::consume`] reader
+//! seams, because a handoff adds a generation and a reader holding the old
+//! chain would simply stop at the old tail and look healthy while falling
+//! behind.
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use holylog::provision::resolve_read_seal;
-use holylog::virtual_log::{ConditionalRegister, LogletResolver, VirtualLog};
-use holylog_object_store::{ObjectStoreMetrics, WritePolicy};
-use holylog_object_store_register::{ObjectStoreConditionalRegister, register_path};
-use object_store::path::Path;
-use scripture_runtime::{
-    ObjectStorePartsFactory, PartsFactory, ProcessLogletResolver, resolve_log_payload,
-};
+use crate::config::ScriptureConfig;
+use crate::consume::{self, VerseReadSeams};
 
-use crate::assemble;
-use crate::config::{AssignmentConfig, ScriptureConfig};
-
-const LOGLET_K: u64 = 2;
-
-/// Options for one consume run.
+/// Options for one consume-lab run.
 pub struct ConsumeOptions {
     pub canon: String,
     pub verse: String,
@@ -42,29 +33,13 @@ pub async fn consume_lab(
     config: ScriptureConfig,
     options: ConsumeOptions,
 ) -> Result<(), Box<dyn Error>> {
-    let shared = assemble::connect_shared_store(&config)?;
-    let assignment = find_assignment(&config, &options)?;
-    let store_root = config.assignment_store_root(&assignment)?;
+    let assignment = consume::find_assignment(&config, &options.canon, &options.verse)?;
+    let (seams, store_root) = VerseReadSeams::from_config(&config, &assignment)?;
 
     println!(
-        "scripture consume-lab: canon={} verse={} seconds={} root={store_root}",
+        "scripture consume-lab: canon={} verse={} seconds={} root={store_root} (lab alias; prefer `scripture consume` for record output)",
         options.canon, options.verse, options.seconds
     );
-
-    let register = Arc::new(ObjectStoreConditionalRegister::new(
-        Arc::clone(&shared.store),
-        Path::from(store_root.clone()).join(register_path("verse").as_ref()),
-        shared.backend.register_capabilities(),
-    )?) as Arc<dyn ConditionalRegister>;
-
-    let parts = Arc::new(ObjectStorePartsFactory::new(
-        Arc::clone(&shared.store),
-        store_root,
-        shared.backend.drive_capabilities(),
-        WritePolicy::AtomicCreate,
-        Arc::new(ObjectStoreMetrics::default()),
-    ));
-    let resolver = Arc::new(ProcessLogletResolver::default());
 
     let start = Instant::now();
     let deadline = start + Duration::from_secs(options.seconds);
@@ -80,29 +55,13 @@ pub async fn consume_lab(
             break;
         }
 
-        // Re-resolve every pass: a handoff publishes a new generation, and a
-        // reader on a stale chain stops at the old tail while looking healthy.
-        let log = VirtualLog::new(
-            Arc::clone(&register),
-            Arc::clone(&resolver) as Arc<dyn LogletResolver>,
-        );
-        let observed = log.observe_membership().await?;
-
-        let mut end = 0_u64;
-        for generation in &observed.state.generations {
-            let durable = parts.open(&generation.loglet_id)?;
-            let view = resolve_read_seal(durable.components(LOGLET_K)).await?;
-            // Contiguous tail: a gap-tolerant tail would read past records that
-            // are not durably present yet and report phantom progress.
-            let tail = view.observe_durable().await?.contiguous_tail();
-            resolver.insert_read_seal(generation.loglet_id.clone(), Arc::new(view));
-            end = generation.start.saturating_add(tail);
-        }
+        let (log, end, _) = seams.observe_contiguous_end().await?;
 
         let mut advanced = false;
         while cursor < end {
             let entry = log.read_next(cursor, end).await?;
-            let resolved_chunks = resolve_log_payload(&shared.store, &entry.payload).await?;
+            let resolved_chunks =
+                scripture_runtime::resolve_log_payload(&seams.store, &entry.payload).await?;
             let in_entry: u64 = resolved_chunks
                 .iter()
                 .flat_map(|resolved| resolved.chunk.frames.iter())
@@ -157,25 +116,4 @@ pub async fn consume_lab(
         }
     }
     Ok(())
-}
-
-fn find_assignment(
-    config: &ScriptureConfig,
-    options: &ConsumeOptions,
-) -> Result<AssignmentConfig, Box<dyn Error>> {
-    config
-        .scribe
-        .as_ref()
-        .ok_or("consume-lab requires scribe.assignments")?
-        .assignments
-        .iter()
-        .find(|a| a.canon == options.canon && a.verse == options.verse)
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "no assignment for canon={} verse={}",
-                options.canon, options.verse
-            )
-            .into()
-        })
 }
