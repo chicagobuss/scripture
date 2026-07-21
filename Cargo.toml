@@ -8,6 +8,7 @@ members = [
     "crates/scripture-campaign",
     "crates/scripture-workload",
     "crates/scripture-telemetry-producer",
+    "crates/scripture-producer-client",
 ]
 resolver = "3"
 

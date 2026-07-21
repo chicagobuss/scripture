@@ -1,0 +1,17 @@
+[package]
+name = "scripture-producer-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Experimental native Producer Wire client for Scripture"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+scripture = { path = "../scripture" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+
+[lints]
+workspace = true

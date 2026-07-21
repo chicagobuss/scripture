@@ -1,0 +1,4 @@
+{"row_type":"send","producer_id":"otel-k0s-a","verse":"telemetry/k0s-node","incarnation":"0123456789abcdef0123456789abcdef","seq":0,"payload_digest":"aa","ack_status":"committed:0:1","unacked":false,"endpoint":"scribe-a:9000"}
+{"row_type":"send","producer_id":"otel-k0s-a","verse":"telemetry/k0s-node","incarnation":"0123456789abcdef0123456789abcdef","seq":1,"payload_digest":"bb","ack_status":"denied","unacked":true,"endpoint":"scribe-a:9000"}
+{"row_type":"failover","verse":"telemetry/k0s-node","from_endpoint":"scribe-a:9000","to_endpoint":"scribe-b:9000","reason":"denied","message":"Verse `telemetry/k0s-node` failover scribe-a:9000→scribe-b:9000 (denied)"}
+{"row_type":"send","producer_id":"otel-k0s-a","verse":"telemetry/k0s-node","incarnation":"0123456789abcdef0123456789abcdef","seq":1,"payload_digest":"bb","ack_status":"committed:1:2","unacked":false,"endpoint":"scribe-b:9000"}

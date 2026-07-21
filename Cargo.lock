@@ -2000,6 +2000,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scripture-producer-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "scripture",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "scripture-runtime"
 version = "0.1.0"
 dependencies = [

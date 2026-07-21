@@ -24,6 +24,24 @@ For a static, read-only visual fixture:
 npm start
 ```
 
+## Show a real telemetry-producer run
+
+`scripture-telemetry-producer` writes an append-only JSONL send ledger. The
+included adapter turns that producer-side evidence into a **read-only** cockpit
+view; it does not infer Scribe authority, Holylog readback, or object-store
+durability from a producer acknowledgement.
+
+```sh
+cd tools/operations-cockpit
+SCRIPTURE_TELEMETRY_LEDGER=/absolute/path/to/send-ledger.jsonl \
+  SCRIPTURE_OPS_ADAPTER="$PWD/telemetry-ledger-adapter.mjs" \
+  npm start
+```
+
+For a safe visual rehearsal with the same adapter, point
+`SCRIPTURE_TELEMETRY_LEDGER` at `telemetry-ledger.fixture.jsonl`. The adapter
+accepts only `status`; cockpit action buttons remain unavailable.
+
 ## Live adapter contract
 
 The browser calls only the local Node server. To connect a lab, copy
