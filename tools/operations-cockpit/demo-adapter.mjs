@@ -32,7 +32,7 @@ if (command === "action") {
     case "pause-producer": state.producers.forEach((producer) => { producer.state = "paused"; }); event(state, "observed", "Producers paused; no implied loss or ACK outcome."); break;
     case "resume-producer": state.producers.forEach((producer) => { producer.state = "sending"; }); event(state, "observed", "Producers resumed from their existing sequence state."); break;
     case "kill-scribe-a": a.posture = "down"; a.reachable = false; event(state, "observed", "Scribe A stopped; B remains a candidate until explicit promotion."); break;
-    case "restart-scribe-a": a.posture = "standby"; a.reachable = true; event(state, "observed", "Scribe A restarted as a non-serving candidate."); break;
+    case "restart-scribe-a": a.posture = "candidate"; a.reachable = true; event(state, "observed", "Scribe A restarted as a non-serving candidate."); break;
     case "promote-scribe-b": if (!b.reachable) throw new Error("Scribe B is unreachable"); a.posture = a.reachable ? "sealed" : "down"; b.posture = "serving"; b.term = Math.max(a.term, b.term) + 1; event(state, "oracle_pass", "Demo promotion: B is canonical serving route; A is fenced/sealed."); break;
     case "cut-store-b": storeB.state = "isolated"; event(state, "observed", "Demo directional store fault enabled for S3 path."); break;
     case "restore-store-b": storeB.state = "healthy"; event(state, "observed", "Demo directional store fault restored."); break;

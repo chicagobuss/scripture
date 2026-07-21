@@ -13,7 +13,7 @@
       "id": "scribe-b",
       "node": "node-b",
       "verse": "telemetry/k8s-node",
-      "posture": "standby",
+      "posture": "candidate",
       "reachable": true,
       "route": "scribe-b:9000",
       "term": 2
