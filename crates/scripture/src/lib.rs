@@ -66,8 +66,8 @@ pub use model::{
     AttributeValue, Checkpoint, JournalId, JournalRecord, Record, RecordOffset, ResumeHint,
 };
 pub use producer_outbox::{
-    MAX_OUTBOX_TARGET_BYTES, PendingWireSubmission, ProducerOutbox, ProducerOutboxError,
-    ProducerOutboxIdentity,
+    MAX_OUTBOX_TARGET_BYTES, OutboxAdmitOrderLog, OutboxFaults, PendingWireSubmission,
+    ProducerOutbox, ProducerOutboxError, ProducerOutboxIdentity, StagedWireSubmission,
 };
 pub use producer_wire::{
     MAX_ERROR_MESSAGE_BYTES, MAX_FRAME_BYTES, MAX_RECORDS_PER_SUBMIT, ProducerWireError,

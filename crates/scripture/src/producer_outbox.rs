@@ -1,18 +1,24 @@
 //! Durable client-side outbox for experimental Producer Wire v1.
 //!
-//! This is deliberately distinct from [`crate::spool`]. A Scribe spool may
-//! support a `spooled` receipt; this outbox grants no receipt at all. It keeps
-//! the producer's exact Wire submission safe across a client crash so a later
-//! process can replay the same `(producer_id, epoch, sequence, records)` claim.
+//! Distinct from the Scribe-local [`crate::spool`] cell: this is the producer /
+//! edge store-and-forward WAL. When opened with a validated
+//! [`ScribeSpoolCapability`], [`ProducerOutbox::stage_submit`] issues an honest
+//! [`SpooledReceipt`] only after capacity reservation, envelope persistence, and
+//! fsync. Without a capability it still keeps exact Wire bytes durable for
+//! replay, but grants no durability receipt.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use crate::chunk::ProducerId;
+use crate::model::JournalId;
+use crate::receipt::{ScribeSpoolCapability, SpooledReceipt};
+use crate::spool::ProgressIdentity;
 use crate::{
-    ProducerId, ProducerWireError, ProducerWireFrame, decode_producer_wire_frame,
-    encode_producer_wire_frame,
+    ProducerWireError, ProducerWireFrame, decode_producer_wire_frame, encode_producer_wire_frame,
 };
 
 const META_NAME: &str = "producer-wire.meta";
@@ -48,6 +54,48 @@ pub struct PendingWireSubmission {
     pub sequence: u64,
     /// Complete length-framed `ProducerWireFrame::Submit` bytes.
     pub encoded_submit: Vec<u8>,
+}
+
+/// Result of [`ProducerOutbox::stage_submit`]: pending Wire bytes plus an optional
+/// `spooled` receipt when a validated edge-spool capability is configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedWireSubmission {
+    /// Exact bytes retained for forwarding / restart replay.
+    pub pending: PendingWireSubmission,
+    /// Present only after fsync under a validated [`ScribeSpoolCapability`].
+    /// Never carries Canon offsets; never a `committed` claim.
+    pub spooled: Option<SpooledReceipt>,
+}
+
+/// Ordering probe for hermetic fsync-before-receipt tests.
+#[derive(Debug, Default, Clone)]
+pub struct OutboxAdmitOrderLog {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl OutboxAdmitOrderLog {
+    /// Creates an empty log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of recorded events.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<&'static str> {
+        self.events.lock().expect("order").clone()
+    }
+
+    fn push(&self, event: &'static str) {
+        self.events.lock().expect("order").push(event);
+    }
+}
+
+/// Injected faults for hermetic outbox tests (no real disk failures).
+#[derive(Debug, Clone, Default)]
+pub struct OutboxFaults {
+    /// Next fsync fails; staged bytes are truncated so nothing is admitted.
+    pub fail_next_sync: bool,
 }
 
 /// Errors from durable producer-outbox operations.
@@ -120,6 +168,12 @@ pub enum ProducerOutboxError {
     /// A complete durable record is malformed or has a mismatching checksum.
     #[error("corrupt producer outbox WAL: {0}")]
     Corrupt(&'static str),
+    /// Spool capability failed validation (missing loss budget, empty id, …).
+    #[error("producer outbox spool capability invalid: {0}")]
+    InvalidCapability(String),
+    /// Injected or real fsync failure before a spooled receipt.
+    #[error("producer outbox fsync failed before spooled receipt")]
+    SyncFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,8 +185,11 @@ enum EntryState {
 /// A crash-safe, single-process durable queue of exact Wire Submit frames.
 ///
 /// `stage_submit` is the local durability boundary. Call it before attempting
-/// the TCP write. `mark_committed` is the only operation that retires a pending
-/// submission, and it must follow a matching Wire ACK.
+/// the TCP write. When opened with a validated [`ScribeSpoolCapability`], a
+/// successful stage returns a [`SpooledReceipt`] only after fsync. Without a
+/// capability, the outbox still retains exact bytes for replay but grants no
+/// durability receipt. `mark_committed` is the only reclaim path and must follow
+/// a matching Wire ACK / observed committed receipt.
 pub struct ProducerOutbox {
     identity: ProducerOutboxIdentity,
     root: PathBuf,
@@ -141,6 +198,10 @@ pub struct ProducerOutbox {
     max_bytes: usize,
     used_bytes: usize,
     entries: BTreeMap<u64, EntryState>,
+    capability: Option<ScribeSpoolCapability>,
+    journal_id: JournalId,
+    order: Option<OutboxAdmitOrderLog>,
+    faults: OutboxFaults,
 }
 
 impl ProducerOutbox {
@@ -149,10 +210,48 @@ impl ProducerOutbox {
     /// The caller must choose one local directory per stable producer and
     /// logical Canon/Verse target. Reopening with any different identity fails
     /// closed; network route changes are intentionally not part of identity.
+    /// This path grants **no** `spooled` receipt — use [`Self::open_spooled`].
     pub fn open(
         root: impl AsRef<Path>,
         identity: ProducerOutboxIdentity,
         max_bytes: usize,
+    ) -> Result<Self, ProducerOutboxError> {
+        Self::open_inner(
+            root,
+            identity,
+            max_bytes,
+            None,
+            JournalId::from_bytes([0; 16]),
+        )
+    }
+
+    /// Opens a durable edge spool that issues `spooled` receipts after fsync.
+    ///
+    /// `capability.max_bytes` is the hard admission bound. `journal_id` is the
+    /// stable Canon journal named on [`ProgressIdentity`] for the receipt; it is
+    /// not a write grant and does not appear as a Canon offset on the receipt.
+    pub fn open_spooled(
+        root: impl AsRef<Path>,
+        identity: ProducerOutboxIdentity,
+        capability: ScribeSpoolCapability,
+        journal_id: JournalId,
+    ) -> Result<Self, ProducerOutboxError> {
+        capability
+            .validate()
+            .map_err(|error| ProducerOutboxError::InvalidCapability(error.to_string()))?;
+        let max_bytes = usize::try_from(capability.max_bytes).unwrap_or(usize::MAX);
+        if max_bytes == 0 {
+            return Err(ProducerOutboxError::InvalidCapacity);
+        }
+        Self::open_inner(root, identity, max_bytes, Some(capability), journal_id)
+    }
+
+    fn open_inner(
+        root: impl AsRef<Path>,
+        identity: ProducerOutboxIdentity,
+        max_bytes: usize,
+        capability: Option<ScribeSpoolCapability>,
+        journal_id: JournalId,
     ) -> Result<Self, ProducerOutboxError> {
         validate_identity(&identity)?;
         if max_bytes == 0 {
@@ -190,7 +289,35 @@ impl ProducerOutbox {
             max_bytes,
             used_bytes: valid_bytes,
             entries,
+            capability,
+            journal_id,
+            order: None,
+            faults: OutboxFaults::default(),
         })
+    }
+
+    /// Attaches an ordering probe (tests assert reserve→persist→fsync→receipt).
+    #[must_use]
+    pub fn with_order_log(mut self, order: OutboxAdmitOrderLog) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    /// Injects the next-sync fault (hermetic tests only).
+    pub fn set_faults(&mut self, faults: OutboxFaults) {
+        self.faults = faults;
+    }
+
+    /// Validated edge-spool capability when this outbox issues `spooled` receipts.
+    #[must_use]
+    pub fn capability(&self) -> Option<&ScribeSpoolCapability> {
+        self.capability.as_ref()
+    }
+
+    /// Published loss budget when a spool capability is configured.
+    #[must_use]
+    pub fn loss_budget(&self) -> Option<std::time::Duration> {
+        self.capability.as_ref().map(|c| c.loss_budget)
     }
 
     /// Durable producer identity and logical target.
@@ -203,6 +330,18 @@ impl ProducerOutbox {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Current durable WAL byte usage (capacity accounting).
+    #[must_use]
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    /// Hard capacity bound.
+    #[must_use]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Next unused contiguous sequence in this persisted epoch.
@@ -228,21 +367,24 @@ impl ProducerOutbox {
     ///
     /// Restaging byte-identical known work is idempotent. Any byte change under
     /// the same sequence is rejected locally, before it can violate the Scribe
-    /// deduplication contract.
+    /// deduplication contract. When a spool capability is configured, a
+    /// [`SpooledReceipt`] is returned only after a successful fsync.
     pub fn stage_submit(
         &mut self,
         encoded_submit: &[u8],
-    ) -> Result<PendingWireSubmission, ProducerOutboxError> {
+    ) -> Result<StagedWireSubmission, ProducerOutboxError> {
         let sequence = submit_sequence(encoded_submit)?;
         if let Some(entry) = self.entries.get(&sequence) {
             let original = match entry {
                 EntryState::Pending(bytes) | EntryState::Acknowledged(bytes) => bytes,
             };
             if original == encoded_submit {
-                return Ok(PendingWireSubmission {
+                let pending = PendingWireSubmission {
                     sequence,
                     encoded_submit: original.clone(),
-                });
+                };
+                let spooled = self.spooled_for(sequence);
+                return Ok(StagedWireSubmission { pending, spooled });
             }
             return Err(ProducerOutboxError::IdentityConflict { sequence });
         }
@@ -254,17 +396,60 @@ impl ProducerOutbox {
             });
         }
         let record = encode_submit_record(sequence, encoded_submit)?;
+        if let Some(order) = &self.order {
+            order.push("reserve");
+        }
         self.reserve(record.len())?;
+        let start_bytes = self.used_bytes;
+        if let Some(order) = &self.order {
+            order.push("persist");
+        }
         self.wal.write_all(&record)?;
         self.wal.flush()?;
-        self.wal.sync_all()?;
+        if let Some(order) = &self.order {
+            order.push("fsync");
+        }
+        if self.faults.fail_next_sync {
+            self.faults.fail_next_sync = false;
+            self.wal.set_len(start_bytes as u64)?;
+            self.wal.sync_all()?;
+            self.wal.seek(SeekFrom::End(0))?;
+            return Err(ProducerOutboxError::SyncFailed);
+        }
+        self.wal.sync_all().map_err(|error| {
+            let _ = self.wal.set_len(start_bytes as u64);
+            let _ = self.wal.sync_all();
+            let _ = self.wal.seek(SeekFrom::End(0));
+            ProducerOutboxError::Io(error)
+        })?;
         self.used_bytes += record.len();
         self.entries
             .insert(sequence, EntryState::Pending(encoded_submit.to_vec()));
-        Ok(PendingWireSubmission {
+        let pending = PendingWireSubmission {
             sequence,
             encoded_submit: encoded_submit.to_vec(),
-        })
+        };
+        let spooled = self.spooled_for(sequence);
+        if spooled.is_some()
+            && let Some(order) = &self.order
+        {
+            order.push("receipt");
+        }
+        Ok(StagedWireSubmission { pending, spooled })
+    }
+
+    fn spooled_for(&self, sequence: u64) -> Option<SpooledReceipt> {
+        let capability = self.capability.as_ref()?;
+        Some(SpooledReceipt::new(
+            capability.scribe_id.clone(),
+            capability.loss_budget,
+            ProgressIdentity {
+                journal_id: self.journal_id,
+                producer_id: self.identity.producer_id,
+                producer_epoch: self.identity.producer_epoch,
+                sequence,
+            },
+        ))
     }
 
     /// Records a matching committed ACK and retires the pending submission.
@@ -587,8 +772,12 @@ fn apply_record(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use bytes::Bytes;
+
+    use crate::chunk::ProducerId;
+    use crate::receipt::{AchievedProfile, ProducerReceipt, SpoolFsyncPolicy, SpoolOnFull};
 
     use super::*;
 
@@ -607,6 +796,21 @@ mod tests {
             producer_id: ProducerId::from_bytes(*b"producer-outbox1"),
             producer_epoch: 7,
             target: "canon/telemetry/verse/host-metrics".into(),
+        }
+    }
+
+    fn journal() -> JournalId {
+        JournalId::from_bytes(*b"scripture-jrnl!!")
+    }
+
+    fn capability(max_bytes: u64) -> ScribeSpoolCapability {
+        ScribeSpoolCapability {
+            path: "injected".into(),
+            max_bytes,
+            fsync: SpoolFsyncPolicy::EveryRecord,
+            on_full: SpoolOnFull::Reject,
+            loss_budget: Duration::from_secs(30),
+            scribe_id: "node-a".into(),
         }
     }
 
@@ -712,5 +916,234 @@ mod tests {
             Err(ProducerOutboxError::Corrupt("record checksum"))
         ));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT3: reserve → persist → fsync → receipt; sync failure admits nothing.
+    #[test]
+    fn fsync_precedes_spooled_receipt_and_sync_failure_admits_nothing() {
+        let root = root("fsync-order");
+        let order = OutboxAdmitOrderLog::new();
+        let mut outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("open")
+                .with_order_log(order.clone());
+        let staged = outbox.stage_submit(&submit(0, b"ok")).expect("stage");
+        assert_eq!(
+            order.snapshot(),
+            vec!["reserve", "persist", "fsync", "receipt"]
+        );
+        assert!(staged.spooled.is_some());
+        drop(outbox);
+
+        let order2 = OutboxAdmitOrderLog::new();
+        let mut outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("reopen")
+                .with_order_log(order2.clone());
+        // mark first committed so sequence 1 is next
+        outbox.mark_committed(7, 0).expect("commit first");
+        outbox.set_faults(OutboxFaults {
+            fail_next_sync: true,
+        });
+        assert!(matches!(
+            outbox.stage_submit(&submit(1, b"fail")),
+            Err(ProducerOutboxError::SyncFailed)
+        ));
+        assert_eq!(order2.snapshot(), vec!["reserve", "persist", "fsync"]);
+        assert!(outbox.pending_submissions().is_empty());
+        // Restart must not recover the failed admission.
+        drop(outbox);
+        let outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("recover");
+        assert!(outbox.pending_submissions().is_empty());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT4: honest spooled receipt — one identity, one-disk scope, loss_budget, no offsets.
+    #[test]
+    fn honest_spooled_receipt_has_no_canon_offset_or_committed_claim() {
+        {
+            let path = root("honest-receipt");
+            let mut outbox =
+                ProducerOutbox::open_spooled(&path, identity(), capability(1024 * 1024), journal())
+                    .expect("open");
+            let staged = outbox.stage_submit(&submit(0, b"payload")).expect("stage");
+            let receipt = staged.spooled.expect("spooled");
+            assert_eq!(receipt.profile, AchievedProfile::Spooled);
+            assert_eq!(receipt.scribe_id, "node-a");
+            assert_eq!(receipt.loss_budget, Duration::from_secs(30));
+            assert_eq!(receipt.identity.sequence, 0);
+            assert_eq!(receipt.identity.journal_id, journal());
+            assert!(
+                ProducerReceipt::Spooled(receipt.clone())
+                    .canon_offsets()
+                    .is_none()
+            );
+            assert!(
+                !ProducerReceipt::Spooled(receipt)
+                    .satisfies(crate::receipt::ReceiptRequirement::Committed)
+            );
+            std::fs::remove_dir_all(path).expect("cleanup");
+        }
+        let plain_root = root("no-capability");
+        let mut plain = ProducerOutbox::open(&plain_root, identity(), 1024 * 1024).expect("open");
+        let staged = plain.stage_submit(&submit(0, b"x")).expect("stage");
+        assert!(staged.spooled.is_none());
+        std::fs::remove_dir_all(plain_root).expect("cleanup");
+    }
+
+    /// WP AT5: retain through unavailable serving path / lost reply.
+    #[test]
+    fn retain_through_unavailable_serving_path_without_false_committed() {
+        let root = root("retain");
+        let mut outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("open");
+        let staged = outbox.stage_submit(&submit(0, b"hold")).expect("stage");
+        let identity_bytes = staged.pending.encoded_submit.clone();
+        // Injected disconnect / not-serving / lost response: do not mark_committed.
+        assert_eq!(outbox.pending_submissions().len(), 1);
+        // Retried forward uses unchanged identity.
+        let again = outbox
+            .stage_submit(&identity_bytes)
+            .expect("restage identical");
+        assert_eq!(again.pending.encoded_submit, identity_bytes);
+        assert_eq!(outbox.pending_submissions().len(), 1);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT6: restart recovery reconstructs envelope for ACTIVE-generation replay.
+    #[test]
+    fn restart_recovery_replays_original_envelope_until_committed() {
+        let root = root("restart-replay");
+        let expected = submit(0, b"envelope");
+        {
+            let mut outbox =
+                ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                    .expect("open");
+            let staged = outbox.stage_submit(&expected).expect("stage");
+            assert!(staged.spooled.is_some());
+        }
+        let outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("recover");
+        let pending = outbox.pending_submissions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].encoded_submit, expected);
+        // Envelope is generation-free Wire Submit bytes, not a sealed DataBlock.
+        match decode_producer_wire_frame(&pending[0].encoded_submit).expect("decode") {
+            ProducerWireFrame::Submit { sequence, records } => {
+                assert_eq!(sequence, 0);
+                assert_eq!(records.len(), 1);
+            }
+            other => panic!("expected Submit envelope, got {other:?}"),
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT7: lost committed reply + restart still yields one logical pending identity.
+    #[test]
+    fn idempotent_forward_after_lost_reply_and_restart() {
+        let root = root("idempotent");
+        let expected = submit(0, b"once");
+        {
+            let mut outbox =
+                ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                    .expect("open");
+            outbox.stage_submit(&expected).expect("stage");
+            // Lost committed reply: no mark_committed.
+        }
+        let mut outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("recover");
+        assert_eq!(outbox.pending_submissions().len(), 1);
+        let restaged = outbox.stage_submit(&expected).expect("identical restage");
+        assert_eq!(restaged.pending.encoded_submit, expected);
+        assert!(restaged.spooled.is_some());
+        // Fabricated upgrade of the original spooled receipt is impossible: we
+        // only get Committed after mark_committed with an observed ACK.
+        outbox.mark_committed(7, 0).expect("observed commit");
+        assert!(outbox.pending_submissions().is_empty());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT8: reclaim only after observed commit; checkpoint precedes reclaim.
+    #[test]
+    fn reclaim_only_after_observed_commit_checkpoint() {
+        let root = root("reclaim");
+        {
+            let mut outbox =
+                ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                    .expect("open");
+            outbox.stage_submit(&submit(0, b"keep")).expect("stage");
+            assert_eq!(outbox.pending_submissions().len(), 1);
+            // Crash/retry before commit leaves entry present.
+        }
+        {
+            let mut outbox =
+                ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                    .expect("recover pending");
+            assert_eq!(outbox.pending_submissions().len(), 1);
+            outbox.mark_committed(7, 0).expect("checkpoint");
+            assert!(outbox.pending_submissions().is_empty());
+        }
+        let outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("recover after checkpoint");
+        assert!(outbox.pending_submissions().is_empty());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT9: staging may return spooled while serving remains unauthorized; retain until commit.
+    #[test]
+    fn authority_gate_independent_spooled_then_commit_same_identity() {
+        let root = root("authority");
+        let expected = submit(0, b"gated");
+        let mut outbox =
+            ProducerOutbox::open_spooled(&root, identity(), capability(1024 * 1024), journal())
+                .expect("open");
+        let staged = outbox
+            .stage_submit(&expected)
+            .expect("spooled despite unauthorized peer");
+        assert!(staged.spooled.is_some());
+        // Injected unauthorized / stale serving: no mark_committed → retained.
+        assert_eq!(outbox.pending_submissions().len(), 1);
+        // Later valid commit of the same identity.
+        outbox.mark_committed(7, 0).expect("authorized commit");
+        assert!(outbox.pending_submissions().is_empty());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// WP AT10: capacity / loss_budget bound rejects before receipt; no eviction.
+    #[test]
+    fn capacity_bound_rejects_before_receipt_without_evicting() {
+        let root = root("capacity");
+        // Tiny capacity: first stage may succeed; second must fail closed.
+        let mut outbox = ProducerOutbox::open_spooled(&root, identity(), capability(80), journal())
+            .expect("open");
+        let first = outbox.stage_submit(&submit(0, b"a")).expect("first");
+        assert!(first.spooled.is_some());
+        let err = outbox
+            .stage_submit(&submit(1, b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+            .expect_err("must reject");
+        assert!(matches!(err, ProducerOutboxError::CapacityExceeded { .. }));
+        assert_eq!(outbox.pending_submissions().len(), 1);
+        assert_eq!(
+            outbox.pending_submissions()[0].encoded_submit,
+            first.pending.encoded_submit
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn open_spooled_rejects_zero_loss_budget() {
+        let root = root("bad-cap");
+        let mut bad = capability(1024);
+        bad.loss_budget = Duration::ZERO;
+        assert!(matches!(
+            ProducerOutbox::open_spooled(&root, identity(), bad, journal()),
+            Err(ProducerOutboxError::InvalidCapability(_))
+        ));
     }
 }

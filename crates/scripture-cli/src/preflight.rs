@@ -66,7 +66,7 @@ fn bump_warning_counter(code: CapabilityCode) {
 /// Build statically-derivable capability inputs from config (hermetic; no I/O).
 ///
 /// - Storage targets: one configured object-store backend today.
-/// - Producer spool: always unset until producer-outbox enablement (follow-up).
+/// - Producer spool: from validated `producer_spool` when present.
 /// - Recovery candidates: only `safety.declared_eligible_candidates`.
 #[must_use]
 pub fn static_capability_inputs(config: &ScriptureConfig) -> CapabilityInputs {
@@ -75,12 +75,22 @@ pub fn static_capability_inputs(config: &ScriptureConfig) -> CapabilityInputs {
         .map(|b| b.label().to_owned())
         .unwrap_or_else(|_| config.store.backend.clone());
     let verses = verse_scopes_for_static(config);
+    let durable = config.durable_producer_spool_configured();
+    let (producer_spool_loss_budget, producer_spool_scribe_id) =
+        match config.validated_producer_spool() {
+            Ok(Some(cap)) => (
+                format!("{}s", cap.loss_budget.as_secs()),
+                cap.scribe_id.clone(),
+            ),
+            _ => (String::new(), String::new()),
+        };
     CapabilityInputs {
         backend_label,
         independent_storage_targets: 1,
         committed_capable_target: true,
-        // No producer-outbox config exists yet (WP out of scope).
-        durable_producer_spool_configured: false,
+        durable_producer_spool_configured: durable,
+        producer_spool_loss_budget,
+        producer_spool_scribe_id,
         verses,
     }
 }

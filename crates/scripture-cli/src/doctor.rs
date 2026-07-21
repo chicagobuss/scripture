@@ -173,12 +173,23 @@ pub async fn build_live_capability_inputs(
             fleet_directory_nonempty: !records.is_empty(),
         });
     }
+    let durable = config.durable_producer_spool_configured();
+    let (producer_spool_loss_budget, producer_spool_scribe_id) =
+        match config.validated_producer_spool() {
+            Ok(Some(cap)) => (
+                format!("{}s", cap.loss_budget.as_secs()),
+                cap.scribe_id.clone(),
+            ),
+            _ => (String::new(), String::new()),
+        };
     Ok(CapabilityInputs {
         backend_label: backend.label().to_owned(),
         independent_storage_targets: 1,
         committed_capable_target: true,
-        // Honest: no producer-outbox config exists yet.
-        durable_producer_spool_configured: false,
+        // Config-derived; live observation does not invent a spool.
+        durable_producer_spool_configured: durable,
+        producer_spool_loss_budget,
+        producer_spool_scribe_id,
         verses,
     })
 }
@@ -229,8 +240,7 @@ fn render_disclosure(inputs: &CapabilityInputs, typed: &TypedCapabilityReport) -
             ),
             evidence: "store.backend + single configured target in YAML".to_owned(),
             result: if inputs.committed_capable_target {
-                "history survives Scribe process restart after a Canon-committed ACK"
-                    .to_owned()
+                "history survives Scribe process restart after a Canon-committed ACK".to_owned()
             } else {
                 typed.canon_history.consequence.clone()
             },
@@ -241,9 +251,27 @@ fn render_disclosure(inputs: &CapabilityInputs, typed: &TypedCapabilityReport) -
             } else {
                 "NOT CONFIGURED".to_owned()
             },
-            receipt_profiles: "committed (default); spooled available only when a ScribeSpoolCapability with a published loss_budget is constructed".to_owned(),
-            spooled_loss_budget: String::new(),
-            evidence: "receipt vocabulary in scripture::receipt; PreCommitSpool in scripture-runtime; serve path still committed-only unless spool capability is mounted".to_owned(),
+            receipt_profiles: if inputs.durable_producer_spool_configured {
+                "committed (default); spooled available via configured producer_spool + ProducerOutbox"
+                    .to_owned()
+            } else {
+                "committed (default); spooled available only when producer_spool is configured"
+                    .to_owned()
+            },
+            spooled_loss_budget: if inputs.durable_producer_spool_configured {
+                inputs.producer_spool_loss_budget.clone()
+            } else {
+                String::new()
+            },
+            evidence: if inputs.durable_producer_spool_configured {
+                format!(
+                    "producer_spool config (scribe_id={}) + ProducerOutbox; scope=one named Scribe local disk",
+                    inputs.producer_spool_scribe_id
+                )
+            } else {
+                "producer_spool absent; ProducerOutbox cannot issue spooled receipts without a validated local spool"
+                    .to_owned()
+            },
             result: if inputs.durable_producer_spool_configured {
                 typed.producer_continuity.consequence.clone()
             } else {
@@ -562,6 +590,8 @@ mod tests {
             independent_storage_targets: 1,
             committed_capable_target: true,
             durable_producer_spool_configured: false,
+            producer_spool_loss_budget: String::new(),
+            producer_spool_scribe_id: String::new(),
             verses: vec![inputs],
         };
         disclose_from_inputs(&package)
@@ -694,6 +724,8 @@ mod tests {
             independent_storage_targets: 1,
             committed_capable_target: true,
             durable_producer_spool_configured: false,
+            producer_spool_loss_budget: String::new(),
+            producer_spool_scribe_id: String::new(),
             verses: vec![verse_inputs(
                 vec![record_candidate(
                     "scripture-own-b!",

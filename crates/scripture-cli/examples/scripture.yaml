@@ -54,3 +54,14 @@ metrics:
 #   #     owner_id: "node-a!!!!!!!!!!"
 #   #     serving_capable: true
 #   #     fresh: true
+#
+# Optional durable producer/edge spool (satisfies producer_continuity: spooled):
+# producer_spool:
+#   enabled: true        # mounts the producer Wire store-and-forward lifecycle
+#   kind: local          # only "local" is durable; "memory" is invalid
+#   path: ".scripture-producer-spool"
+#   max_bytes: 1048576
+#   fsync: every_record
+#   on_full: reject
+#   loss_budget: 30s     # Ns / Nm / Nh
+#   scribe_id: "node-a"

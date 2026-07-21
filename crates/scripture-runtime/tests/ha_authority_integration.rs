@@ -28,15 +28,16 @@ use scripture::serving_authority::{
     ServingAuthorityRecord, TransitionId, TransitionIntent, TransitionKind, WriterTerm,
 };
 use scripture::{
-    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId, ProducerWireFrame,
-    Record, RecoveryBound, Submission, SystemClock, SystemTimer, VerseId, WriterId,
+    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId, ProducerOutbox,
+    ProducerOutboxIdentity, ProducerWireFrame, Record, RecoveryBound, ScribeSpoolCapability,
+    SpoolFsyncPolicy, SpoolOnFull, Submission, SystemClock, SystemTimer, VerseId, WriterId,
     decode_producer_wire_frame, encode_producer_wire_frame,
 };
 use scripture_runtime::{
     AuthorityGateDecision, DurableLogletParts, HaServingSession, HolylogJournalFoundation,
     NodeIdentity, PartsFactory, PartsFactoryError, ProcessLogletResolver, SharedMemoryPartsFactory,
     bootstrap_and_serve, bootstrap_authority_domain, evaluate_authority_gate, promote_and_serve,
-    serve_ha_producer_wire_connection,
+    serve_ha_producer_wire_io,
 };
 use scripture_service::{
     AuthorityCoordinator, DeterministicTransitionIdGenerator, JournalFoundationTransition,
@@ -849,17 +850,17 @@ async fn raw_lines_ha_cutover_fresh_producer_dense_continuation() {
 #[tokio::test]
 async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
     use scripture::decode_chunk;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 
-    async fn serve_once(listener: TcpListener, session: Arc<HaServingSession>) {
-        let (stream, _) = listener.accept().await.expect("accept");
+    async fn serve_once(server: DuplexStream, session: Arc<HaServingSession>) {
+        let (reader, writer) = tokio::io::split(server);
         // The first simulated reply loss is allowed to surface as a transport
         // error after the durable receipt has resolved.
-        let _ = serve_ha_producer_wire_connection(stream, session).await;
+        let _ = serve_ha_producer_wire_io(reader, writer, session).await;
     }
 
-    async fn read_wire_reply(stream: &mut TcpStream) -> ProducerWireFrame {
+    async fn read_wire_reply<R: AsyncRead + Unpin>(stream: &mut R) -> ProducerWireFrame {
         let mut prefix = [0_u8; 4];
         stream.read_exact(&mut prefix).await.expect("reply prefix");
         let length = u32::from_be_bytes(prefix) as usize;
@@ -901,28 +902,48 @@ async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
     assert!(session.is_effective_writer().await, "A remains effective");
 
     let producer_id = ProducerId::from_bytes(*b"wire-retry-prod!");
-    let hello = encode_producer_wire_frame(&ProducerWireFrame::Hello {
-        producer_id,
-        producer_epoch: 7,
-    })
-    .expect("hello");
     let submit = encode_producer_wire_frame(&ProducerWireFrame::Submit {
         sequence: 0,
         records: vec![Bytes::from_static(b"wire-retry-payload")],
     })
     .expect("submit");
+    let spool = tempfile::tempdir().expect("spool root");
+    let capability = ScribeSpoolCapability {
+        path: spool.path().display().to_string(),
+        max_bytes: 1024 * 1024,
+        fsync: SpoolFsyncPolicy::EveryRecord,
+        on_full: SpoolOnFull::Reject,
+        loss_budget: Duration::from_secs(30),
+        scribe_id: "node-a".to_owned(),
+    };
+    let identity = ProducerOutboxIdentity {
+        producer_id,
+        producer_epoch: 7,
+        target: "ha-int-journal!!/ha-int-verse!!!!".to_owned(),
+    };
+    let mut outbox = ProducerOutbox::open_spooled(
+        spool.path(),
+        identity.clone(),
+        capability.clone(),
+        journal(),
+    )
+    .expect("open configured spool");
+    let staged = outbox.stage_submit(&submit).expect("fsynced stage");
+    let spooled = staged.spooled.expect("spooled only after fsync");
+    assert_eq!(spooled.identity.sequence, 0);
+    assert_eq!(outbox.pending_submissions().len(), 1);
+    let hello = outbox.hello_frame().expect("hello");
 
     // First connection reaches the real HA session, then the client drops the
     // socket without reading its Ack. Polling the real VirtualLog confirms the
     // durable action happened before retrying, avoiding a timing-only test.
-    let first_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind first");
-    let first_address = first_listener.local_addr().expect("first address");
-    let first_server = tokio::spawn(serve_once(first_listener, Arc::clone(&session)));
-    let mut first_client = TcpStream::connect(first_address)
-        .await
-        .expect("connect first");
+    let (mut first_client, first_server_io) = duplex(4096);
+    let first_server = tokio::spawn(serve_once(first_server_io, Arc::clone(&session)));
     first_client.write_all(&hello).await.expect("write hello");
-    first_client.write_all(&submit).await.expect("write submit");
+    first_client
+        .write_all(&staged.pending.encoded_submit)
+        .await
+        .expect("write submit");
     first_client.flush().await.expect("flush submit");
 
     let virtual_log = VirtualLog::new(
@@ -958,14 +979,22 @@ async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
     drop(first_client);
     first_server.await.expect("first server join");
 
-    let retry_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind retry");
-    let retry_address = retry_listener.local_addr().expect("retry address");
-    let retry_server = tokio::spawn(serve_once(retry_listener, Arc::clone(&session)));
-    let mut retry_client = TcpStream::connect(retry_address)
-        .await
-        .expect("connect retry");
+    // A process restart recovers the exact stable envelope; the lost reply
+    // cannot reclaim it because no committed receipt has been observed.
+    drop(outbox);
+    let mut outbox = ProducerOutbox::open_spooled(spool.path(), identity, capability, journal())
+        .expect("recover configured spool");
+    let recovered = outbox.pending_submissions();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].encoded_submit, submit);
+
+    let (mut retry_client, retry_server_io) = duplex(4096);
+    let retry_server = tokio::spawn(serve_once(retry_server_io, Arc::clone(&session)));
     retry_client.write_all(&hello).await.expect("retry hello");
-    retry_client.write_all(&submit).await.expect("retry submit");
+    retry_client
+        .write_all(&recovered[0].encoded_submit)
+        .await
+        .expect("retry submit");
     retry_client.flush().await.expect("retry flush");
     let reply = read_wire_reply(&mut retry_client).await;
     assert_eq!(
@@ -977,6 +1006,12 @@ async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
             next_offset: 1,
         }
     );
+    // Completion is durably checkpointed before the recovered entry is
+    // reclaimed from the replay set.
+    outbox
+        .mark_committed(7, 0)
+        .expect("checkpoint observed commit");
+    assert!(outbox.pending_submissions().is_empty());
     retry_client.shutdown().await.expect("retry shutdown");
     retry_server.await.expect("retry server join");
 
@@ -988,14 +1023,8 @@ async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
         records: vec![Bytes::from_static(b"wire-retry-CHANGED")],
     })
     .expect("conflict submit");
-    let conflict_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind conflict");
-    let conflict_address = conflict_listener.local_addr().expect("conflict address");
-    let conflict_server = tokio::spawn(serve_once(conflict_listener, Arc::clone(&session)));
-    let mut conflict_client = TcpStream::connect(conflict_address)
-        .await
-        .expect("connect conflict");
+    let (mut conflict_client, conflict_server_io) = duplex(4096);
+    let conflict_server = tokio::spawn(serve_once(conflict_server_io, Arc::clone(&session)));
     conflict_client
         .write_all(&hello)
         .await

@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use scripture::{
-    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, VerseId, WriterId,
+    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, RecoveryBound, ScribeSpoolCapability,
+    SpoolFsyncPolicy, SpoolOnFull, VerseId, WriterId,
 };
 use scripture_runtime::{BackendProfile, assignment_durable_root};
 use scripture_service::VerseRuntimeConfig;
@@ -50,6 +51,119 @@ pub struct ScriptureConfig {
     /// Optional durability/availability policy (`safety.require`).
     #[serde(default)]
     pub safety: Option<SafetyConfig>,
+    /// Optional durable producer/edge spool (`producer_continuity: spooled`).
+    #[serde(default)]
+    pub producer_spool: Option<ProducerSpoolConfig>,
+}
+
+/// Durable producer/edge spool configuration for `spooled` receipts.
+///
+/// Only `kind: local` is a durable spool. Volatile kinds (e.g. `memory`) are
+/// rejected: they cannot satisfy `producer_continuity: spooled`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerSpoolConfig {
+    /// Explicitly mounts the configured spool into the producer submission
+    /// lifecycle. A valid path alone is only dormant configuration and must
+    /// never satisfy `producer_continuity: spooled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Storage kind. Must be `local` for durable capability.
+    pub kind: String,
+    /// Local filesystem path for the durable edge spool.
+    pub path: String,
+    /// Maximum retained bytes before `on_full` applies.
+    pub max_bytes: u64,
+    /// Sync boundary before issuing `spooled` (`every_record`).
+    pub fsync: String,
+    /// Behavior when capacity cannot be reserved (`reject`).
+    pub on_full: String,
+    /// Published loss budget (`30s` / `5m` / `1h`).
+    pub loss_budget: String,
+    /// Stable Scribe identity named on `spooled` receipts.
+    pub scribe_id: String,
+}
+
+impl ProducerSpoolConfig {
+    /// Map YAML fields to a validated [`ScribeSpoolCapability`].
+    pub fn to_capability(&self) -> Result<ScribeSpoolCapability, ConfigError> {
+        let kind = self.kind.trim();
+        if kind != "local" {
+            return Err(ConfigError::Invalid(format!(
+                "producer_spool.kind: {kind:?} is not a durable spool (expected \"local\"; \"memory\" cannot satisfy producer_continuity: spooled)"
+            )));
+        }
+        let path = self.path.trim();
+        if path.is_empty() || path.contains("..") {
+            return Err(ConfigError::Invalid(
+                "producer_spool.path must be a non-empty path without '..'".into(),
+            ));
+        }
+        let fsync = match self.fsync.trim() {
+            "every_record" => SpoolFsyncPolicy::EveryRecord,
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "producer_spool.fsync: invalid value {other:?} (expected every_record)"
+                )));
+            }
+        };
+        let on_full = match self.on_full.trim() {
+            "reject" => SpoolOnFull::Reject,
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "producer_spool.on_full: invalid value {other:?} (expected reject)"
+                )));
+            }
+        };
+        let loss_budget = parse_loss_budget(self.loss_budget.trim()).map_err(|error| {
+            ConfigError::Invalid(format!("producer_spool.loss_budget: {error}"))
+        })?;
+        let capability = ScribeSpoolCapability {
+            path: path.to_owned(),
+            max_bytes: self.max_bytes,
+            fsync,
+            on_full,
+            loss_budget,
+            scribe_id: self.scribe_id.clone(),
+        };
+        capability
+            .validate()
+            .map_err(|error| ConfigError::Invalid(format!("producer_spool: {error}")))?;
+        Ok(capability)
+    }
+}
+
+/// Parse simple `Ns` / `Nm` / `Nh` duration forms for `producer_spool.loss_budget`.
+fn parse_loss_budget(raw: &str) -> Result<Duration, String> {
+    if raw.is_empty() {
+        return Err("must be non-empty (e.g. 30s, 5m, 1h)".into());
+    }
+    // Check longer unit suffixes first so `h` / `m` are not confused with bare digits.
+    if let Some(hours) = raw.strip_suffix('h') {
+        let n: u64 = hours
+            .parse()
+            .map_err(|_| format!("expected Nh form, got {raw}"))?;
+        let secs = n
+            .checked_mul(3_600)
+            .ok_or_else(|| format!("duration overflow in {raw}"))?;
+        return Ok(Duration::from_secs(secs));
+    }
+    if let Some(minutes) = raw.strip_suffix('m') {
+        let n: u64 = minutes
+            .parse()
+            .map_err(|_| format!("expected Nm form, got {raw}"))?;
+        let secs = n
+            .checked_mul(60)
+            .ok_or_else(|| format!("duration overflow in {raw}"))?;
+        return Ok(Duration::from_secs(secs));
+    }
+    if let Some(seconds) = raw.strip_suffix('s') {
+        let n: u64 = seconds
+            .parse()
+            .map_err(|_| format!("expected Ns form, got {raw}"))?;
+        return Ok(Duration::from_secs(n));
+    }
+    Err(format!("expected Ns, Nm, or Nh (e.g. 30s), got {raw}"))
 }
 
 /// Static multi-assignment Scribe layout for this process.
@@ -528,7 +642,29 @@ impl ScriptureConfig {
         if let Some(safety) = &self.safety {
             Self::validate_safety(safety)?;
         }
+        // Present-but-invalid spool fails closed; absent is fine.
+        let _ = self.validated_producer_spool()?;
         Ok(())
+    }
+
+    /// Validated durable producer spool, if configured.
+    ///
+    /// Returns `Ok(None)` when `producer_spool` is absent, `Ok(Some(_))` when a
+    /// durable local spool is present and valid, and `Err` when present but
+    /// invalid (volatile kind, bad path, empty loss budget, etc.).
+    pub fn validated_producer_spool(&self) -> Result<Option<ScribeSpoolCapability>, ConfigError> {
+        let Some(raw) = &self.producer_spool else {
+            return Ok(None);
+        };
+        Ok(Some(raw.to_capability()?))
+    }
+
+    /// True only when a validated durable (`kind: local`) producer spool is
+    /// explicitly enabled for the executable producer lifecycle.
+    #[must_use]
+    pub fn durable_producer_spool_configured(&self) -> bool {
+        self.producer_spool.as_ref().is_some_and(|raw| raw.enabled)
+            && matches!(self.validated_producer_spool(), Ok(Some(_)))
     }
 
     fn validate_safety(safety: &SafetyConfig) -> Result<(), ConfigError> {
@@ -937,6 +1073,70 @@ scribe:
         config.validate().expect("valid");
         assert_eq!(config.node.owner_id.len(), 16);
         assert!(!config.is_multi_assignment());
+        assert!(!config.durable_producer_spool_configured());
+        assert!(matches!(config.validated_producer_spool(), Ok(None)));
+    }
+
+    #[test]
+    fn accepts_local_producer_spool() {
+        let yaml = sample_yaml().to_owned()
+            + r#"
+producer_spool:
+  enabled: true
+  kind: local
+  path: ".scripture-producer-spool"
+  max_bytes: 1048576
+  fsync: every_record
+  on_full: reject
+  loss_budget: 30s
+  scribe_id: "node-a"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        config.validate().expect("valid");
+        assert!(config.durable_producer_spool_configured());
+        let cap = config
+            .validated_producer_spool()
+            .expect("ok")
+            .expect("present");
+        assert_eq!(cap.scribe_id, "node-a");
+        assert_eq!(cap.loss_budget, Duration::from_secs(30));
+        assert_eq!(cap.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn rejects_memory_producer_spool() {
+        let yaml = sample_yaml().to_owned()
+            + r#"
+producer_spool:
+  kind: memory
+  path: ".scripture-producer-spool"
+  max_bytes: 1048576
+  fsync: every_record
+  on_full: reject
+  loss_budget: 30s
+  scribe_id: "node-a"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        let err = config.validate().expect_err("memory not durable");
+        assert!(err.to_string().contains("producer_spool.kind"));
+        assert!(!config.durable_producer_spool_configured());
+    }
+
+    #[test]
+    fn rejects_zero_loss_budget_producer_spool() {
+        let yaml = sample_yaml().to_owned()
+            + r#"
+producer_spool:
+  kind: local
+  path: ".scripture-producer-spool"
+  max_bytes: 1048576
+  fsync: every_record
+  on_full: reject
+  loss_budget: 0s
+  scribe_id: "node-a"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(&yaml).expect("parse");
+        assert!(config.validate().is_err());
     }
 
     #[test]

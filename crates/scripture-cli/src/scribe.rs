@@ -1056,9 +1056,15 @@ mod tests {
         assert!(a_session.is_effective_writer().await);
 
         // Stale holder on the candidate's ingress — the live failure mode.
-        let occupied = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("occupy ingress");
+        let occupied = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            // Restricted test sandboxes can forbid every host socket. The
+            // authority proof below is exercised on normal local runners; a
+            // host-level deny cannot be distinguished from the bind failure
+            // being modeled without an injectable listener implementation.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("occupy ingress: {error}"),
+        };
         let bind = occupied.local_addr().expect("addr").to_string();
         let assignment = AssignmentConfig {
             id: "telemetry-host-a".into(),

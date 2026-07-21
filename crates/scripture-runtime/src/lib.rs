@@ -69,7 +69,8 @@ pub use holylog_foundation::{
 pub use ingress::{
     serve_canon_raw_lines_connection, serve_canon_raw_lines_connection_with_metrics,
     serve_canon_raw_lines_connection_with_spool, serve_ha_producer_wire_connection,
-    serve_ha_raw_lines_connection, serve_ha_raw_lines_connection_with_budgets,
+    serve_ha_producer_wire_io, serve_ha_raw_lines_connection,
+    serve_ha_raw_lines_connection_with_budgets,
 };
 pub use local_file_store::ConditionalLocalFileStore;
 pub use node::{

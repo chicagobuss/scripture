@@ -161,6 +161,10 @@ pub struct CapabilityInputs {
     pub committed_capable_target: bool,
     /// Whether a durable producer/edge spool (outbox) is configured.
     pub durable_producer_spool_configured: bool,
+    /// Published spool loss budget disclosure (e.g. `"30s"`); empty when not configured.
+    pub producer_spool_loss_budget: String,
+    /// Named Scribe identity for the configured spool; empty when not configured.
+    pub producer_spool_scribe_id: String,
     /// Per-Verse scopes to evaluate.
     pub verses: Vec<VerseCapabilityInputs>,
 }
@@ -248,7 +252,10 @@ pub fn evaluate(inputs: &CapabilityInputs) -> CapabilityReport {
             kind: SatisfactionKind::Satisfied,
             code: None,
             scope: CapabilityScope::deployment(),
-            observed: "durable producer/edge spool configured".to_owned(),
+            observed: format!(
+                "durable producer/edge spool configured (scribe_id={}, loss_budget={}, scope=one named Scribe local disk)",
+                inputs.producer_spool_scribe_id, inputs.producer_spool_loss_budget
+            ),
             consequence:
                 "producers can retain accepted-but-not-yet-committed records across a Scribe outage"
                     .to_owned(),
@@ -263,7 +270,7 @@ pub fn evaluate(inputs: &CapabilityInputs) -> CapabilityReport {
             consequence: "an ordinary Scribe restart stalls producers; unacknowledged source records depend on the application's own retry/persistence"
                 .to_owned(),
             remediation: Some(
-                "configure a durable producer edge spool/outbox for spooled receipts (follow-up: producer-outbox enablement)"
+                "configure producer_spool (kind: local, path, max_bytes, fsync, on_full, loss_budget, scribe_id) for durable spooled receipts"
                     .to_owned(),
             ),
         }
@@ -517,6 +524,8 @@ mod tests {
             independent_storage_targets: 1,
             committed_capable_target: true,
             durable_producer_spool_configured: false,
+            producer_spool_loss_budget: String::new(),
+            producer_spool_scribe_id: String::new(),
             verses: vec![VerseCapabilityInputs {
                 canon: "telemetry-jrnl!!".to_owned(),
                 verse: "telemetry-host-a".to_owned(),
@@ -640,6 +649,31 @@ mod tests {
         assert_eq!(
             report.producer_continuity.code,
             Some(CapabilityCode::ProducerContinuity)
+        );
+        assert!(
+            report
+                .producer_continuity
+                .remediation
+                .as_ref()
+                .is_some_and(|r| r.contains("producer_spool"))
+        );
+    }
+
+    #[test]
+    fn producer_continuity_satisfied_with_spool_disclosure() {
+        let mut inputs = base_inputs();
+        inputs.durable_producer_spool_configured = true;
+        inputs.producer_spool_loss_budget = "30s".to_owned();
+        inputs.producer_spool_scribe_id = "node-a".to_owned();
+        let report = evaluate(&inputs);
+        assert_eq!(report.producer_continuity.kind, SatisfactionKind::Satisfied);
+        assert!(report.producer_continuity.observed.contains("node-a"));
+        assert!(report.producer_continuity.observed.contains("30s"));
+        assert!(
+            report
+                .producer_continuity
+                .observed
+                .contains("one named Scribe local disk")
         );
     }
 

@@ -277,6 +277,8 @@ fn t8_doctor_render_agrees_enforcement_on_fresh_standby() {
         independent_storage_targets: 1,
         committed_capable_target: true,
         durable_producer_spool_configured: false,
+        producer_spool_loss_budget: String::new(),
+        producer_spool_scribe_id: String::new(),
         verses: vec![VerseCapabilityInputs {
             canon: "telemetry-jrnl!!".to_owned(),
             verse: "telemetry-host-a".to_owned(),
@@ -511,6 +513,8 @@ fn enforce_warn_orders_findings_by_code_then_scope() {
         independent_storage_targets: 1,
         committed_capable_target: true,
         durable_producer_spool_configured: false,
+        producer_spool_loss_budget: String::new(),
+        producer_spool_scribe_id: String::new(),
         verses: vec![
             VerseCapabilityInputs {
                 canon: "canon-bbbbbbbbb".to_owned(),

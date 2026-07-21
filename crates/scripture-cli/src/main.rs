@@ -31,6 +31,8 @@ mod serve;
 mod live_accept;
 #[cfg(test)]
 mod safety_accept;
+#[cfg(test)]
+mod spooled_accept;
 
 use std::error::Error;
 use std::path::PathBuf;

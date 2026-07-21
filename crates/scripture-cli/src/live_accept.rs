@@ -82,6 +82,8 @@ fn live_inputs(candidates: Vec<RecoveryCandidateEvidence>) -> CapabilityInputs {
         independent_storage_targets: 1,
         committed_capable_target: true,
         durable_producer_spool_configured: false,
+        producer_spool_loss_budget: String::new(),
+        producer_spool_scribe_id: String::new(),
         verses: vec![VerseCapabilityInputs {
             canon: "scripture-jrnl!!".to_owned(),
             verse: "scripture-verse!".to_owned(),

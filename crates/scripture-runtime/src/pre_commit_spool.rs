@@ -282,6 +282,7 @@ impl<S: SpoolStorage> PreCommitSpool<S> {
         }
         Ok(SpooledReceipt::new(
             self.config.capability.scribe_id.clone(),
+            self.config.capability.loss_budget,
             identity,
         ))
     }

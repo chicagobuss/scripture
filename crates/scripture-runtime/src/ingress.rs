@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use scripture::{DriverError, ProducerWireErrorCode, ReceiptFuture, Submission};
 use scripture_service::{CanonRoute, ChunkServiceError, VerseAdmitError, VerseRuntime};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ha_session::HaServingSession;
@@ -215,6 +215,22 @@ pub async fn serve_ha_producer_wire_connection(
     session: Arc<HaServingSession>,
 ) -> io::Result<()> {
     let (reader, writer) = stream.into_split();
+    serve_ha_producer_wire_io(reader, writer, session).await
+}
+
+/// Transport-generic form of [`serve_ha_producer_wire_connection`].
+///
+/// Keeping authority admission above the transport lets hermetic tests exercise
+/// the real active-generation serving path without opening host sockets.
+pub async fn serve_ha_producer_wire_io<R, W>(
+    reader: R,
+    writer: W,
+    session: Arc<HaServingSession>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     serve_producer_wire_connection(reader, writer, HaProducerWireSink { session }).await
 }
 

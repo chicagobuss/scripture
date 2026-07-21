@@ -180,6 +180,8 @@ pub struct SpooledReceipt {
     pub profile: AchievedProfile,
     /// Scribe that holds the local copy.
     pub scribe_id: String,
+    /// Published loss budget for this one-disk acknowledgment scope.
+    pub loss_budget: Duration,
     /// Stable producer event identity retained for idempotent forward.
     pub identity: ProgressIdentity,
 }
@@ -187,10 +189,15 @@ pub struct SpooledReceipt {
 impl SpooledReceipt {
     /// Constructs a scoped `spooled` receipt (no offsets by design).
     #[must_use]
-    pub fn new(scribe_id: impl Into<String>, identity: ProgressIdentity) -> Self {
+    pub fn new(
+        scribe_id: impl Into<String>,
+        loss_budget: Duration,
+        identity: ProgressIdentity,
+    ) -> Self {
         Self {
             profile: AchievedProfile::Spooled,
             scribe_id: scribe_id.into(),
+            loss_budget,
             identity,
         }
     }
