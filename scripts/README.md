@@ -8,6 +8,19 @@ define a stable application protocol.
 drill templates under `config/local/scribe-drills/` without printing secrets or
 starting processes.
 
+`submission-check.sh` captures the portable, deterministic evidence bundle for
+the current source revision. It runs the core handoff/DataRef/spool suites, the
+correctness campaign, and the Arrow/Parquet workload contract, then writes logs
+and provenance beneath ignored `.tmp/submission-evidence/`:
+
+```sh
+./scripts/submission-check.sh
+```
+
+It intentionally makes no live deployment claim and never contacts object
+storage, Kubernetes, or a package registry. A separate approved two-Scribe
+object-store drill is required for live operational evidence.
+
 `scripture_send.py` targets the current provisional raw-lines TCP listener:
 
 ```sh
