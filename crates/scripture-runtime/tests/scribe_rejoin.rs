@@ -18,9 +18,9 @@ use scripture::{
     RecoveryBound, Submission, SystemClock, SystemTimer, VerseId, WriterId, decode_chunk,
 };
 use scripture_runtime::{
-    HolylogJournalFoundation, InjectedPeerProbe, NodeIdentity, PartsFactory,
-    ProcessLogletResolver, ScribeLifecycle, ScribeRunOptions, ScribeRunOutcome,
-    SharedMemoryPartsFactory, resolve_log_payload,
+    HolylogJournalFoundation, InjectedPeerProbe, NodeIdentity, PartsFactory, ProcessLogletResolver,
+    ScribeLifecycle, ScribeRunOptions, ScribeRunOutcome, SharedMemoryPartsFactory,
+    resolve_log_payload,
 };
 use scripture_service::{
     AuthorityCoordinator, DeterministicTransitionIdGenerator, JournalFoundationTransition,
@@ -389,6 +389,62 @@ async fn two_cycle_recovery_with_continuity_outbox_and_history() {
         records: vec![Record::new([], Bytes::from_static(b"dup"))],
     };
     assert!(outbox.admit(dup).is_err());
+}
+
+#[tokio::test]
+async fn recovery_waits_for_peer_grace_before_arming() {
+    // Peer-grace gate: with the writer gone and the peer unreachable, a process
+    // whose grace has NOT been armed must join and wait — not immediately recover.
+    // Only once recovery is armed (grace elapsed) may the same durable state be
+    // lawfully recovered. Guards against a transient probe failure triggering an
+    // instant authority-stealing promote CAS.
+    let register = Arc::new(InMemoryConditionalRegister::new()) as Arc<dyn ConditionalRegister>;
+    let parts = Arc::new(SharedMemoryPartsFactory::default()) as Arc<dyn PartsFactory>;
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new()) as Arc<dyn ExclusiveClaimStore>;
+    let peer = Arc::new(InjectedPeerProbe::new(true));
+
+    let a = build_node(
+        owner_a(),
+        "tcp://rejoin-a:9300",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+    let b = build_node(
+        owner_b(),
+        "tcp://rejoin-b:9300",
+        Arc::clone(&register),
+        Arc::clone(&parts),
+        Arc::clone(&claims),
+    );
+
+    let a_life = lifecycle(&a, Arc::clone(&peer));
+    let writer = match a_life.reconcile_once(false).await.expect("a bootstrap") {
+        ScribeRunOutcome::LawfulWriter(session) => session,
+        _ => panic!("a must bootstrap"),
+    };
+
+    // Simulate A's loss: writable gone, session dropped (claim released), peer down.
+    let expected = writer.generation().clone();
+    a.resolver.remove(&expected.active_loglet_id);
+    drop(writer);
+    peer.set_reachable(false);
+
+    let b_life = lifecycle(&b, Arc::clone(&peer));
+    // Grace NOT armed: must wait as a healthy member even though the peer is down.
+    match b_life.reconcile_once(false).await.expect("b observe") {
+        ScribeRunOutcome::HealthyMember(_) => {}
+        ScribeRunOutcome::LawfulWriter(_) => {
+            panic!("B recovered before peer-grace was armed (grace bypass)")
+        }
+    }
+    // Grace armed: the same unreachable/lost-writer state now lawfully recovers.
+    match b_life.reconcile_once(true).await.expect("b recover") {
+        ScribeRunOutcome::LawfulWriter(session) => assert!(session.is_effective_writer().await),
+        ScribeRunOutcome::HealthyMember(member) => {
+            panic!("B should recover once armed: {}", member.reason)
+        }
+    }
 }
 
 #[tokio::test]

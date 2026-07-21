@@ -327,19 +327,12 @@ where
                 }
 
                 let reachable = self.peer.is_reachable(&route).await;
-                if reachable && !attempt_recovery {
-                    return self
-                        .join_member(
-                            record,
-                            true,
-                            format!(
-                                "other owner {} is Serving and reachable",
-                                hex_owner(serving_owner)
-                            ),
-                        )
-                        .await;
-                }
-                if attempt_recovery || !reachable {
+                // Liveness only *arms* recovery; it never grants authority. A
+                // recovery CAS is attempted solely when the caller has armed it
+                // (peer_grace elapsed) AND the peer still looks unreachable. A
+                // transient probe failure with grace not yet armed must wait as a
+                // healthy member, not race to steal a possibly-live writer.
+                if attempt_recovery && !reachable {
                     match self.try_recovery_from_serving_record(&record).await {
                         Ok(outcome) => Ok(outcome),
                         Err(ScribeLifecycleError::Activation(error)) => {
@@ -353,15 +346,18 @@ where
                         Err(error) => Err(error),
                     }
                 } else {
-                    self.join_member(
-                        record,
-                        true,
+                    let reason = if reachable {
                         format!(
-                            "other owner {} Serving; peer unreachable but grace not armed",
+                            "other owner {} is Serving and reachable",
                             hex_owner(serving_owner)
-                        ),
-                    )
-                    .await
+                        )
+                    } else {
+                        format!(
+                            "other owner {} Serving; peer unreachable, awaiting peer-grace before recovery",
+                            hex_owner(serving_owner)
+                        )
+                    };
+                    self.join_member(record, true, reason).await
                 }
             }
         }
