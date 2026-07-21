@@ -377,6 +377,106 @@ fn summary_rejects_stale_epoch() {
 }
 
 #[test]
+fn verifier_rejects_duplicate_producer_offsets() {
+    let summary = ParquetOutputSummary {
+        status: "present".into(),
+        binding_epoch: 1,
+        row_count: 1,
+        schema_fields: vec!["source_digest".into()],
+        source_digests: vec!["d0".into()],
+        source_offset_digests: vec![SourceOffsetDigest {
+            offset: 0,
+            digest: "d0".into(),
+        }],
+        data_objects: vec!["x.parquet".into()],
+        canonical_manifest: "x.commit.json".into(),
+        first_offset: 0,
+        next_offset: 1,
+        manifest_count: 1,
+        note: "test".into(),
+    };
+    let report = verify_vertical_equality(
+        &[(0, b"x"), (0, b"x")],
+        &[(0, b"x")],
+        &summary,
+        SourceOffset::new(1),
+        &CanonRef::new("telemetry").expect("canon"),
+        &VerseRef::new("host-metrics").expect("verse"),
+    );
+    assert_eq!(report.verdict, "fail");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("duplicate offset"))
+    );
+}
+
+#[test]
+fn verifier_accepts_trim_bootstrap_interval() {
+    let d5 = payload_digest(b"a");
+    let d6 = payload_digest(b"b");
+    let summary = ParquetOutputSummary {
+        status: "present".into(),
+        binding_epoch: 1,
+        row_count: 2,
+        schema_fields: vec!["source_digest".into()],
+        source_digests: vec![d5.clone(), d6.clone()],
+        source_offset_digests: vec![
+            SourceOffsetDigest {
+                offset: 5,
+                digest: d5,
+            },
+            SourceOffsetDigest {
+                offset: 6,
+                digest: d6,
+            },
+        ],
+        data_objects: vec!["trim.parquet".into()],
+        canonical_manifest: "trim.commit.json".into(),
+        first_offset: 5,
+        next_offset: 7,
+        manifest_count: 1,
+        note: "test".into(),
+    };
+    let payloads: Vec<(u64, &[u8])> = vec![(5, b"a" as &[u8]), (6, b"b")];
+    let report = verify_vertical_equality(
+        &payloads,
+        &payloads,
+        &summary,
+        SourceOffset::new(7),
+        &CanonRef::new("telemetry").expect("canon"),
+        &VerseRef::new("host-metrics").expect("verse"),
+    );
+    assert_eq!(report.verdict, "pass");
+}
+
+#[test]
+fn chain_rejects_escaped_parquet_file_in_manifest() {
+    let dir = tempdir().expect("temp");
+    let out = dir.path().join("out");
+    fs::create_dir_all(&out).expect("mkdir");
+
+    let manifest = ParquetCommitManifest {
+        workload_id: "wl-telemetry".into(),
+        binding_epoch: 1,
+        owner_token: "a".into(),
+        schema_ref: "events.v1".into(),
+        canon_id: "telemetry".into(),
+        verse_id: "host-metrics".into(),
+        first_offset: 0,
+        next_offset: 1,
+        parquet_file: "../escape.parquet".into(),
+        parquet_digest: "blake3:escape".into(),
+        previous_commit_ref: None,
+    };
+    write_manifest(&out.join("escape.commit.json"), &manifest);
+    let register = test_register(1, 1, Some("escape.commit.json"));
+    let err = walk_manifest_chain(&out, "escape.commit.json", &register).expect_err("escape");
+    assert!(matches!(err, SummaryError::Manifest(_)));
+}
+
+#[test]
 fn verifier_rejects_duplicate_parquet_offsets() {
     let summary = ParquetOutputSummary {
         status: "present".into(),
@@ -414,7 +514,7 @@ fn verifier_rejects_duplicate_parquet_offsets() {
         report
             .notes
             .iter()
-            .any(|note| note.contains("row_count") || note.contains("exactly once"))
+            .any(|note| note.contains("duplicate offset"))
     );
 }
 

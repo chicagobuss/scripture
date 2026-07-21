@@ -170,12 +170,78 @@ function normalizeIceberg(value, status) {
   if (!isPlainObject(value) || !ICEBERG_STATES.has(value.state)) {
     fail("outputs/iceberg.json.state must be verified|configured_not_verified|absent|not_run");
   }
+  const tableIdent = typeof value.table_ident === "string" && value.table_ident.trim()
+    ? value.table_ident
+    : null;
+  const snapshotId = value.snapshot_id != null && String(value.snapshot_id).trim()
+    ? String(value.snapshot_id)
+    : null;
+  if (value.state === "verified" && (!tableIdent || !snapshotId)) {
+    fail(
+      "outputs/iceberg.json.state=verified requires non-empty table_ident and snapshot_id",
+      "iceberg_evidence"
+    );
+  }
   return {
     state: value.state,
     detail: typeof value.detail === "string" ? value.detail : null,
-    table_ident: typeof value.table_ident === "string" ? value.table_ident : null,
-    snapshot_id: value.snapshot_id ?? null
+    table_ident: tableIdent,
+    snapshot_id: snapshotId
   };
+}
+
+function collectDeclaredInputPaths(inputs) {
+  const declared = new Set();
+  const add = (value) => {
+    if (value == null) return;
+    if (Array.isArray(value)) {
+      value.forEach(add);
+      return;
+    }
+    if (typeof value === "string" && value.trim()) {
+      declared.add(value.split(sep).join("/"));
+    }
+  };
+  add(inputs.producer_ledger);
+  add(inputs.messages);
+  add(inputs.scribe_logs);
+  add(inputs.object_inventory);
+  add(inputs.outputs_register);
+  add(inputs.outputs_manifests);
+  add(inputs.parquet_summary);
+  add(inputs.iceberg);
+  add(inputs.holylog_oracle);
+  add(inputs.authority_observation);
+  return declared;
+}
+
+async function validateEvidenceVerdicts(root, manifest) {
+  const declared = collectDeclaredInputPaths(manifest.inputs);
+  for (const item of manifest.verdicts) {
+    if (item.verdict !== "observed" && item.verdict !== "pass") continue;
+    const source = item.source;
+    if (source === "not supplied" || source === "not_run") {
+      fail(
+        `verdict "${item.label}" is ${item.verdict} but source is synthetic`,
+        "verdict_source"
+      );
+    }
+    const { absolute, relative: rel } = boundedPath(root, source, `verdict ${item.label} source`);
+    if (!declared.has(rel) && !declared.has(source)) {
+      fail(
+        `verdict "${item.label}" source is not declared in manifest.inputs: ${source}`,
+        "verdict_source"
+      );
+    }
+    try {
+      const info = await stat(absolute);
+      if (!info.isFile()) {
+        fail(`verdict "${item.label}" source is not a file: ${source}`, "verdict_source");
+      }
+    } catch {
+      fail(`verdict "${item.label}" is ${item.verdict} but source is missing: ${source}`, "verdict_source");
+    }
+  }
 }
 
 /** Load and validate a run-bundle-v1 directory. */
@@ -254,21 +320,7 @@ export async function loadRunBundle(bundleRoot) {
   const previewsAllowed = (manifest.policy?.payload_previews ?? "off") === "lab_nonsecret";
   const iceberg = normalizeIceberg(icebergFile.value, icebergFile.status);
 
-  // A missing oracle can never surface as pass.
-  for (const item of manifest.verdicts) {
-    if (item.verdict === "pass") {
-      const source = item.source;
-      if (source === "not supplied" || source === "not_run") {
-        fail(`verdict "${item.label}" cannot be pass without a source file`, "verdict_source");
-      }
-      const { absolute } = boundedPath(root, source, `pass verdict ${item.label}`);
-      try {
-        await stat(absolute);
-      } catch {
-        fail(`verdict "${item.label}" is pass but source is missing`, "verdict_source");
-      }
-    }
-  }
+  await validateEvidenceVerdicts(root, manifest);
 
   return {
     schema_version: SCHEMA_VERSION,
@@ -518,7 +570,11 @@ function buildMatrix(bundle) {
   }));
   rows.push({
     claim: "Iceberg table presence",
-    verdict: bundle.iceberg.state === "verified" ? "pass" : bundle.iceberg.state === "absent" ? "observed" : "not_run",
+    verdict: bundle.iceberg.state === "verified"
+      ? "pass"
+      : bundle.iceberg.state === "absent"
+        ? "observed"
+        : "not_run",
     source: bundle.icebergPath ?? "not supplied",
     layer: "iceberg",
     detail: bundle.iceberg.detail

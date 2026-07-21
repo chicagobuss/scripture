@@ -279,7 +279,11 @@ pub struct VerticalVerifyReport {
     pub notes: Vec<String>,
 }
 
-/// Verifies producer → Canon → Parquet digest equality for `[0, frontier)`.
+/// Verifies producer → Canon → Parquet digest equality over the covered interval.
+///
+/// Coverage is `[parquet_summary.first_offset, parquet_summary.next_offset)`, which must
+/// equal `[frontier_base, frontier)` for trim/bootstrap scenarios where the chain does
+/// not begin at offset 0.
 pub fn verify_vertical_equality(
     producer_payloads: &[(u64, &[u8])],
     canon_payloads: &[(u64, &[u8])],
@@ -288,10 +292,28 @@ pub fn verify_vertical_equality(
     _canon: &CanonRef,
     _verse: &VerseRef,
 ) -> VerticalVerifyReport {
+    let first = parquet_summary.first_offset;
+    let next = parquet_summary.next_offset;
     let limit = frontier.get();
-    let producer_map = offset_digest_map(producer_payloads, limit);
-    let canon_map = offset_digest_map(canon_payloads, limit);
-    let parquet_map = parquet_offset_digest_map(parquet_summary, limit);
+
+    let producer_map = match offset_digest_map(producer_payloads, first, next) {
+        Ok(map) => map,
+        Err(note) => {
+            return fail_report(note);
+        }
+    };
+    let canon_map = match offset_digest_map(canon_payloads, first, next) {
+        Ok(map) => map,
+        Err(note) => {
+            return fail_report(note);
+        }
+    };
+    let parquet_map = match parquet_offset_digest_map(parquet_summary, first, next) {
+        Ok(map) => map,
+        Err(note) => {
+            return fail_report(note);
+        }
+    };
 
     let producer_digests = ordered_digests(&producer_map);
     let canon_digests = ordered_digests(&canon_map);
@@ -299,30 +321,29 @@ pub fn verify_vertical_equality(
 
     let mut notes = Vec::new();
     if producer_map != canon_map {
-        notes.push("producer digests ≠ Canon digests over frontier offsets".into());
+        notes.push("producer digests ≠ Canon digests over covered offsets".into());
     }
     if canon_map != parquet_map {
-        notes.push("Canon digests ≠ Parquet source_digest offsets over frontier".into());
+        notes.push("Canon digests ≠ Parquet source_digest offsets over covered interval".into());
     }
-    if !covers_frontier_exactly_once(&producer_map, limit) {
-        notes.push("producer offsets do not cover [0, frontier) exactly once".into());
-    }
-    if !covers_frontier_exactly_once(&canon_map, limit) {
-        notes.push("Canon offsets do not cover [0, frontier) exactly once".into());
-    }
-    if !covers_frontier_exactly_once(&parquet_map, limit) {
-        notes.push("Parquet offsets do not cover [0, frontier) exactly once".into());
-    }
-    if parquet_summary.first_offset != 0 {
+    if !covers_interval_exactly_once(&producer_map, first, next) {
         notes.push(format!(
-            "parquet chain first_offset {} != 0",
-            parquet_summary.first_offset
+            "producer offsets do not cover [{first}, {next}) exactly once"
         ));
     }
-    if parquet_summary.next_offset != limit {
+    if !covers_interval_exactly_once(&canon_map, first, next) {
         notes.push(format!(
-            "parquet chain next_offset {} != frontier {}",
-            parquet_summary.next_offset, limit
+            "Canon offsets do not cover [{first}, {next}) exactly once"
+        ));
+    }
+    if !covers_interval_exactly_once(&parquet_map, first, next) {
+        notes.push(format!(
+            "Parquet offsets do not cover [{first}, {next}) exactly once"
+        ));
+    }
+    if next != limit {
+        notes.push(format!(
+            "parquet chain next_offset {next} != register frontier {limit}"
         ));
     }
     if u64::try_from(parquet_digests.len()).unwrap_or(u64::MAX) != parquet_summary.row_count {
@@ -334,8 +355,13 @@ pub fn verify_vertical_equality(
 
     let equal = notes.is_empty();
     if equal {
-        notes.push("producer ≡ Canon ≡ Parquet over covered frontier offsets".into());
-        notes.push("register/manifest chain covers [0, frontier) exactly once (no prefix LIST)".into());
+        notes.push(format!(
+            "producer ≡ Canon ≡ Parquet over covered offsets [{first}, {next})"
+        ));
+        notes.push(
+            "register/manifest chain covers the covered interval exactly once (no prefix LIST)"
+                .into(),
+        );
     }
 
     VerticalVerifyReport {
@@ -347,37 +373,62 @@ pub fn verify_vertical_equality(
     }
 }
 
-fn offset_digest_map(payloads: &[(u64, &[u8])], frontier: u64) -> BTreeMap<u64, String> {
+fn fail_report(note: String) -> VerticalVerifyReport {
+    VerticalVerifyReport {
+        verdict: "fail".into(),
+        producer_digests: Vec::new(),
+        canon_digests: Vec::new(),
+        parquet_digests: Vec::new(),
+        notes: vec![note],
+    }
+}
+
+fn offset_digest_map(
+    payloads: &[(u64, &[u8])],
+    first: u64,
+    next: u64,
+) -> Result<BTreeMap<u64, String>, String> {
     let mut map = BTreeMap::new();
     for (offset, payload) in payloads {
-        if *offset < frontier {
+        if *offset >= first && *offset < next {
+            if map.contains_key(offset) {
+                return Err(format!("duplicate offset {offset} in payload stream"));
+            }
             map.insert(*offset, payload_digest(payload));
         }
     }
-    map
+    Ok(map)
 }
 
 fn parquet_offset_digest_map(
     summary: &ParquetOutputSummary,
-    frontier: u64,
-) -> BTreeMap<u64, String> {
+    first: u64,
+    next: u64,
+) -> Result<BTreeMap<u64, String>, String> {
     let mut map = BTreeMap::new();
     for item in &summary.source_offset_digests {
-        if item.offset < frontier {
+        if item.offset >= first && item.offset < next {
+            if map.contains_key(&item.offset) {
+                return Err(format!(
+                    "duplicate offset {} in parquet source_offset_digests",
+                    item.offset
+                ));
+            }
             map.insert(item.offset, item.digest.clone());
         }
     }
-    map
+    Ok(map)
 }
 
-fn covers_frontier_exactly_once(map: &BTreeMap<u64, String>, frontier: u64) -> bool {
-    if frontier == 0 {
-        return map.is_empty();
-    }
-    if map.len() != usize::try_from(frontier).unwrap_or(usize::MAX) {
+fn covers_interval_exactly_once(map: &BTreeMap<u64, String>, first: u64, next: u64) -> bool {
+    if next < first {
         return false;
     }
-    for offset in 0..frontier {
+    let span = next.saturating_sub(first);
+    if map.len() != usize::try_from(span).unwrap_or(usize::MAX) {
+        return false;
+    }
+    for offset in first..next {
         if !map.contains_key(&offset) {
             return false;
         }

@@ -210,5 +210,47 @@ try {
   bad("Iceberg absent cannot render as table/snapshot", error.message ?? error);
 }
 
+// 7. Observed verdict with missing source fails closed.
+{
+  const tmp = await mkdtemp(join(tmpdir(), "run-bundle-observed-missing-"));
+  try {
+    await copyTree(fixture, tmp);
+    const manifest = JSON.parse(await readFile(join(tmp, "manifest.json"), "utf8"));
+    manifest.verdicts.push({
+      label: "phantom observation",
+      verdict: "observed",
+      source: "outputs/phantom.json"
+    });
+    manifest.inputs.outputs_manifests = [...manifest.inputs.outputs_manifests, "outputs/phantom.json"];
+    await writeFile(join(tmp, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+    await expectReject(
+      "observed verdict with missing source fails closed",
+      () => loadRunBundle(tmp),
+      "verdict_source"
+    );
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// 8. Iceberg verified without snapshot evidence fails closed.
+{
+  const tmp = await mkdtemp(join(tmpdir(), "run-bundle-iceberg-verified-"));
+  try {
+    await copyTree(fixture, tmp);
+    await writeFile(
+      join(tmp, "outputs/iceberg.json"),
+      `${JSON.stringify({ state: "verified", detail: "forged", table_ident: null, snapshot_id: null }, null, 2)}\n`
+    );
+    await expectReject(
+      "iceberg verified without table/snapshot fails closed",
+      () => loadRunBundle(tmp),
+      "iceberg_evidence"
+    );
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

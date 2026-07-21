@@ -113,7 +113,9 @@ pub fn summarize_canonical_parquet(
     let mut data_objects = Vec::new();
 
     for (_path, manifest) in &chain {
+        validate_parquet_file_name(&manifest.parquet_file)?;
         let parquet_path = output_dir.join(&manifest.parquet_file);
+        ensure_path_inside(output_dir, &parquet_path)?;
         let bytes = fs::read(&parquet_path).map_err(|error| {
             SummaryError::Parquet(format!("read {}: {error}", parquet_path.display()))
         })?;
@@ -182,6 +184,7 @@ pub fn walk_manifest_chain(
         }
         let (path, manifest) = resolve_manifest_for_commit_ref(&output_dir, &commit_ref)?;
         ensure_path_inside(&output_dir, &path)?;
+        validate_parquet_file_name(&manifest.parquet_file)?;
         if backward.last().is_some() {
             let newer = backward.last().expect("just pushed").1.clone();
             if manifest.next_offset != newer.first_offset {
@@ -230,6 +233,26 @@ pub fn walk_manifest_chain(
 
     backward.reverse();
     Ok(backward)
+}
+
+fn validate_parquet_file_name(name: &str) -> Result<(), SummaryError> {
+    if name.is_empty() {
+        return Err(SummaryError::Manifest("parquet_file must not be empty".into()));
+    }
+    if name.contains('\0') {
+        return Err(SummaryError::Manifest("parquet_file contains NUL".into()));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(SummaryError::Manifest(format!(
+            "parquet_file must be a single safe file name: {name}"
+        )));
+    }
+    if Path::new(name).is_absolute() {
+        return Err(SummaryError::Manifest(format!(
+            "parquet_file must be relative: {name}"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_path_inside(root: &Path, path: &Path) -> Result<(), SummaryError> {

@@ -93,11 +93,19 @@ pub struct CohortVerseFrame {
 
 impl CohortVerseFrame {
     /// Exclusive end offset.
-    #[must_use]
-    pub fn next_offset(&self) -> u64 {
+    pub fn try_next_offset(&self) -> Result<u64, CanonSourceError> {
         self.base_offset
             .checked_add(u64::try_from(self.payloads.len()).unwrap_or(u64::MAX))
-            .expect("cohort verse frame offset overflow")
+            .ok_or(CanonSourceError::ContinuityGap {
+                offset: self.base_offset,
+                detail: "cohort verse frame offset overflow".into(),
+            })
+    }
+
+    /// Exclusive end offset for tests and simple callers with known-small frames.
+    #[must_use]
+    pub fn next_offset(&self) -> u64 {
+        self.try_next_offset().unwrap_or(u64::MAX)
     }
 }
 
@@ -174,7 +182,7 @@ impl MemoryCanonSource {
                 continue;
             }
             match expected_next {
-                None => expected_next = Some(frame.next_offset()),
+                None => expected_next = Some(frame.try_next_offset()?),
                 Some(want) => {
                     if frame.base_offset != want {
                         return Err(CanonSourceError::CohortChain {
@@ -185,7 +193,7 @@ impl MemoryCanonSource {
                             ),
                         });
                     }
-                    expected_next = Some(frame.next_offset());
+                    expected_next = Some(frame.try_next_offset()?);
                 }
             }
         }
