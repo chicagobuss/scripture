@@ -1,5 +1,6 @@
-//! Object-store durable Loglet parts for Scripture (RustFS / R2 / Amazon S3).
+//! Object-store durable Loglet parts for Scripture (file / RustFS / R2 / Amazon S3).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -12,16 +13,22 @@ use holylog_object_store::{
     BackendCapabilities, ConditionalCreate, ListingOrder, ListingVisibility, ObjectStoreLogDrive,
     ObjectStoreMetrics, PointSemantics, WritePolicy,
 };
-use holylog_object_store_register::RegisterCapabilities;
+use holylog_object_store_register::{ConditionalWrite, ReadConsistency, RegisterCapabilities};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 
+use crate::local_file_store::ConditionalLocalFileStore;
 use crate::node::{DurableLogletParts, PartsFactory};
 
 /// Attested backend profiles Scripture may construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendProfile {
+    /// Local directory via [`ConditionalLocalFileStore`] (cargo-only try-it).
+    ///
+    /// Single-host, single writer process. Create is POSIX hard-link atomic;
+    /// Update is etag-conditioned within the writer process.
+    LocalFile,
     /// Local RustFS path-style S3 (Holylog local-s3 compose).
     RustFs,
     /// Cloudflare R2 (S3-compatible); register attested via [`RegisterCapabilities::cloudflare_r2`].
@@ -36,14 +43,15 @@ pub enum BackendProfile {
 }
 
 impl BackendProfile {
-    /// Parses `rustfs`, `r2`, or `s3`.
+    /// Parses `file`, `rustfs`, `r2`, or `s3`.
     pub fn parse(raw: &str) -> Result<Self, ObjectStoreError> {
         match raw {
+            "file" => Ok(Self::LocalFile),
             "rustfs" => Ok(Self::RustFs),
             "r2" => Ok(Self::CloudflareR2),
             "s3" => Ok(Self::AmazonS3),
             other => Err(ObjectStoreError::BackendProfile(format!(
-                "unknown backend profile '{other}' (expected rustfs|r2|s3)"
+                "unknown backend profile '{other}' (expected file|rustfs|r2|s3)"
             ))),
         }
     }
@@ -52,6 +60,7 @@ impl BackendProfile {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::LocalFile => "file",
             Self::RustFs => "rustfs",
             Self::CloudflareR2 => "r2",
             Self::AmazonS3 => "s3",
@@ -62,6 +71,10 @@ impl BackendProfile {
     #[must_use]
     pub fn register_capabilities(self) -> RegisterCapabilities {
         match self {
+            Self::LocalFile => RegisterCapabilities::new(
+                ConditionalWrite::VersionMatch,
+                ReadConsistency::StronglyConsistent,
+            ),
             Self::RustFs | Self::AmazonS3 => RegisterCapabilities::amazon_s3(),
             Self::CloudflareR2 => RegisterCapabilities::cloudflare_r2(),
         }
@@ -70,9 +83,8 @@ impl BackendProfile {
     /// LogDrive capability declaration for this profile.
     #[must_use]
     pub fn drive_capabilities(self) -> BackendCapabilities {
-        // RustFS, R2 and S3 are all attested for atomic conditional create and
-        // lexicographic listing; the 2026-07-12 run exercised data, seal and
-        // trim namespaces on S3 directly.
+        // file / RustFS / R2 / S3: atomic conditional create + lex listing.
+        // file Create is hard-link publish; Update is Scripture's etag adapter.
         BackendCapabilities::new(
             PointSemantics::LinearizableSingleValue,
             ListingOrder::Lexicographic,
@@ -195,6 +207,9 @@ pub enum ObjectStoreError {
     /// Rejected run id / root.
     #[error("run id: {0}")]
     RunId(String),
+    /// Local filesystem store could not be opened.
+    #[error("local file store: {0}")]
+    LocalFile(object_store::Error),
 }
 
 /// Connects to a path-style S3-compatible endpoint (RustFS or R2).
@@ -222,6 +237,13 @@ pub fn connect_s3_compat(
     Ok(Arc::new(builder.build()?) as Arc<dyn ObjectStore>)
 }
 
+/// Opens a local-directory store rooted at `path` (created if missing).
+pub fn connect_local_file(
+    path: impl Into<PathBuf>,
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreError> {
+    ConditionalLocalFileStore::shared(path).map_err(ObjectStoreError::LocalFile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +252,10 @@ mod tests {
 
     #[test]
     fn parses_attested_profiles_and_rejects_unattested_ones() {
+        assert_eq!(
+            BackendProfile::parse("file").expect("file"),
+            BackendProfile::LocalFile
+        );
         assert_eq!(
             BackendProfile::parse("rustfs").expect("rustfs"),
             BackendProfile::RustFs
@@ -245,8 +271,26 @@ mod tests {
         // Garage speaks the same API and the same headers, and silently ignores
         // the preconditions a register depends on. It is the recorded
         // falsification, and the reason a profile is a tested claim rather than
-        // an inference from the endpoint.
+        // an inference from the API shape.
         assert!(BackendProfile::parse("garage").is_err());
+    }
+
+    #[test]
+    fn file_profile_attests_atomic_create_and_version_match() {
+        assert_eq!(BackendProfile::LocalFile.label(), "file");
+        assert_eq!(
+            BackendProfile::LocalFile
+                .drive_capabilities()
+                .conditional_create,
+            ConditionalCreate::Atomic
+        );
+        assert_eq!(
+            BackendProfile::LocalFile.register_capabilities(),
+            RegisterCapabilities::new(
+                ConditionalWrite::VersionMatch,
+                ReadConsistency::StronglyConsistent,
+            )
+        );
     }
 
     #[test]
@@ -268,5 +312,66 @@ mod tests {
             ConditionalCreate::Unsupported,
         );
         assert!(ObjectStoreExclusiveClaim::new(store, caps).is_err());
+    }
+
+    #[tokio::test]
+    async fn local_file_register_bootstrap_second_create_loses_then_cas_updates() {
+        use holylog::virtual_log::{
+            ApplicationFence, ConditionalRegister, GenerationDescriptor, LogletId, VirtualLogState,
+        };
+        use holylog_object_store_register::ObjectStoreConditionalRegister;
+        use object_store::path::Path as ObjectPath;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = connect_local_file(dir.path()).expect("open");
+        let register = ObjectStoreConditionalRegister::new(
+            Arc::clone(&store),
+            ObjectPath::from("tryit/register-pointer"),
+            BackendProfile::LocalFile.register_capabilities(),
+        )
+        .expect("register seams");
+
+        let membership = |revision: u64, loglet: &str| VirtualLogState {
+            revision,
+            generations: vec![GenerationDescriptor {
+                loglet_id: LogletId::new(loglet).expect("id"),
+                start: 0,
+            }],
+            application_fence: ApplicationFence::default(),
+        };
+
+        assert!(
+            register
+                .compare_and_swap(None, membership(0, "gen-a"))
+                .await
+                .expect("bootstrap"),
+            "first bootstrap must win"
+        );
+        assert!(
+            !register
+                .compare_and_swap(None, membership(0, "gen-b"))
+                .await
+                .expect("second bootstrap"),
+            "second Create must lose"
+        );
+
+        let observed = register.read().await.expect("read").expect("present");
+        assert_eq!(observed.state.generations[0].loglet_id.as_str(), "gen-a");
+        assert!(
+            register
+                .compare_and_swap(Some(&observed), membership(1, "gen-c"))
+                .await
+                .expect("cas"),
+            "matching Update must win"
+        );
+        let after = register.read().await.expect("read").expect("present");
+        assert_eq!(after.state.generations[0].loglet_id.as_str(), "gen-c");
+        assert!(
+            !register
+                .compare_and_swap(Some(&observed), membership(1, "gen-d"))
+                .await
+                .expect("stale witness cas"),
+            "stale etag witness must lose"
+        );
     }
 }

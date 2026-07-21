@@ -38,6 +38,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 /// Loads credentials for `profile` from the process environment.
 ///
 /// Contract:
+/// - `file`: no credentials (local directory).
 /// - `rustfs`: `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY`, or AWS-compatible
 ///   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (no built-in defaults).
 /// - `r2`: `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` (required).
@@ -45,6 +46,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 ///   profile file is deliberately not consulted).
 pub fn resolve_credentials(profile: BackendProfile) -> Result<StoreCredentials, CredentialError> {
     match profile {
+        BackendProfile::LocalFile => Ok(StoreCredentials {
+            access_key: String::new(),
+            secret_key: String::new(),
+        }),
         BackendProfile::RustFs => Ok(StoreCredentials {
             access_key: env_nonempty("RUSTFS_ACCESS_KEY")
                 .or_else(|| env_nonempty("AWS_ACCESS_KEY_ID"))

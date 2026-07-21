@@ -1,0 +1,33 @@
+# Local try-it configuration (cargo-only; no Docker, no cloud credentials).
+#
+# Identity fields that are canonical IDs must be exactly 16 ASCII bytes.
+# `store.path` is a filesystem directory (created if missing). Separate
+# serve / produce-lab / consume processes share it via backend: file.
+#
+# Fresh empty store: `scripture serve` bootstraps in-process (Uninitialized →
+# Serving). Then produce-lab and consume against the same config.
+
+version: 1
+
+node:
+  owner_id: "scripture-own-a!"
+  advertise: "tcp://127.0.0.1:9000"
+
+listener:
+  bind: "127.0.0.1:9000"
+
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+
+store:
+  backend: file
+  path: ".scripture-local-data"
+  prefix: "tryit"
+
+paths: {}
+
+metrics:
+  status_bind: "127.0.0.1:9100"

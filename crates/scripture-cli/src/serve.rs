@@ -48,15 +48,42 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let assembled = assemble::assemble_supervisor(&config)?;
+    let shared = assemble::connect_shared_store(&config)?;
+    let store_root = config.store.prefix.trim_end_matches('/').to_owned();
+    let verse_config = config.verse_runtime_config()?;
+    let assembled = assemble::assemble_assignment_seams(
+        &shared,
+        &store_root,
+        verse_config,
+        shared.advertise.clone(),
+    )?;
     let advertise = assembled.advertise;
     let backend = assembled.backend;
     let store_root = assembled.store_root;
     let node = assembled.node;
+    let directory_store = Arc::clone(&shared.store);
 
-    let outcome = node
-        .start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
-        .await?;
+    let outcome = match node.virtual_log().observe_membership().await {
+        Err(holylog::virtual_log::VirtualLogError::Uninitialized) => {
+            // Greenfield / cargo try-it: empty store bootstraps in-process so
+            // plain `serve` can open ingress without a separate bootstrap process.
+            // Holylog soft sequencers still cannot cross process exit — restarting
+            // against a non-empty root remains RecoveryRequired (delete store.path
+            // to reset the try-it directory).
+            let loglet = holylog::virtual_log::LogletId::new("scripture-gen-01")
+                .map_err(|error| format!("bootstrap loglet id: {error}"))?;
+            eprintln!(
+                "scripture: empty Canon — bootstrapping in-process (loglet_id=scripture-gen-01)"
+            );
+            node.bootstrap_verse(loglet, SystemClock::new(), scripture::SystemTimer::new(), 2)
+                .await?
+        }
+        Ok(_) => {
+            node.start_configured(SystemClock::new(), scripture::SystemTimer::new(), 2)
+                .await?
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     match &outcome {
         VerseControlOutcome::ConflictNeedsInspect { .. } | VerseControlOutcome::StartFailed(_) => {
@@ -153,6 +180,9 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
         listener.local_addr()?
     );
 
+    // Discovery only: produce-lab resolves routes from the fleet directory.
+    spawn_single_assignment_directory_heartbeat(directory_store, &config, ready);
+
     loop {
         let (stream, peer) = listener.accept().await?;
         let runtime = Arc::clone(&runtime);
@@ -174,6 +204,52 @@ pub async fn serve(config: ScriptureConfig) -> Result<(), Box<dyn Error>> {
             }
         });
     }
+}
+
+/// Publishes a soft directory route so `produce-lab` can find this serve.
+fn spawn_single_assignment_directory_heartbeat(
+    store: Arc<dyn object_store::ObjectStore>,
+    config: &ScriptureConfig,
+    ready: bool,
+) {
+    let Some(verse) = config.verse.clone() else {
+        return;
+    };
+    let owner_id = config.node.owner_id.clone();
+    let node_advertise = config.node.advertise.clone();
+    let prefix = config.store.prefix.clone();
+    let valid_for_ms = 15_000u64;
+    let beat = std::time::Duration::from_millis(3_000);
+
+    tokio::spawn(async move {
+        loop {
+            let record = scripture_runtime::directory::DirectoryRecord {
+                format_version: 1,
+                owner_id: owner_id.clone(),
+                node_advertise: node_advertise.clone(),
+                published_at_ms: scripture_runtime::directory::now_ms(),
+                valid_for_ms,
+                assignments: vec![scripture_runtime::directory::DirectoryAssignment {
+                    canon: verse.journal_id.clone(),
+                    verse: verse.verse_id.clone(),
+                    advertise: node_advertise.clone(),
+                    posture: "legacy-serve".to_owned(),
+                    disposition: if ready {
+                        "Serving".to_owned()
+                    } else {
+                        "NotReady".to_owned()
+                    },
+                    admits_committed_acks: ready,
+                }],
+            };
+            if let Err(error) =
+                scripture_runtime::directory::publish(&store, &prefix, &record).await
+            {
+                eprintln!("scripture: directory heartbeat failed (discovery only): {error}");
+            }
+            tokio::time::sleep(beat).await;
+        }
+    });
 }
 
 async fn serve_probe_loop(

@@ -13,7 +13,8 @@ use scripture::DataRefBlobConfig;
 use scripture_runtime::counting_store::{CountingStore, RequestCounters};
 use scripture_runtime::{
     BackendProfile, NodeIdentity, ObjectStoreChunkBlobStore, ObjectStorePartsFactory, PartsFactory,
-    ProcessLogletResolver, VerseNodeSupervisor, connect_s3_compat, resolve_credentials,
+    ProcessLogletResolver, VerseNodeSupervisor, connect_local_file, connect_s3_compat,
+    resolve_credentials,
 };
 use scripture_service::VerseRuntimeConfig;
 
@@ -56,23 +57,40 @@ pub fn connect_shared_store(config: &ScriptureConfig) -> Result<SharedStore, Box
     let owner_id = config.owner_id()?;
     let advertise = config.advertise()?;
     let backend = config.backend()?;
-    let credentials = resolve_credentials(backend)?;
-    if matches!(
-        backend,
-        BackendProfile::CloudflareR2 | BackendProfile::AmazonS3
-    ) && config.store.endpoint.starts_with("http://")
-    {
-        return Err(format!("{} requires an HTTPS endpoint", backend.label()).into());
-    }
 
-    let store = connect_s3_compat(
-        &config.store.endpoint,
-        &config.store.bucket,
-        &config.store.region,
-        &credentials.access_key,
-        &credentials.secret_key,
-    )?;
-    drop(credentials);
+    let store = match backend {
+        BackendProfile::LocalFile => {
+            let path = config
+                .store
+                .path
+                .as_ref()
+                .ok_or("store.path is required when store.backend is file")?;
+            if path.trim().is_empty() || path.contains("..") {
+                return Err("store.path must be a non-empty path without '..'".into());
+            }
+            connect_local_file(path)?
+        }
+        BackendProfile::RustFs | BackendProfile::CloudflareR2 | BackendProfile::AmazonS3 => {
+            let credentials = resolve_credentials(backend)?;
+            if matches!(
+                backend,
+                BackendProfile::CloudflareR2 | BackendProfile::AmazonS3
+            ) && config.store.endpoint.starts_with("http://")
+            {
+                return Err(format!("{} requires an HTTPS endpoint", backend.label()).into());
+            }
+            let store = connect_s3_compat(
+                &config.store.endpoint,
+                &config.store.bucket,
+                &config.store.region,
+                &credentials.access_key,
+                &credentials.secret_key,
+            )?;
+            drop(credentials);
+            store
+        }
+    };
+
     Ok(SharedStore {
         store,
         authority_counters: Arc::new(RequestCounters::default()),
@@ -241,5 +259,48 @@ mod tests {
         // field exists to prevent. Serve must use assembled.verse_config, not a
         // newly built assignment_runtime_config().
         assert!(bare_verse_config().dataref_blobs.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_store_directory_publish_resolves_for_produce_lab() {
+        use std::sync::Arc;
+
+        use object_store::ObjectStore;
+        use scripture_runtime::directory::{DirectoryAssignment, DirectoryRecord, publish};
+        use scripture_runtime::{BackendProfile, ConditionalLocalFileStore, resolve_route};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> =
+            ConditionalLocalFileStore::shared(dir.path()).expect("file store");
+        assert_eq!(BackendProfile::LocalFile.label(), "file");
+
+        publish(
+            &store,
+            "tryit",
+            &DirectoryRecord {
+                format_version: 1,
+                owner_id: "scripture-own-a!".to_owned(),
+                node_advertise: "tcp://127.0.0.1:9000".to_owned(),
+                published_at_ms: scripture_runtime::directory::now_ms(),
+                valid_for_ms: 15_000,
+                assignments: vec![DirectoryAssignment {
+                    canon: "scripture-jrnl!!".to_owned(),
+                    verse: "scripture-verse!".to_owned(),
+                    advertise: "tcp://127.0.0.1:9000".to_owned(),
+                    posture: "legacy-serve".to_owned(),
+                    disposition: "Serving".to_owned(),
+                    admits_committed_acks: true,
+                }],
+            },
+        )
+        .await
+        .expect("publish");
+
+        let route = resolve_route(&store, "tryit", "scripture-jrnl!!", "scripture-verse!")
+            .await
+            .expect("resolve");
+        assert_eq!(route.candidates.len(), 1);
+        assert_eq!(route.candidates[0].endpoint, "tcp://127.0.0.1:9000");
+        assert!(route.candidates[0].claims_serving);
     }
 }

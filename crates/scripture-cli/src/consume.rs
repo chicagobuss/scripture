@@ -96,7 +96,13 @@ impl VerseReadSeams {
         assignment: &AssignmentConfig,
     ) -> Result<(Self, String), Box<dyn Error>> {
         let shared = assemble::connect_shared_store(config)?;
-        let store_root = config.assignment_store_root(assignment)?;
+        // Single-assignment roots are the configured prefix; multi-assignment
+        // derives an exclusive Canon/Verse subtree under that prefix.
+        let store_root = if config.is_multi_assignment() {
+            config.assignment_store_root(assignment)?
+        } else {
+            config.store.prefix.trim_end_matches('/').to_owned()
+        };
         let seams = Self::from_store(
             Arc::clone(&shared.store),
             store_root.clone(),
@@ -173,21 +179,50 @@ impl VerseReadSeams {
     }
 }
 
-/// Finds the Canon/Verse assignment in multi-assignment YAML.
+/// Finds the Canon/Verse assignment (multi-assignment) or synthesizes one from
+/// the single-assignment verse section.
 pub(crate) fn find_assignment(
     config: &ScriptureConfig,
     canon: &str,
     verse: &str,
 ) -> Result<AssignmentConfig, Box<dyn Error>> {
-    config
-        .scribe
+    if config.is_multi_assignment() {
+        return config
+            .scribe
+            .as_ref()
+            .ok_or("consume requires scribe.assignments")?
+            .assignments
+            .iter()
+            .find(|a| a.canon == canon && a.verse == verse)
+            .cloned()
+            .ok_or_else(|| format!("no assignment for canon={canon} verse={verse}").into());
+    }
+
+    let verse_cfg = config
+        .verse
         .as_ref()
-        .ok_or("consume requires scribe.assignments")?
-        .assignments
-        .iter()
-        .find(|a| a.canon == canon && a.verse == verse)
-        .cloned()
-        .ok_or_else(|| format!("no assignment for canon={canon} verse={verse}").into())
+        .ok_or("consume requires verse section for single-assignment config")?;
+    let listener = config
+        .listener
+        .as_ref()
+        .ok_or("consume requires listener section for single-assignment config")?;
+    if verse_cfg.journal_id != canon || verse_cfg.verse_id != verse {
+        return Err(format!(
+            "no single-assignment match for canon={canon} verse={verse} (config has canon={} verse={})",
+            verse_cfg.journal_id, verse_cfg.verse_id
+        )
+        .into());
+    }
+    Ok(AssignmentConfig {
+        id: "single".to_owned(),
+        canon: verse_cfg.journal_id.clone(),
+        verse: verse_cfg.verse_id.clone(),
+        cohort_id: verse_cfg.cohort_id.clone(),
+        writer_id: verse_cfg.writer_id.clone(),
+        posture: crate::config::AssignmentPosture::BootstrapIfEmpty,
+        ingress: listener.clone(),
+        advertise: config.node.advertise.clone(),
+    })
 }
 
 /// Runs the demo consumer against a configured assignment store root.

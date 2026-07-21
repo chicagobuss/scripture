@@ -97,37 +97,43 @@ scripture serve --config /path/to/scripture.yaml
 Scripture records from a configured Canon/Verse to stdout. It owns no consumer
 register or checkpoint and does not claim durable subscription semantics.
 
-Against a local multi-assignment Scribe (for example RustFS-backed YAML under
-`crates/scripture-cli/examples/`):
+Cargo-only try-it (no Docker, no cloud credentials) using the checked-in local
+file backend:
 
 ```sh
-# terminal 1
-cargo run -p scripture-cli --bin scripture -- serve --config /path/to/scripture.yaml
+# terminal 1 — empty `.scripture-local-data` bootstraps in-process, then serves
+cargo run -p scripture-cli --bin scripture -- serve \
+  --config crates/scripture-cli/examples/scripture-local.yaml
 
 # terminal 2
 cargo run -p scripture-cli --bin scripture -- produce-lab \
-  --config /path/to/scripture.yaml \
-  --canon demo --verse events \
+  --config crates/scripture-cli/examples/scripture-local.yaml \
+  --canon 'scripture-jrnl!!' --verse 'scripture-verse!' \
   --workers 1 --per-worker 5
 
 # terminal 3
 cargo run -p scripture-cli --bin scripture -- consume \
-  --config /path/to/scripture.yaml \
-  --canon demo --verse events \
+  --config crates/scripture-cli/examples/scripture-local.yaml \
+  --canon 'scripture-jrnl!!' --verse 'scripture-verse!' \
   --from 0 --until-records 5 --no-follow
 ```
+
+Canon and Verse IDs are exactly 16 ASCII bytes (match the example YAML). The
+`file` backend stores objects under `store.path` (default
+`.scripture-local-data`); delete that directory to reset.
 
 Representative text output:
 
 ```text
-canon=demo verse=events entry=0 record=0 bytes=64 digest=… payload=text:…
-canon=demo verse=events entry=1 record=1 bytes=64 digest=… payload=text:…
+canon=scripture-jrnl!! verse=scripture-verse! entry=0 record=0 bytes=64 digest=… payload=text:…
+canon=scripture-jrnl!! verse=scripture-verse! entry=1 record=1 bytes=64 digest=… payload=text:…
 scripture consume: entries_scanned=5 records_printed=5 final_cursor=5 elapsed_ms=12 membership_change=no
 ```
 
 Use `--format jsonl` for one JSON object per record on stdout (summaries stay on
-stderr). Hermetic coverage lives in `cargo test -p scripture-cli --locked`
-(in-memory ObjectStore + VirtualLog; no cloud credentials).
+stderr). Hermetic coverage lives in `cargo test -p scripture-cli --locked` and
+`cargo test -p scripture-runtime --locked` (file-backend Create/CAS; no cloud
+credentials).
 
 ### Automatic same-Verse fleet lifecycle
 

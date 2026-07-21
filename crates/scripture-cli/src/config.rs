@@ -410,9 +410,16 @@ pub struct VerseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfig {
-    /// Durable-store profile: `rustfs`, `r2`, or attested Amazon `s3`.
+    /// Durable-store profile: `file`, `rustfs`, `r2`, or attested Amazon `s3`.
     pub backend: String,
+    /// Filesystem root when `backend: file` (created if missing). Ignored otherwise.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// S3-compatible endpoint (required for rustfs/r2/s3).
+    #[serde(default)]
     pub endpoint: String,
+    /// Bucket name (required for rustfs/r2/s3).
+    #[serde(default)]
     pub bucket: String,
     #[serde(default = "default_region")]
     pub region: String,
@@ -480,12 +487,34 @@ impl ScriptureConfig {
                 found: self.version,
             });
         }
-        BackendProfile::parse(&self.store.backend)
+        let backend = BackendProfile::parse(&self.store.backend)
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         if self.store.prefix.trim().is_empty() || self.store.prefix.contains("..") {
             return Err(ConfigError::Invalid(
                 "store.prefix must be a non-empty path without '..'".into(),
             ));
+        }
+        match backend {
+            BackendProfile::LocalFile => {
+                let path = self.store.path.as_deref().unwrap_or("").trim();
+                if path.is_empty() || path.contains("..") {
+                    return Err(ConfigError::Invalid(
+                        "store.path is required for backend file and must not contain '..'".into(),
+                    ));
+                }
+            }
+            BackendProfile::RustFs | BackendProfile::CloudflareR2 | BackendProfile::AmazonS3 => {
+                if self.store.endpoint.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "store.endpoint is required for S3-compatible backends".into(),
+                    ));
+                }
+                if self.store.bucket.trim().is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "store.bucket is required for S3-compatible backends".into(),
+                    ));
+                }
+            }
         }
         OwnerEndpoint::new(&self.node.advertise)
             .map_err(|error| ConfigError::Invalid(format!("node.advertise: {error}")))?;
@@ -1071,5 +1100,64 @@ ha:
         let config: ScriptureConfig = serde_yaml::from_str(&bad).expect("parse");
         let err = config.validate().expect_err("bad advertise");
         assert!(err.to_string().contains("advertise"));
+    }
+
+    #[test]
+    fn accepts_local_file_backend_config() {
+        let yaml = r#"
+version: 1
+node:
+  owner_id: "scripture-own-a!"
+  advertise: "tcp://127.0.0.1:9000"
+listener:
+  bind: "127.0.0.1:9000"
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+store:
+  backend: file
+  path: ".scripture-local-data"
+  prefix: "tryit"
+metrics:
+  status_bind: "127.0.0.1:9100"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(yaml).expect("parse");
+        config.validate().expect("file backend valid");
+        assert_eq!(config.backend().expect("backend").label(), "file");
+    }
+
+    #[test]
+    fn rejects_file_backend_without_path() {
+        let yaml = r#"
+version: 1
+node:
+  owner_id: "scripture-own-a!"
+  advertise: "tcp://127.0.0.1:9000"
+listener:
+  bind: "127.0.0.1:9000"
+verse:
+  journal_id: "scripture-jrnl!!"
+  verse_id: "scripture-verse!"
+  cohort_id: "scripture-cohrt!"
+  writer_id: "scripture-wrtr!!"
+store:
+  backend: file
+  prefix: "tryit"
+"#;
+        let config: ScriptureConfig = serde_yaml::from_str(yaml).expect("parse");
+        let err = config.validate().expect_err("path required");
+        assert!(err.to_string().contains("store.path"));
+    }
+
+    #[test]
+    fn checked_in_local_example_validates() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scripture-local.yaml");
+        let config = ScriptureConfig::load(&path).expect("load scripture-local.yaml");
+        assert_eq!(config.backend().expect("backend").label(), "file");
+        assert_eq!(config.verse.as_ref().expect("verse").journal_id.len(), 16);
+        assert_eq!(config.verse.as_ref().expect("verse").verse_id.len(), 16);
     }
 }

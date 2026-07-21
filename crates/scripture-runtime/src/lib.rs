@@ -18,6 +18,7 @@ pub mod directory;
 mod ha_session;
 mod holylog_foundation;
 mod ingress;
+mod local_file_store;
 mod node;
 mod object_store;
 pub mod pre_commit_spool;
@@ -70,13 +71,15 @@ pub use ingress::{
     serve_canon_raw_lines_connection_with_spool, serve_ha_producer_wire_connection,
     serve_ha_raw_lines_connection, serve_ha_raw_lines_connection_with_budgets,
 };
+pub use local_file_store::ConditionalLocalFileStore;
 pub use node::{
     DurableLogletParts, InMemoryPartsFactory, NodeIdentity, PartsFactory, PartsFactoryError,
     ProcessLogletResolver, SharedMemoryPartsFactory, SupervisorError, VerseControlOutcome,
     VerseNodeSupervisor,
 };
 pub use object_store::{
-    BackendProfile, ObjectStoreError, ObjectStorePartsFactory, connect_s3_compat,
+    BackendProfile, ObjectStoreError, ObjectStorePartsFactory, connect_local_file,
+    connect_s3_compat,
 };
 pub use pre_commit_spool::{
     AdmitOrderLog, PreCommitSpool, PreCommitSpoolConfig, PreCommitSpoolError,
