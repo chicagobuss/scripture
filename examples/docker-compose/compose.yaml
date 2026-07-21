@@ -5,6 +5,7 @@ services:
       dockerfile: examples/docker-compose/Dockerfile
     ports:
       - "9000:9000" # raw-lines listener
+      - "9001:9001" # experimental native Producer Wire v1
       - "9100:9100" # /livez, /readyz, /status
     volumes:
       - scripture-data:/var/lib/scripture

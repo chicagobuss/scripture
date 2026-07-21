@@ -4,6 +4,7 @@ Cargo.lock.bak
 /.cargo/config.toml
 /.tmp/
 /.scripture-local-data/
+/.scripture-producer-spool/
 /references/opendata/
 /deploy/fleet-exercise/bin/fleet-lab-node
 /deploy/fleet-exercise/bin/scripture-load

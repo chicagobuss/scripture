@@ -41,10 +41,32 @@ docker compose exec scripture scripture consume \
   --canon 'scripture-jrnl!!' --verse 'scripture-verse!' \
   --from 0 --until-records 5 --no-follow
 
-# Inspect process status, then remove the whole local demo including its data.
+# Inspect process status.
 curl -fsS http://127.0.0.1:9100/status
-docker compose down -v
 ```
+
+### Optional: see store-and-forward receipts
+
+The Compose example also exposes the experimental native Producer Wire
+listener on port `9001`. Its reference client uses the configured local edge
+outbox and prints two distinct facts: `spooled` after it fsyncs the stable
+envelope locally, then `committed` after the Scribe has acknowledged that same
+producer identity into the Canon.
+
+```sh
+docker compose exec scripture scripture-producer-wire-client \
+  127.0.0.1 9001 'edge receipt, then Canon commit' \
+  --config /etc/scripture/scripture.yaml
+```
+
+This is deliberately a single-host demonstration. `spooled` means one named
+local disk holds the envelope; it is useful for a temporary Scribe/object-store
+outage and retry-safe forwarding, but it is **not** a committed Canon offset,
+multi-Scribe HA, or protection against losing that Docker host. The client
+keeps the envelope until it observes and durably checkpoints the committed ACK.
+
+When you are done with either local exercise, remove the entire demo—including
+its named-volume data—with `docker compose down -v`.
 
 The image is built from source with the public, pinned Holylog tag. The
 `scripture-data` volume deliberately survives ordinary `docker compose down`
@@ -61,8 +83,10 @@ The useful core is already more than a diagram:
   offsets, deterministic records, immutable payload blobs, and ordered
   `DataRef` / reference-batch metadata.
 - **Bounded producer path.** Multi-record submissions, stable producer
-  identity, retry-safe deduplication, bounded batching, durable outbox
-  primitives, and explicit receipt semantics.
+  identity, retry-safe deduplication, bounded batching, and an experimental
+  edge outbox that follows fsync → `spooled` → forward → observed committed
+  ACK → durable checkpoint → reclaim. `spooled` is explicitly one-local-disk
+  evidence; `committed` remains the default and stronger receipt.
 - **Scribe lifecycle.** A Scribe can serve a Verse, recover through a lawful
   seal-and-replace transition, and refuse work when it lacks authority. A
   route, health check, or discovery record is never authority.
@@ -184,6 +208,8 @@ starting every user with partitions and rebalance operations.
 - no completed Iceberg writer;
 - no automatic multi-cloud repair product yet;
 - no claim that the Compose example is HA or cloud durable;
+- no claim that a one-disk `spooled` receipt survives losing that producer/edge
+  host;
 - no claim that model checking proves the deployed Rust program correct.
 
 ## Explore the project

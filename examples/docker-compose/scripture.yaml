@@ -9,6 +9,7 @@ node:
 
 listener:
   bind: "0.0.0.0:9000"
+  producer_wire_bind: "0.0.0.0:9001"
 
 verse:
   journal_id: "scripture-jrnl!!"
@@ -22,6 +23,20 @@ store:
   prefix: "compose-demo"
 
 paths: {}
+
+# The experimental Producer Wire client can use this edge outbox when invoked
+# with `--config /etc/scripture/scripture.yaml`. A `spooled` receipt means the
+# client has fsynced its stable envelope to this one Docker host's volume; it
+# is not a Canon commit and does not survive loss of that host.
+producer_spool:
+  enabled: true
+  kind: local
+  path: "/var/lib/scripture/producer-spool"
+  max_bytes: 1048576
+  fsync: every_record
+  on_full: reject
+  loss_budget: 30s
+  scribe_id: "compose-scribe-a"
 
 metrics:
   status_bind: "0.0.0.0:9100"
