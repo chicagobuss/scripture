@@ -4,7 +4,7 @@
 //! stress fault injection, timer age bounds, receipt drops, and poison at the
 //! real AtomicLog / scripted LogDrive boundary.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -80,6 +80,7 @@ struct RealActorHarness {
     log: AtomicLog,
     timer: ManualTimer,
     next_sequence: u64,
+    records_by_sequence: BTreeMap<u64, u8>,
     committed: Vec<u64>,
     in_flight: BTreeSet<u64>,
     pending_gates: VecDeque<Arc<PollGate>>,
@@ -133,6 +134,7 @@ impl RealActorHarness {
             log,
             timer,
             next_sequence: 0,
+            records_by_sequence: BTreeMap::new(),
             committed: Vec::new(),
             in_flight: BTreeSet::new(),
             pending_gates: VecDeque::new(),
@@ -360,16 +362,25 @@ impl RealActorHarness {
             HostileOp::SubmitNew(records) => {
                 let sequence = self.next_sequence;
                 self.next_sequence += 1;
+                self.records_by_sequence.insert(sequence, records);
                 self.submit(sequence, records)?;
             }
             HostileOp::RetryCommitted => {
                 if let Some(&sequence) = self.committed.last() {
-                    self.submit(sequence, 1)?;
+                    let records = *self
+                        .records_by_sequence
+                        .get(&sequence)
+                        .expect("remember committed submission shape");
+                    self.submit(sequence, records)?;
                 }
             }
             HostileOp::RetryInFlight => {
                 if let Some(&sequence) = self.in_flight.iter().next() {
-                    self.submit(sequence, 1)?;
+                    let records = *self
+                        .records_by_sequence
+                        .get(&sequence)
+                        .expect("remember inflight submission shape");
+                    self.submit(sequence, records)?;
                 }
             }
             HostileOp::Flush => {

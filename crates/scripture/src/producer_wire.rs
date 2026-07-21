@@ -1,9 +1,9 @@
 //! Experimental native producer-wire v1 codec.
 //!
-//! This is deliberately a codec, not yet a listener or public compatibility
-//! promise. Its purpose is to carry one stable producer identity, epoch, and
-//! submission sequence across a reconnect so a future transport can ask the
-//! existing submission deduplication path for the *original* receipt.
+//! This is deliberately a codec, not a stable public compatibility promise.
+//! The experimental runtime listener carries one stable producer identity,
+//! epoch, and submission sequence across a reconnect so the existing
+//! submission deduplication path can return the *original* receipt.
 //!
 //! Raw-lines remains a separate, per-connection compatibility ingress. It
 //! cannot acquire retry safety merely by sharing these types.

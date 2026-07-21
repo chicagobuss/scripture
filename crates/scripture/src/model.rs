@@ -95,6 +95,49 @@ impl Record {
     }
 }
 
+/// Stable digest of one producer submission's exact canonical record sequence.
+///
+/// This is an internal durable-retry witness, not an application payload hash:
+/// typed attributes, their canonical BTreeMap order, and record boundaries are
+/// all included. A producer identity/epoch/sequence replay with a different
+/// value must fail closed instead of receiving a receipt for earlier bytes.
+#[must_use]
+pub(crate) fn canonical_records_digest(records: &[Record]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"scripture-submission-digest-v1");
+    hash_u64(&mut hasher, records.len() as u64);
+    for record in records {
+        hash_u64(&mut hasher, record.attributes.len() as u64);
+        for (key, value) in &record.attributes {
+            hash_bytes(&mut hasher, key.as_bytes());
+            match value {
+                AttributeValue::String(value) => {
+                    hasher.update(&[1]);
+                    hash_bytes(&mut hasher, value.as_bytes());
+                }
+                AttributeValue::I64(value) => {
+                    hasher.update(&[2]);
+                    hasher.update(&value.to_be_bytes());
+                }
+                AttributeValue::Bool(value) => {
+                    hasher.update(&[3, u8::from(*value)]);
+                }
+            }
+        }
+        hash_bytes(&mut hasher, &record.payload);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hash_u64(hasher, value.len() as u64);
+    hasher.update(value);
+}
+
 /// One decoded record with its stable journal offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalRecord {

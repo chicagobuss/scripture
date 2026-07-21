@@ -598,13 +598,16 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
             entry.0 = entry.0.max(placed.submission.sequence);
             entry.1.insert(
                 placed.submission.sequence,
-                (
-                    placed.first_offset,
-                    records,
+                super::state::DedupReceipt {
+                    first_offset: placed.first_offset,
+                    record_count: records,
                     chunk_id,
-                    ack.slot,
-                    self.generation,
-                ),
+                    slot: ack.slot,
+                    canon_revision: self.generation,
+                    submission_digest: crate::model::canonical_records_digest(
+                        &placed.submission.records,
+                    ),
+                },
             );
             self.ledger.event(Event::ReceiptReleased {
                 producer_id: placed.submission.producer_id,

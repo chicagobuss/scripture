@@ -137,7 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--payload")
     parser.add_argument("--producer-id", default="producer-py-demo")
     parser.add_argument("--epoch", type=int, default=1)
-    parser.add_argument("--sequence", type=int, default=1)
+    parser.add_argument("--sequence", type=int, default=0)
     args = parser.parse_args()
     if args.self_test:
         self_test()

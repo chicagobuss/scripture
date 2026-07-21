@@ -12,9 +12,11 @@ use holylog::virtual_log::{VirtualLog, VirtualLogError};
 use crate::canon::{
     CanonAuthorityError, CanonAuthoritySnapshot, OwnerId, VerseId, observe_canon_authority,
 };
-use crate::chunk::{ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_index};
+use crate::chunk::{
+    ChunkDigest, ChunkError, ChunkId, CohortId, SealedChunk, decode_chunk, decode_index,
+};
 use crate::dataref::{DataRef, DataRefError, encode_data_ref, encode_reference_batch};
-use crate::model::{JournalId, RecordOffset};
+use crate::model::{JournalId, RecordOffset, canonical_records_digest};
 use crate::sequencer_key::sequencer_request_key_for_chunk;
 
 /// A bounded number of tail chunks to inspect during owner recovery.
@@ -82,8 +84,12 @@ pub struct RecoveredChunk {
     /// The sole decoded frame, including its [`crate::chunk::SubmissionRef`]s.
     ///
     /// Callers rebuild the producer dedup window from these spans without a
-    /// second Holylog read.
+    /// second Holylog read. Digests bind each replay identity to the exact
+    /// records that originally produced its stored receipt.
     pub frame: crate::chunk::FrameRef,
+    /// One canonical record digest per `frame.submissions` entry, in the same
+    /// order. It is derived while the recovery scan has decoded chunk bytes.
+    pub submission_digests: Vec<[u8; 32]>,
 }
 
 /// Result of rebuilding one writer from a bounded durable suffix.
@@ -871,6 +877,7 @@ impl ChunkLogWriter {
             };
             for chunk_bytes in chunk_byte_sets {
                 let index = decode_index(&chunk_bytes)?;
+                let decoded = decode_chunk(&chunk_bytes)?;
                 if index.header.cohort_id != cohort_id {
                     return Err(ChunkLogError::CohortMismatch);
                 }
@@ -911,6 +918,22 @@ impl ChunkLogWriter {
                         journal: journal_id,
                     });
                 }
+                let [decoded_frame] = decoded.frames.as_slice() else {
+                    return Err(ChunkLogError::JournalFrameMismatch {
+                        journal: journal_id,
+                    });
+                };
+                let mut submission_digests = Vec::with_capacity(frame.submissions.len());
+                for submission in &frame.submissions {
+                    let start = submission.first_record as usize;
+                    let end = start.saturating_add(submission.record_count as usize);
+                    let records = decoded_frame.records.get(start..end).ok_or(
+                        ChunkLogError::JournalFrameMismatch {
+                            journal: journal_id,
+                        },
+                    )?;
+                    submission_digests.push(canonical_records_digest(records));
+                }
                 chunks.push(RecoveredChunk {
                     slot,
                     chunk_id: index.header.chunk_id,
@@ -919,6 +942,7 @@ impl ChunkLogWriter {
                     first_offset: frame.base_offset,
                     record_count: frame.record_count,
                     frame: frame.clone(),
+                    submission_digests,
                 });
             }
         }

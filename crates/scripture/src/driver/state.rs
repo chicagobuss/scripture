@@ -99,7 +99,20 @@ impl PendingAppend {
     }
 }
 
-/// Dedup window value: highest committed sequence, then per-sequence
-/// `(first_offset, record_count, chunk_id, slot, canon_revision)`.
-pub(super) type DedupEntry = (u64, BTreeMap<u64, (RecordOffset, u32, ChunkId, u64, u64)>);
+/// One committed identity in the dedup window.
+///
+/// The digest is derived from the exact canonical record sequence. A retry
+/// identity is therefore a claim about both `(producer, epoch, sequence)` and
+/// bytes/attributes—not merely a request for the old receipt.
+pub(super) struct DedupReceipt {
+    pub(super) first_offset: RecordOffset,
+    pub(super) record_count: u32,
+    pub(super) chunk_id: ChunkId,
+    pub(super) slot: u64,
+    pub(super) canon_revision: u64,
+    pub(super) submission_digest: [u8; 32],
+}
+
+/// Dedup window value: highest committed sequence, then per-sequence receipt.
+pub(super) type DedupEntry = (u64, BTreeMap<u64, DedupReceipt>);
 pub(super) type DedupWindow = BTreeMap<(ProducerId, u32), DedupEntry>;

@@ -7,13 +7,15 @@
 use std::io;
 use std::sync::Arc;
 
-use scripture::{ReceiptFuture, Submission};
-use scripture_service::{CanonRoute, VerseRuntime};
+use scripture::{DriverError, ProducerWireErrorCode, ReceiptFuture, Submission};
+use scripture_service::{CanonRoute, ChunkServiceError, VerseAdmitError, VerseRuntime};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::ha_session::HaServingSession;
-use crate::producer_wire::serve_producer_wire_connection;
+use crate::producer_wire::{
+    ProducerWireRejection, ProducerWireSink, serve_producer_wire_connection,
+};
 use crate::raw_lines::{
     RawLinesConfig, RawLinesConnectionMetrics, RawLinesSink, serve_raw_lines_pipeline,
 };
@@ -90,6 +92,66 @@ struct HaAuthoritySink {
     session: Arc<HaServingSession>,
 }
 
+/// Producer Wire preserves structured refusal classes instead of reducing them
+/// to the legacy raw-lines text surface.
+struct HaProducerWireSink {
+    session: Arc<HaServingSession>,
+}
+
+fn wire_rejection_from_admission(error: impl std::fmt::Display) -> ProducerWireRejection {
+    ProducerWireRejection::new(ProducerWireErrorCode::NotServing, error.to_string())
+}
+
+fn wire_rejection_from_driver(error: DriverError) -> ProducerWireRejection {
+    let code = match error {
+        DriverError::OutOfSequence { .. }
+        | DriverError::FencedProducer { .. }
+        | DriverError::IdentityConflict { .. } => ProducerWireErrorCode::IdentityConflict,
+        DriverError::Indeterminate { .. }
+        | DriverError::Uncertain { .. }
+        | DriverError::Poisoned
+        | DriverError::Policy(_)
+        | DriverError::Codec(_)
+        | DriverError::Log(_)
+        | DriverError::Invariant(_) => ProducerWireErrorCode::Ambiguous,
+        DriverError::RecordTooLarge { .. }
+        | DriverError::SubmissionTooLarge { .. }
+        | DriverError::EmptySubmission
+        | DriverError::BlobSinkBufferFull => ProducerWireErrorCode::Backpressure,
+        DriverError::NotWritten | DriverError::Unavailable => ProducerWireErrorCode::NotServing,
+    };
+    ProducerWireRejection::new(code, error.to_string())
+}
+
+fn wire_rejection_from_verse(error: VerseAdmitError) -> ProducerWireRejection {
+    match error {
+        VerseAdmitError::Unavailable(error) => wire_rejection_from_admission(error),
+        VerseAdmitError::Service(ChunkServiceError::Driver(error)) => {
+            wire_rejection_from_driver(error)
+        }
+        VerseAdmitError::Service(error) => wire_rejection_from_admission(error),
+    }
+}
+
+impl ProducerWireSink for HaProducerWireSink {
+    async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, ProducerWireRejection> {
+        self.session
+            .submit(submission)
+            .await
+            .map_err(|error| match error {
+                crate::HaAdmissionError::GateDenied { .. } => wire_rejection_from_admission(error),
+                crate::HaAdmissionError::Runtime(error) => wire_rejection_from_verse(error),
+            })
+    }
+
+    async fn flush(&self) -> Result<(), ProducerWireRejection> {
+        self.session
+            .flush()
+            .await
+            .map_err(wire_rejection_from_admission)
+    }
+}
+
 impl RawLinesSink for HaAuthoritySink {
     async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, String> {
         self.session
@@ -153,7 +215,7 @@ pub async fn serve_ha_producer_wire_connection(
     session: Arc<HaServingSession>,
 ) -> io::Result<()> {
     let (reader, writer) = stream.into_split();
-    serve_producer_wire_connection(reader, writer, HaAuthoritySink { session }).await
+    serve_producer_wire_connection(reader, writer, HaProducerWireSink { session }).await
 }
 
 /// Canon-gated raw-lines admission over a started [`VerseRuntime`].

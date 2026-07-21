@@ -28,13 +28,15 @@ use scripture::serving_authority::{
     ServingAuthorityRecord, TransitionId, TransitionIntent, TransitionKind, WriterTerm,
 };
 use scripture::{
-    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId, Record, RecoveryBound,
-    Submission, SystemClock, SystemTimer, VerseId, WriterId,
+    ChunkPolicy, CohortId, JournalId, OwnerEndpoint, OwnerId, ProducerId, ProducerWireFrame,
+    Record, RecoveryBound, Submission, SystemClock, SystemTimer, VerseId, WriterId,
+    decode_producer_wire_frame, encode_producer_wire_frame,
 };
 use scripture_runtime::{
     AuthorityGateDecision, DurableLogletParts, HaServingSession, HolylogJournalFoundation,
     NodeIdentity, PartsFactory, PartsFactoryError, ProcessLogletResolver, SharedMemoryPartsFactory,
     bootstrap_and_serve, bootstrap_authority_domain, evaluate_authority_gate, promote_and_serve,
+    serve_ha_producer_wire_connection,
 };
 use scripture_service::{
     AuthorityCoordinator, DeterministicTransitionIdGenerator, JournalFoundationTransition,
@@ -839,4 +841,187 @@ async fn raw_lines_ha_cutover_fresh_producer_dense_continuation() {
         producers[0], producers[1],
         "B raw-lines connection must not reuse A's producer identity"
     );
+}
+
+/// Native Producer Wire must preserve the producer identity through a reply
+/// loss. The first connection commits and loses its Ack; the exact reconnect
+/// retry returns the original range and must not append a second record.
+#[tokio::test]
+async fn producer_wire_lost_ack_reconnect_replays_one_durable_submission() {
+    use scripture::decode_chunk;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn serve_once(listener: TcpListener, session: Arc<HaServingSession>) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        // The first simulated reply loss is allowed to surface as a transport
+        // error after the durable receipt has resolved.
+        let _ = serve_ha_producer_wire_connection(stream, session).await;
+    }
+
+    async fn read_wire_reply(stream: &mut TcpStream) -> ProducerWireFrame {
+        let mut prefix = [0_u8; 4];
+        stream.read_exact(&mut prefix).await.expect("reply prefix");
+        let length = u32::from_be_bytes(prefix) as usize;
+        assert!(length <= scripture::MAX_FRAME_BYTES);
+        let mut bytes = vec![0_u8; length + 4];
+        bytes[..4].copy_from_slice(&prefix);
+        stream
+            .read_exact(&mut bytes[4..])
+            .await
+            .expect("reply body");
+        decode_producer_wire_frame(&bytes).expect("decode reply")
+    }
+
+    let register = Arc::new(InMemoryConditionalRegister::new());
+    let parts = Arc::new(SharedMemoryPartsFactory::default());
+    let claims = Arc::new(InMemoryExclusiveClaimStore::new());
+    let a = build_node(
+        owner_a(),
+        "tcp://owner-a:9000",
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&parts),
+        Arc::clone(&claims) as Arc<dyn ExclusiveClaimStore>,
+    );
+    let session = Arc::new(
+        bootstrap_and_serve(
+            &a.coordinator,
+            &a.foundation,
+            key(),
+            WriterTerm::new(1).expect("t1"),
+            runtime_config(owner_a()),
+            Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+            Arc::clone(&a.resolver),
+            SystemClock::new(),
+            SystemTimer::new(),
+        )
+        .await
+        .expect("A serving"),
+    );
+    assert!(session.is_effective_writer().await, "A remains effective");
+
+    let producer_id = ProducerId::from_bytes(*b"wire-retry-prod!");
+    let hello = encode_producer_wire_frame(&ProducerWireFrame::Hello {
+        producer_id,
+        producer_epoch: 7,
+    })
+    .expect("hello");
+    let submit = encode_producer_wire_frame(&ProducerWireFrame::Submit {
+        sequence: 0,
+        records: vec![Bytes::from_static(b"wire-retry-payload")],
+    })
+    .expect("submit");
+
+    // First connection reaches the real HA session, then the client drops the
+    // socket without reading its Ack. Polling the real VirtualLog confirms the
+    // durable action happened before retrying, avoiding a timing-only test.
+    let first_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind first");
+    let first_address = first_listener.local_addr().expect("first address");
+    let first_server = tokio::spawn(serve_once(first_listener, Arc::clone(&session)));
+    let mut first_client = TcpStream::connect(first_address)
+        .await
+        .expect("connect first");
+    first_client.write_all(&hello).await.expect("write hello");
+    first_client.write_all(&submit).await.expect("write submit");
+    first_client.flush().await.expect("flush submit");
+
+    let virtual_log = VirtualLog::new(
+        Arc::clone(&register) as Arc<dyn ConditionalRegister>,
+        Arc::clone(&a.resolver) as Arc<dyn LogletResolver>,
+    );
+    let first_entry = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(entry) = virtual_log.read_next(0, 2).await {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first submission becomes durable before retry");
+    let first_chunk = decode_chunk(&first_entry.payload).expect("decode first chunk");
+    assert_eq!(first_chunk.frames.len(), 1);
+    assert_eq!(first_chunk.frames[0].submissions.len(), 1);
+    assert_eq!(
+        first_chunk.frames[0].submissions[0].producer_id,
+        producer_id
+    );
+    assert_eq!(first_chunk.frames[0].submissions[0].sequence, 0);
+    assert_eq!(first_chunk.frames[0].records.len(), 1);
+    assert_eq!(
+        first_chunk.frames[0].records[0].payload,
+        b"wire-retry-payload".as_slice()
+    );
+    // The server has written its receipt, but the producer has never read it.
+    // Dropping now models client-side reply loss without racing admission out
+    // of the kernel socket buffers.
+    drop(first_client);
+    first_server.await.expect("first server join");
+
+    let retry_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind retry");
+    let retry_address = retry_listener.local_addr().expect("retry address");
+    let retry_server = tokio::spawn(serve_once(retry_listener, Arc::clone(&session)));
+    let mut retry_client = TcpStream::connect(retry_address)
+        .await
+        .expect("connect retry");
+    retry_client.write_all(&hello).await.expect("retry hello");
+    retry_client.write_all(&submit).await.expect("retry submit");
+    retry_client.flush().await.expect("retry flush");
+    let reply = read_wire_reply(&mut retry_client).await;
+    assert_eq!(
+        reply,
+        ProducerWireFrame::Ack {
+            producer_epoch: 7,
+            sequence: 0,
+            first_offset: 0,
+            next_offset: 1,
+        }
+    );
+    retry_client.shutdown().await.expect("retry shutdown");
+    retry_server.await.expect("retry server join");
+
+    // Reusing the identity/sequence with changed bytes is not a retry. The
+    // driver reports its sequence conflict through the v1 machine-readable
+    // IdentityConflict class and still cannot append a second record.
+    let conflict_submit = encode_producer_wire_frame(&ProducerWireFrame::Submit {
+        sequence: 0,
+        records: vec![Bytes::from_static(b"wire-retry-CHANGED")],
+    })
+    .expect("conflict submit");
+    let conflict_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind conflict");
+    let conflict_address = conflict_listener.local_addr().expect("conflict address");
+    let conflict_server = tokio::spawn(serve_once(conflict_listener, Arc::clone(&session)));
+    let mut conflict_client = TcpStream::connect(conflict_address)
+        .await
+        .expect("connect conflict");
+    conflict_client
+        .write_all(&hello)
+        .await
+        .expect("conflict hello");
+    conflict_client
+        .write_all(&conflict_submit)
+        .await
+        .expect("conflict submit write");
+    conflict_client.flush().await.expect("conflict flush");
+    match read_wire_reply(&mut conflict_client).await {
+        ProducerWireFrame::Error {
+            producer_epoch,
+            sequence,
+            code: scripture::ProducerWireErrorCode::IdentityConflict,
+            ..
+        } => {
+            assert_eq!(producer_epoch, 7);
+            assert_eq!(sequence, 0);
+        }
+        other => panic!("changed replay must be identity conflict, got {other:?}"),
+    }
+    conflict_client.shutdown().await.expect("conflict shutdown");
+    conflict_server.await.expect("conflict server join");
+
+    // There is still exactly one physical log entry and one record for the
+    // identity. The second connection recovered the first receipt; it did not
+    // create an equally plausible duplicate at offset one.
+    assert!(virtual_log.read_next(1, 2).await.is_err());
 }

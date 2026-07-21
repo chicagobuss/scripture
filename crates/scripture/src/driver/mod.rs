@@ -114,6 +114,18 @@ pub enum DriverError {
         /// Epoch on the rejected request.
         request_epoch: u32,
     },
+    /// The same producer identity/epoch/sequence was retried with different
+    /// canonical records. Replaying its original receipt would lie about what
+    /// the caller submitted, so the conflict is terminal and fail-closed.
+    #[error("producer identity conflict for epoch {producer_epoch} sequence {sequence}")]
+    IdentityConflict {
+        /// Producer whose identity was reused inconsistently.
+        producer_id: ProducerId,
+        /// Producer incarnation.
+        producer_epoch: u32,
+        /// Reused submission sequence.
+        sequence: u64,
+    },
     /// The submission lies outside the bounded dedup window.
     #[error("indeterminate producer submission")]
     Indeterminate {
@@ -400,7 +412,12 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
 
     fn rebuild_dedup(&mut self, recovered: &[RecoveredChunk]) {
         for chunk in recovered {
-            for submission in &chunk.frame.submissions {
+            for (submission, submission_digest) in chunk
+                .frame
+                .submissions
+                .iter()
+                .zip(&chunk.submission_digests)
+            {
                 let key = (submission.producer_id, submission.producer_epoch);
                 let first = chunk
                     .frame
@@ -418,13 +435,14 @@ impl<C: Clock, T: Timer> ChunkDriverActor<C, T> {
                 entry.0 = entry.0.max(submission.sequence);
                 entry.1.insert(
                     submission.sequence,
-                    (
-                        first,
-                        submission.record_count,
-                        chunk.chunk_id,
-                        chunk.slot,
-                        chunk.generation,
-                    ),
+                    state::DedupReceipt {
+                        first_offset: first,
+                        record_count: submission.record_count,
+                        chunk_id: chunk.chunk_id,
+                        slot: chunk.slot,
+                        canon_revision: chunk.generation,
+                        submission_digest: *submission_digest,
+                    },
                 );
                 self.admitted_seq.insert(key, entry.0);
                 self.known_producers

@@ -144,6 +144,6 @@ if (args.length === 1 && args[0] === "--self-test") {
   }
   sendOnce({ host, port, payload: Buffer.from(payload, "utf8"),
     producerId: Buffer.from(value("--producer-id", "producer-node-01"), "ascii"),
-    epoch: Number(value("--epoch", "1")), sequence: BigInt(value("--sequence", "1")) })
+    epoch: Number(value("--epoch", "1")), sequence: BigInt(value("--sequence", "0")) })
     .catch((error) => { console.error(`producer-wire: ${error.message}`); process.exitCode = 1; });
 }

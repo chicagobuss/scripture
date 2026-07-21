@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 
 use crate::chunk::{ChunkError, Frame, ProducerId, SubmissionRef, encoded_chunk_len};
-use crate::model::{Record, RecordOffset};
+use crate::model::{Record, RecordOffset, canonical_records_digest};
 use crate::trace::{Event, RejectReason};
 
 use super::state::{BlockedSubmission, OpenChunk, PendingAppend, PlacedSubmission};
@@ -150,6 +150,7 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                 return;
             }
         };
+        let canonical_digest = canonical_records_digest(&submission.records);
 
         // A submission is one atomic unit. If it cannot fit in a single chunk,
         // reject it — never split it across chunks (that would invent two
@@ -193,9 +194,26 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
         if let Some((highest, window)) = self.dedup.get(&key)
             && submission.sequence <= *highest
         {
-            if let Some((first_offset, records, chunk_id, slot, canon_revision)) =
-                window.get(&submission.sequence).copied()
-            {
+            if let Some(receipt) = window.get(&submission.sequence) {
+                if receipt.submission_digest != canonical_digest {
+                    self.ledger.event(Event::SubmissionRejected {
+                        producer_id: submission.producer_id,
+                        sequence: submission.sequence,
+                        reason: RejectReason::OutOfSequence,
+                    });
+                    let _ = admission.send(Err(DriverError::IdentityConflict {
+                        producer_id: submission.producer_id,
+                        producer_epoch: submission.producer_epoch,
+                        sequence: submission.sequence,
+                    }));
+                    self.bump_rejected();
+                    return;
+                }
+                let first_offset = receipt.first_offset;
+                let records = receipt.record_count;
+                let chunk_id = receipt.chunk_id;
+                let slot = receipt.slot;
+                let canon_revision = receipt.canon_revision;
                 let next_offset = first_offset
                     .checked_add(records as usize)
                     .unwrap_or(first_offset);
@@ -249,6 +267,15 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                     && placed.submission.producer_epoch == submission.producer_epoch
                     && placed.submission.sequence == submission.sequence
                 {
+                    if canonical_records_digest(&placed.submission.records) != canonical_digest {
+                        let _ = admission.send(Err(DriverError::IdentityConflict {
+                            producer_id: submission.producer_id,
+                            producer_epoch: submission.producer_epoch,
+                            sequence: submission.sequence,
+                        }));
+                        self.bump_rejected();
+                        return;
+                    }
                     let (tx, rx) = oneshot::channel();
                     placed.waiters.push(tx);
                     let _ = admission.send(Ok(rx));
@@ -262,6 +289,15 @@ impl<C: crate::clock::Clock, T: crate::clock::Timer> ChunkDriverActor<C, T> {
                     && placed.submission.producer_epoch == submission.producer_epoch
                     && placed.submission.sequence == submission.sequence
                 {
+                    if canonical_records_digest(&placed.submission.records) != canonical_digest {
+                        let _ = admission.send(Err(DriverError::IdentityConflict {
+                            producer_id: submission.producer_id,
+                            producer_epoch: submission.producer_epoch,
+                            sequence: submission.sequence,
+                        }));
+                        self.bump_rejected();
+                        return;
+                    }
                     let (tx, rx) = oneshot::channel();
                     placed.waiters.push(tx);
                     let _ = admission.send(Ok(rx));

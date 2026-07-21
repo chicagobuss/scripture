@@ -6,7 +6,7 @@
 //! fleet-plan integration test — see holylog folio
 //! `scripture-cross-cloud-real-driver-and-fleet-plan.md`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::Poll;
@@ -345,6 +345,131 @@ fn dropped_response_retry_returns_original_receipt() {
     assert_eq!(retry.slot, first.slot);
     assert_eq!(retry.chunk_id, first.chunk_id);
     assert_eq!(drive.write_count(), 1);
+}
+
+#[test]
+fn changed_payload_under_a_committed_submission_identity_is_rejected() {
+    let drive = ScriptedLogDrive::new();
+    let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+        .build()
+        .expect("log");
+    let writer = ChunkLogWriter::new(journal(), cohort(), 1, log, RecordOffset::new(0));
+    let clock = Arc::new(ManualClock::new());
+    let timer = ManualTimer::new(Arc::clone(&clock));
+    let (handle, actor) = ChunkDriverActor::new(
+        journal(),
+        cohort(),
+        writer_id(),
+        1,
+        writer,
+        &[],
+        policy(),
+        clock,
+        timer,
+        8,
+        None,
+        None,
+        None,
+    )
+    .expect("actor");
+    let mut pool = LocalPool::new();
+    pool.spawner()
+        .spawn(async move { actor.run().await.expect("run") })
+        .expect("spawn");
+
+    pool.run_until({
+        let handle = handle.clone();
+        async move {
+            let receipt = handle.submit(submission(0, &[9])).await.expect("admit");
+            handle.flush().await.expect("flush");
+            receipt.await.expect("commit");
+        }
+    });
+    let error = pool.run_until(async move { handle.submit(submission(0, &[10])).await });
+    assert!(matches!(error, Err(DriverError::IdentityConflict { .. })));
+    assert_eq!(
+        drive.write_count(),
+        1,
+        "conflict cannot append a second value"
+    );
+}
+
+#[test]
+fn changed_payload_after_recovery_is_rejected_from_the_durable_record_digest() {
+    let drive = ScriptedLogDrive::new();
+    let log = AtomicLog::builder(Arc::clone(&drive) as Arc<dyn LogDrive>, 0)
+        .build()
+        .expect("log");
+    {
+        let writer = ChunkLogWriter::new(journal(), cohort(), 1, log.clone(), RecordOffset::new(0));
+        let clock = Arc::new(ManualClock::new());
+        let timer = ManualTimer::new(Arc::clone(&clock));
+        let (handle, actor) = ChunkDriverActor::new(
+            journal(),
+            cohort(),
+            writer_id(),
+            1,
+            writer,
+            &[],
+            policy(),
+            clock,
+            timer,
+            8,
+            None,
+            None,
+            None,
+        )
+        .expect("actor");
+        let mut pool = LocalPool::new();
+        pool.spawner()
+            .spawn(async move { actor.run().await.expect("run") })
+            .expect("spawn");
+        pool.run_until(async move {
+            let receipt = handle.submit(submission(0, &[9])).await.expect("admit");
+            handle.flush().await.expect("flush");
+            receipt.await.expect("commit");
+        });
+        // Dropping the pool ends the old owner before recovered owner B starts.
+    }
+
+    let mut pool = LocalPool::new();
+    let recovery = pool
+        .run_until(ChunkLogWriter::recover(
+            journal(),
+            cohort(),
+            1,
+            log,
+            RecoveryBound::new(8).expect("bound"),
+            None,
+        ))
+        .expect("recover");
+    assert_eq!(recovery.chunks[0].submission_digests.len(), 1);
+    let recovered_chunks = recovery.chunks;
+    let recovered_writer = recovery.writer;
+    let clock = Arc::new(ManualClock::new());
+    let timer = ManualTimer::new(Arc::clone(&clock));
+    let (handle, actor) = ChunkDriverActor::new(
+        journal(),
+        cohort(),
+        writer_id(),
+        1,
+        recovered_writer,
+        &recovered_chunks,
+        policy(),
+        clock,
+        timer,
+        8,
+        None,
+        None,
+        None,
+    )
+    .expect("recovered actor");
+    pool.spawner()
+        .spawn(async move { actor.run().await.expect("run") })
+        .expect("spawn recovered");
+    let error = pool.run_until(async move { handle.submit(submission(0, &[10])).await });
+    assert!(matches!(error, Err(DriverError::IdentityConflict { .. })));
+    assert_eq!(drive.write_count(), 1, "recovery conflict cannot append");
 }
 
 #[test]
@@ -1317,15 +1442,21 @@ proptest! {
 
         let mut next_sequence = 0_u64;
         let mut committed_sequences = Vec::new();
+        let mut sequence_record_counts = BTreeMap::new();
         let mut pending = Vec::new();
         let mut receipts = Vec::new();
-        for (index, (retry, records)) in operations.into_iter().enumerate() {
-            let sequence = if retry && !committed_sequences.is_empty() {
-                *committed_sequences.last().expect("non-empty")
+        for (index, (retry, requested_records)) in operations.into_iter().enumerate() {
+            let (sequence, records) = if retry && !committed_sequences.is_empty() {
+                let sequence = *committed_sequences.last().expect("non-empty");
+                let records = *sequence_record_counts
+                    .get(&sequence)
+                    .expect("remember committed submission shape");
+                (sequence, records)
             } else {
                 let sequence = next_sequence;
                 next_sequence += 1;
-                sequence
+                sequence_record_counts.insert(sequence, requested_records);
+                (sequence, requested_records)
             };
             let submission = Submission {
                 producer_id: producer(), producer_epoch: 1, sequence,

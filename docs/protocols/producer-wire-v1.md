@@ -40,6 +40,11 @@ Producer Wire v1 carries the existing durable submission identity unchanged:
 ProducerId (16 bytes) + producer epoch (u32) + submission sequence (u64)
 ~~~
 
+Within an epoch, the first submission sequence is **0** and subsequent
+submissions are dense. An exact retry repeats the same sequence *and exact
+canonical records*; changing the records under an existing identity is an
+`IdentityConflict`, never a replay of an earlier receipt.
+
 The eventual server creates Scripture Submission values from those fields. A
 replay of the same canonical records under the same identity must return the
 original committed offset range; changed records under the same identity must

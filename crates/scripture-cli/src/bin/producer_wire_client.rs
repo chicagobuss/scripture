@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let payload = Bytes::copy_from_slice(args[2].as_bytes());
     let id = producer_id(args.get(3).map_or("producer-rust-01", String::as_str))?;
     let epoch: u32 = args.get(4).map_or(Ok(1), |raw| raw.parse())?;
-    let requested_sequence: u64 = args.get(5).map_or(Ok(1), |raw| raw.parse())?;
+    let requested_sequence: u64 = args.get(5).map_or(Ok(0), |raw| raw.parse())?;
     if epoch == 0 {
         return Err("EPOCH must be nonzero".into());
     }

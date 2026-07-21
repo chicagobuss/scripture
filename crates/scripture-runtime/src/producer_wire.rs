@@ -7,12 +7,36 @@
 use std::io;
 
 use scripture::{
-    ProducerWireErrorCode, ProducerWireFrame, Record, Submission, decode_producer_wire_frame,
-    encode_producer_wire_frame,
+    ProducerWireErrorCode, ProducerWireFrame, ReceiptFuture, Record, Submission,
+    decode_producer_wire_frame, encode_producer_wire_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::raw_lines::RawLinesSink;
+/// One machine-readable admission refusal for Producer Wire.
+#[derive(Debug, Clone)]
+pub(crate) struct ProducerWireRejection {
+    pub(crate) code: ProducerWireErrorCode,
+    pub(crate) message: String,
+}
+
+impl ProducerWireRejection {
+    pub(crate) fn new(code: ProducerWireErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// Admission/flush surface deliberately separate from raw-lines.
+///
+/// Raw-lines predates a machine-readable producer contract and collapses
+/// errors to text. Producer Wire must retain the bounded error class all the
+/// way to its frame encoder.
+pub(crate) trait ProducerWireSink {
+    async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, ProducerWireRejection>;
+    async fn flush(&self) -> Result<(), ProducerWireRejection>;
+}
 
 /// Serves one v1 connection over an already accepted transport.
 ///
@@ -27,7 +51,7 @@ pub(crate) async fn serve_producer_wire_connection<R, W, S>(
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
-    S: RawLinesSink,
+    S: ProducerWireSink,
 {
     let Some(ProducerWireFrame::Hello {
         producer_id,
@@ -57,25 +81,25 @@ where
                 };
                 let receipt = match sink.submit(submission).await {
                     Ok(receipt) => receipt,
-                    Err(_) => {
+                    Err(error) => {
                         write_error(
                             &mut writer,
                             producer_epoch,
                             sequence,
-                            ProducerWireErrorCode::NotServing,
-                            "submission refused",
+                            error.code,
+                            &error.message,
                         )
                         .await?;
                         continue;
                     }
                 };
-                if sink.flush().await.is_err() {
+                if let Err(error) = sink.flush().await {
                     write_error(
                         &mut writer,
                         producer_epoch,
                         sequence,
-                        ProducerWireErrorCode::Ambiguous,
-                        "flush unavailable",
+                        error.code,
+                        &error.message,
                     )
                     .await?;
                     continue;
@@ -195,8 +219,11 @@ mod tests {
         flushes: Mutex<u64>,
     }
 
-    impl RawLinesSink for Arc<RecordingSink> {
-        async fn submit(&self, submission: Submission) -> Result<ReceiptFuture, String> {
+    impl ProducerWireSink for Arc<RecordingSink> {
+        async fn submit(
+            &self,
+            submission: Submission,
+        ) -> Result<ReceiptFuture, ProducerWireRejection> {
             self.submissions
                 .lock()
                 .expect("submissions")
@@ -215,7 +242,7 @@ mod tests {
             Ok(ReceiptFuture::from_receiver(receiver))
         }
 
-        async fn flush(&self) -> Result<(), String> {
+        async fn flush(&self) -> Result<(), ProducerWireRejection> {
             *self.flushes.lock().expect("flushes") += 1;
             Ok(())
         }
