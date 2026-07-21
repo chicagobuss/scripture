@@ -21,6 +21,21 @@ It intentionally makes no live deployment claim and never contacts object
 storage, Kubernetes, or a package registry. A separate approved two-Scribe
 object-store drill is required for live operational evidence.
 
+`render-provider-scribe-drill.sh` creates non-secret, ignored two-Scribe YAML
+for an isolated **real R2 or Amazon S3** run. It only renders configuration; it
+does not contact a provider or copy credentials:
+
+```sh
+set -a; source ~/.config/scripture/r2.env; set +a
+./scripts/render-provider-scribe-drill.sh \
+  --backend r2 --run-id demo-001 \
+  --a-host 10.244.231.86 --b-host 10.244.19.23
+```
+
+The later approved launch supplies credentials only in the Scribe process
+environment. RustFS remains a disposable fault-injection backend, not the
+default stand-in for real-provider evidence.
+
 `scripture_send.py` targets the current provisional raw-lines TCP listener:
 
 ```sh
